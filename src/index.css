@@ -1,0 +1,232 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@600&display=swap');
+
+:root {
+  --bg-core: #040308;
+  /* Deep Stealth Black */
+  --bg-panel: linear-gradient(145deg, rgba(15, 12, 29, 0.75), rgba(20, 15, 40, 0.4));
+  --bg-input: rgba(10, 8, 20, 0.9);
+
+  --accent-primary: #A200FF;
+  /* Neon Purple */
+  --accent-secondary: #00E5FF;
+  /* Aerospace HUD Cyan */
+  --accent-alert: #FF0055;
+  /* Critical Red */
+  --accent-success: #00FF66;
+  /* Secure Green */
+
+  --text-main: #f8fafc;
+  --text-muted: #8E8AAB;
+  --text-hud: #00E5FF;
+
+  --border-color: rgba(162, 0, 255, 0.25);
+  --border-hud: rgba(0, 229, 255, 0.3);
+  --panel-border: 1px solid var(--border-color);
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: var(--bg-core);
+  color: var(--text-main);
+  min-height: 100vh;
+  margin: 0;
+  display: flex;
+  overflow: hidden;
+
+  /* Neon Radar Grid */
+  background-image:
+    linear-gradient(rgba(162, 0, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(162, 0, 255, 0.05) 1px, transparent 1px);
+  background-size: 30px 30px;
+}
+
+/* Aerospace HUD Scanlines Overlay */
+body::after {
+  content: " ";
+  display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  right: 0;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.15) 50%);
+  background-size: 100% 4px;
+  z-index: 9999;
+  pointer-events: none;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(10, 10, 15, 0.9);
+  border-left: 1px solid rgba(162, 0, 255, 0.05);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(162, 0, 255, 0.25);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(162, 0, 255, 0.5);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Animations */
+.aura-spin {
+  animation: aura-spin 16s linear infinite;
+}
+
+.pulse-line {
+  animation: pulse-line 2.2s ease-in-out infinite;
+}
+
+.sweep {
+  animation: sweep 2.8s linear infinite;
+}
+
+@keyframes aura-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse-line {
+
+  0%,
+  100% {
+    opacity: 0.45;
+    box-shadow: 0 0 0 rgba(162, 0, 255, 0.25);
+  }
+
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 16px rgba(162, 0, 255, 0.7);
+  }
+}
+
+@keyframes sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+
+  100% {
+    transform: translateX(220%);
+  }
+}
+
+@keyframes toast-slide-in {
+  0% {
+    opacity: 0;
+    transform: translateX(100%) scale(0.95);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+.toast-slide-in {
+  animation: toast-slide-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.vfs-container {
+  height: 100%;
+  width: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.vfs-row {
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid rgba(0, 229, 255, 0.08);
+  transition: background-color 0.2s;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: var(--text-main);
+}
+
+.vfs-row:hover {
+  background-color: rgba(0, 229, 255, 0.05);
+}
+
+.vfs-row:hover .vfs-download-btn {
+  opacity: 1 !important;
+}
+
+.vfs-toggle {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 4px;
+  color: var(--text-muted);
+}
+
+.vfs-toggle:hover {
+  color: var(--accent-secondary);
+}
+
+.vfs-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 8px;
+}
+
+.vfs-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vfs-size {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.vfs-download-btn {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--accent-secondary);
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+}
+
+.vfs-download-btn:hover {
+  background: rgba(0, 229, 255, 0.15);
+}
