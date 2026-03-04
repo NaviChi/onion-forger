@@ -87,6 +87,16 @@ impl CrawlerAdapter for PearAdapter {
                         }
                     };
 
+                    struct TaskGuard {
+                        counter: Arc<std::sync::atomic::AtomicUsize>,
+                    }
+                    impl Drop for TaskGuard {
+                        fn drop(&mut self) {
+                            self.counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    let _guard = TaskGuard { counter: pending_clone.clone() };
+
                     let _permit = f.politeness_semaphore.acquire().await.ok();
                     let (_cid, _client) = f.get_client();
 
@@ -181,8 +191,6 @@ impl CrawlerAdapter for PearAdapter {
                         let mut lock = discovered_ref.lock().await;
                         lock.extend(new_files);
                     }
-
-                    pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }

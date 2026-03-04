@@ -86,7 +86,7 @@ pub fn support_catalog() -> Vec<AdapterSupportInfo> {
             support_level: "Full Crawl",
             matching_strategy: "Known-domain + QData marker signature matching",
             sample_urls: vec![
-                "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/",
+                "http://a7r2n577n6jqzqexu5an3j2aej3ezb4klm7pkbp44243cqbwi43brjid.onion/72a4c05f-f711-498a-a038-758efa78aa09/",
             ],
             tested_for: vec![
                 "Adapter fingerprint match (engine_test)",

@@ -20,11 +20,15 @@ pub fn parse_autoindex_html(html: &str) -> Vec<(String, Option<u64>, bool)> {
             if let Some(href_end) = after_href.find('"') {
                 let raw_href = &after_href[..href_end];
 
-                // Skip parent directory link
+                // Skip parent directory link and invalid absolute/template targets
                 if raw_href == "../"
                     || raw_href == ".."
                     || raw_href == "/"
                     || raw_href.starts_with("?")
+                    || raw_href.starts_with("/")
+                    || raw_href.starts_with("http://")
+                    || raw_href.starts_with("https://")
+                    || raw_href.starts_with("${")
                 {
                     continue;
                 }

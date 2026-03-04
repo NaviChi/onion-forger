@@ -261,6 +261,16 @@ impl CrawlerAdapter for DragonForceAdapter {
                         }
                     };
 
+                    struct TaskGuard {
+                        counter: Arc<std::sync::atomic::AtomicUsize>,
+                    }
+                    impl Drop for TaskGuard {
+                        fn drop(&mut self) {
+                            self.counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    let _guard = TaskGuard { counter: pending_clone.clone() };
+
                     let dynamic_host = if let Ok(u) = url::Url::parse(&next_url) {
                         u.host_str().unwrap_or("").to_string()
                     } else {
@@ -332,8 +342,6 @@ impl CrawlerAdapter for DragonForceAdapter {
                             discovered_ref.lock().await.append(&mut new_files);
                         }
                     }
-
-                    pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }

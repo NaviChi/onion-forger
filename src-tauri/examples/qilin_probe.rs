@@ -19,20 +19,22 @@ async fn main() {
         .build()
         .unwrap();
 
-    let target_url = "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=30111f69-5882-3535-8484-77a751b3c1c5";
+    let target_url = "http://a7r2n577n6jqzqexu5an3j2aej3ezb4klm7pkbp44243cqbwi43brjid.onion/72a4c05f-f711-498a-a038-758efa78aa09/usa%20medica/MEGA%20uploads/";
 
     for attempt in 1..=5 {
-        println!("Fetching Qilin (Attempt {}): {}", attempt, target_url);
+        println!("Fetching {}...", target_url);
 
         match client.get(target_url).send().await {
             Ok(resp) => {
-                let status = resp.status();
-                println!("Status: {}", status);
                 if let Ok(text) = resp.text().await {
-                    std::fs::write("/tmp/qilin_dump.html", &text).unwrap();
-                    println!("Saved HTML to /tmp/qilin_dump.html");
-                    let preview = text.chars().take(800).collect::<String>();
-                    println!("{}\n[SUCCESS] Extracted payload.", preview);
+                    let parsed = crawli_lib::adapters::autoindex::parse_autoindex_html(&text);
+                    println!("Found {} entries in MEGA uploads:", parsed.len());
+                    for (name, size, is_dir) in parsed.iter().take(20) {
+                        println!(" - [Dir={}] Name: {}", is_dir, name);
+                    }
+                    if parsed.len() > 100 {
+                        println!("... and {} more entries.", parsed.len() - 20);
+                    }
                     break;
                 }
             }
