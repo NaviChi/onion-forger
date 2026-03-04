@@ -1,5 +1,5 @@
-Version: 1.0.4
-Updated: 2026-03-03
+Version: 1.0.6
+Updated: 2026-03-04
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [CRITICAL-L0] Native/Web Boundary, [MANDATORY-L1] Prevention Discipline, [MANDATORY-L1] Testing & Validation
 
@@ -18,6 +18,9 @@ Observed GUI issues:
 - `NETWORK I/O` could display `0.00 MB/s` and `0.00 MB` during active batch phases because it only read per-file stream events.
 - Support popover could show stale adapter capability labels when backend adapter behavior changed.
 - `NETWORK I/O` could still drop to `0.00 MB/s` between sparse batch events when payload speed was missing/zero.
+- Windows UI could surface raw canonical path prefixes (`\\?\X:\...`) in progress fields.
+- Download progress could appear stuck when only file-count progress moved but byte transfer continued.
+- Operators lacked explicit active-circuit and peak throughput ceilings on the dashboard.
 
 # Details
 Issue-to-fix mapping:
@@ -36,14 +39,23 @@ Issue-to-fix mapping:
 - Issue: Throughput could transiently flatline between sparse batch telemetry frames.
   - Fix: Add frontend delta-based batch speed fallback in `App.tsx` (`downloadedBytes` sample window) when backend speed is unavailable.
   - Fix: Keep fallback reset aligned with `download_batch_started` and crawl restart state reset.
+- Issue: Windows canonical path prefixes leaked into download progress UI.
+  - Fix: normalize display paths in `App.tsx` by stripping Windows verbatim prefixes and rendering root-relative paths.
+- Issue: Progress bar looked frozen while backend still downloaded data.
+  - Fix: switched download progress fill model from file-count only to `max(filePercent, bytePercent)` with cumulative byte telemetry.
+- Issue: Operators could not quickly see active circuit load or observed ceilings.
+  - Fix: added `active/peak circuits`, `peak bandwidth`, and `current/peak disk I/O` metrics to the dashboard network cards.
+- Issue: Throughput and ETA values could oscillate heavily on sparse batch telemetry, reducing operator trust.
+  - Root Cause: raw instantaneous speed was rendered directly and ETA confidence was implicit.
+  - Fix: added EWMA speed smoothing (`smoothedSpeedMbps`) and explicit `etaConfidence` scoring in `App.tsx`, then surfaced both in `Dashboard.tsx`.
 - Issue: Support panel labels for LockBit/Nu were stale (`Detection Only`) after backend crawl delegation was enabled.
   - Fix: Align fallback support catalog entries in `App.tsx` with backend support catalog (`Full Crawl` + updated sample/test metadata).
 - Issue: The frontend visual aesthetic felt disjointed during operations due to monolithic React `lucide` spinners.
   - Root Cause: Default CSS rotation algorithms on standard SVG paths lack the premium, zero-latency "SnoozeSlayer" visual weight.
   - Fix: Implemented `<VibeLoader />` wrapping 8-bit true-alpha Animated WebP cinematic sequences. Designed strict CSS fallback states preserving `-webkit-optimize-contrast` halo-free rendering.
-- Issue (Theoretical/HFT): Rapid circuit routing and Thompson Sampling algorithm updates causes UI throughput charts to jitter too aggressively.
-  - Root Cause: high-frequency bandwidth sampling feeds directly into UI telemetry.
-  - Fix (Proposed): Ensure UI telemetry integrates robust EMA (Exponential Moving Average) smoothing at the React layer, decoupling raw sampling rate from rendering rate.
+- Issue: Rapid backend routing updates caused UI throughput labels to jitter.
+  - Root Cause: high-frequency bandwidth sampling fed directly into UI telemetry without smoothing.
+  - Fix: implemented EMA/EWMA smoothing in React state and rendered both instant and smoothed throughput for operator context.
 
 # Prevention Rules
 **1. Progress visuals must bind to backend telemetry events, not inferred log strings.**
@@ -56,6 +68,9 @@ Issue-to-fix mapping:
 **8. Support-popover fallback metadata must stay in lockstep with backend support catalog semantics.**
 **9. Batch speed rendering must include a delta-based fallback for sparse or partial backend payloads.**
 **10. (HFT Standard) Rapidly oscillating telemetry must be smoothed (EMA) in the UI state layer to prevent visual jitter without throttling the backend.**
+**11. Display-path rendering must sanitize OS-specific canonical prefixes before binding to UI text or keys.**
+**12. Download progress bars must blend file-count and byte-count signals to avoid false plateaus.**
+**13. ETA displays must include confidence signaling when totals/speeds are estimate-driven.**
 
 # Risk
 - Estimated progress may briefly plateau in highly dynamic directory trees.
@@ -66,6 +81,8 @@ Issue-to-fix mapping:
 - 2026-03-03: Added merged network telemetry fallback for batch-heavy download phases.
 - 2026-03-03: Synced support-popover adapter capabilities with backend adapter behavior.
 - 2026-03-03: Added delta-based frontend throughput fallback for sparse batch telemetry updates.
+- 2026-03-03: Added Windows path normalization, byte-aware progress fill, and active/peak circuit+throughput telemetry.
+- 2026-03-04: Added EWMA throughput smoothing and explicit ETA confidence telemetry to stabilize download operator readouts.
 
 # Appendices
 - Validation:

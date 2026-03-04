@@ -24,16 +24,16 @@ jobs:
         include:
           - platform: ubuntu-24.04
             label: linux-x64
-            args: "--bundles deb,rpm"
+            args: "--bundles appimage,deb,rpm"
           - platform: windows-latest
             label: windows-x64
-            args: ""
+            args: "--bundles none"
           - platform: macos-14
             label: macos-x64
-            args: "--target x86_64-apple-darwin"
+            args: "--target x86_64-apple-darwin --bundles app"
           - platform: macos-14
             label: macos-aarch64
-            args: "--target aarch64-apple-darwin"
+            args: "--target aarch64-apple-darwin --bundles app"
 
     steps:
       - name: Checkout
@@ -79,7 +79,10 @@ jobs:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: Onion Forger ${{ github.event.inputs.tag || github.ref_name }}
           releaseBody: |
-            Automated multi-platform release artifacts for Onion Forger.
+            Portable-first multi-platform release artifacts for Onion Forger.
+            - Windows: portable executable zip with bundled runtime dependencies
+            - macOS: portable .app bundles
+            - Linux: portable AppImage + package artifacts
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: false
@@ -118,3 +121,58 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ github.event.inputs.tag || github.ref_name }}" "$env:PORTABLE_ZIP" --clobber
+
+      - name: Package portable Linux AppImage asset
+        if: matrix.platform == 'ubuntu-24.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          appimage="$(find src-tauri/target -type f -name '*.AppImage' | head -n1)"
+          if [ -z "$appimage" ]; then
+            echo "No AppImage found under src-tauri/target" >&2
+            exit 1
+          fi
+          mkdir -p portable-assets
+          out="portable-assets/crawli_${tag}_linux_x64_portable.AppImage"
+          cp "$appimage" "$out"
+          chmod +x "$out"
+          echo "PORTABLE_LINUX_ASSET=$out" >> "$GITHUB_ENV"
+
+      - name: Upload portable Linux AppImage asset
+        if: matrix.platform == 'ubuntu-24.04'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.inputs.tag || github.ref_name }}" "$PORTABLE_LINUX_ASSET" --clobber
+
+      - name: Package portable macOS app bundle asset
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          if [ "${{ matrix.label }}" = "macos-x64" ]; then
+            app_path="$(find src-tauri/target/x86_64-apple-darwin/release/bundle/macos -maxdepth 1 -type d -name '*.app' | head -n1)"
+            arch="x64"
+          else
+            app_path="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -type d -name '*.app' | head -n1)"
+            arch="aarch64"
+          fi
+          if [ -z "${app_path:-}" ]; then
+            echo "No macOS .app bundle found for ${{ matrix.label }}" >&2
+            exit 1
+          fi
+          mkdir -p portable-assets
+          out="portable-assets/crawli_${tag}_macos_${arch}_portable.app.tar.gz"
+          tar -czf "$out" -C "$(dirname "$app_path")" "$(basename "$app_path")"
+          echo "PORTABLE_MAC_ASSET=$out" >> "$GITHUB_ENV"
+
+      - name: Upload portable macOS app bundle asset
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.inputs.tag || github.ref_name }}" "$PORTABLE_MAC_ASSET" --clobber

@@ -72,7 +72,9 @@ impl CrawlerAdapter for PearAdapter {
 
             workers.spawn(async move {
                 loop {
-                    if f.is_cancelled() { break; }
+                    if f.is_cancelled() {
+                        break;
+                    }
 
                     let next_url = match q_clone.pop() {
                         Some(url) => url,
@@ -91,81 +93,101 @@ impl CrawlerAdapter for PearAdapter {
                     let mut new_files = Vec::new();
 
                     let start_time = std::time::Instant::now();
-                        let mut html = String::new();
-                        // active_cid is just used inside the loop
+                    let mut html = String::new();
+                    // active_cid is just used inside the loop
 
-                        for _attempt in 0..4 {
-                            let (current_cid, current_client) = f.get_client();
-                            html = match tokio::time::timeout(std::time::Duration::from_secs(45), current_client.get(&next_url).send()).await {
-                                Ok(Ok(resp)) if resp.status().is_success() => match resp.text().await {
-                                    Ok(body) => body,
-                                    Err(_) => String::new(),
-                                },
-                                Ok(Ok(resp)) => {
-                                    if resp.status() == 404 { break; }
-                                    String::new()
-                                }
-                                _ => String::new(),
-                            };
-
-                            if !html.is_empty() {
-                                f.record_success(current_cid, html.len() as u64, start_time.elapsed().as_millis() as u64);
-                                break;
-                            } else {
-                                f.record_failure(current_cid);
+                    for _attempt in 0..4 {
+                        let (current_cid, current_client) = f.get_client();
+                        html = match tokio::time::timeout(
+                            std::time::Duration::from_secs(45),
+                            current_client.get(&next_url).send(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(resp)) if resp.status().is_success() => {
+                                resp.text().await.unwrap_or_default()
                             }
-                        }
+                            Ok(Ok(resp)) => {
+                                if resp.status() == 404 {
+                                    break;
+                                }
+                                String::new()
+                            }
+                            _ => String::new(),
+                        };
 
                         if !html.is_empty() {
-                            let parsed_files = crate::adapters::autoindex::parse_autoindex_html(&html);
-                            
-                            for doc in &parsed_files {
-                                let base_clean = next_url.trim_end_matches('/');
-                                let absolute_url = if doc.0.starts_with("http") {
-                                    doc.0.clone()
-                                } else if doc.0.starts_with('/') {
-                                    if let Ok(u) = url::Url::parse(&base_clean) {
-                                        format!("{}://{}{}", u.scheme(), u.host_str().unwrap_or(""), doc.0)
-                                    } else {
-                                        format!("{}{}", base_clean, doc.0)
-                                    }
-                                } else {
-                                    format!("{}/{}", base_clean, doc.0)
-                                };
-                                
-                                let file_entry = crate::adapters::FileEntry {
-                                    path: format!("/{}", doc.0),
-                                    size_bytes: doc.1,
-                                    entry_type: if doc.2 { crate::adapters::EntryType::Folder } else { crate::adapters::EntryType::File },
-                                    raw_url: absolute_url.clone(),
-                                };
-                                
-                                new_files.push(file_entry);
+                            f.record_success(
+                                current_cid,
+                                html.len() as u64,
+                                start_time.elapsed().as_millis() as u64,
+                            );
+                            break;
+                        } else {
+                            f.record_failure(current_cid);
+                        }
+                    }
 
-                                if doc.2 {
-                                    if absolute_url.matches('/').count() < 12 && f.mark_visited(&absolute_url) {
-                                        pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                        q_clone.push(absolute_url);
-                                    }
+                    if !html.is_empty() {
+                        let parsed_files = crate::adapters::autoindex::parse_autoindex_html(&html);
+
+                        for doc in &parsed_files {
+                            let base_clean = next_url.trim_end_matches('/');
+                            let absolute_url = if doc.0.starts_with("http") {
+                                doc.0.clone()
+                            } else if doc.0.starts_with('/') {
+                                if let Ok(u) = url::Url::parse(base_clean) {
+                                    format!(
+                                        "{}://{}{}",
+                                        u.scheme(),
+                                        u.host_str().unwrap_or(""),
+                                        doc.0
+                                    )
+                                } else {
+                                    format!("{}{}", base_clean, doc.0)
                                 }
+                            } else {
+                                format!("{}/{}", base_clean, doc.0)
+                            };
+
+                            let file_entry = crate::adapters::FileEntry {
+                                path: format!("/{}", doc.0),
+                                size_bytes: doc.1,
+                                entry_type: if doc.2 {
+                                    crate::adapters::EntryType::Folder
+                                } else {
+                                    crate::adapters::EntryType::File
+                                },
+                                raw_url: absolute_url.clone(),
+                            };
+
+                            new_files.push(file_entry);
+
+                            if doc.2
+                                && absolute_url.matches('/').count() < 12
+                                && f.mark_visited(&absolute_url)
+                            {
+                                pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                q_clone.push(absolute_url);
                             }
                         }
+                    }
 
-                        for file in &new_files {
-                            let _ = ui_tx_clone.send(file.clone()).await;
-                        }
+                    for file in &new_files {
+                        let _ = ui_tx_clone.send(file.clone()).await;
+                    }
 
-                        if !new_files.is_empty() {
-                            let mut lock = discovered_ref.lock().await;
-                            lock.extend(new_files);
-                        }
+                    if !new_files.is_empty() {
+                        let mut lock = discovered_ref.lock().await;
+                        lock.extend(new_files);
+                    }
 
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }
 
-        while let Some(_) = workers.join_next().await {}
+        while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
         let mut final_results = all_discovered_entries.lock().await;

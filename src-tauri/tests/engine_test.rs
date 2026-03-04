@@ -110,7 +110,7 @@ async fn test_frontier_clearnet_initialization() {
 
     // Clearnet: 1 client per daemon (breaks after first), minimum 1
     assert!(
-        frontier.http_clients.len() >= 1,
+        !frontier.http_clients.is_empty(),
         "Expected at least 1 clearnet client"
     );
     assert!(!frontier.is_onion);
@@ -127,6 +127,7 @@ async fn test_onion_listing_worker_target_stays_pinned_after_failures() {
         sizes: true,
         download: false,
         circuits: Some(120),
+        daemons: Some(4),
     };
     let frontier = CrawlerFrontier::new(
         None,
@@ -355,6 +356,7 @@ async fn test_crawl_options_propagation() {
             sizes: false,
             download: false,
             circuits: None,
+            daemons: None,
         },
     );
     assert!(!frontier.active_options.listing);
@@ -373,6 +375,7 @@ async fn test_crawl_options_propagation() {
             sizes: true,
             download: true,
             circuits: None,
+            daemons: None,
         },
     );
     assert!(frontier2.active_options.listing);

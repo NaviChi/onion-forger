@@ -1,4 +1,64 @@
 use std::fs::OpenOptions;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectIoPolicy {
+    Auto,
+    Always,
+    Off,
+}
+
+static DIRECT_IO_POLICY: OnceLock<DirectIoPolicy> = OnceLock::new();
+static DIRECT_IO_DEGRADED: AtomicBool = AtomicBool::new(false);
+
+pub fn direct_io_policy() -> DirectIoPolicy {
+    *DIRECT_IO_POLICY.get_or_init(|| {
+        match std::env::var("CRAWLI_DIRECT_IO")
+            .unwrap_or_else(|_| "auto".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "always" | "on" | "force" | "1" => DirectIoPolicy::Always,
+            "off" | "disabled" | "0" => DirectIoPolicy::Off,
+            _ => DirectIoPolicy::Auto,
+        }
+    })
+}
+
+pub fn direct_io_policy_label() -> &'static str {
+    match direct_io_policy() {
+        DirectIoPolicy::Auto => "auto",
+        DirectIoPolicy::Always => "always",
+        DirectIoPolicy::Off => "off",
+    }
+}
+
+pub fn should_try_direct_io() -> bool {
+    match direct_io_policy() {
+        DirectIoPolicy::Off => false,
+        DirectIoPolicy::Always => true,
+        DirectIoPolicy::Auto => !DIRECT_IO_DEGRADED.load(Ordering::Relaxed),
+    }
+}
+
+pub fn mark_direct_io_degraded() {
+    if direct_io_policy() == DirectIoPolicy::Auto {
+        DIRECT_IO_DEGRADED.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn is_direct_io_degraded() -> bool {
+    DIRECT_IO_DEGRADED.load(Ordering::Relaxed)
+}
+
+pub fn apply_direct_io_if_enabled(opts: &mut OpenOptions) -> bool {
+    if should_try_direct_io() {
+        apply_internal(opts);
+        return true;
+    }
+    false
+}
 
 /// Applies OS-specific bypasses for the page cache (Direct I/O) to an OpenOptions builder.
 /// This provides High-Frequency Trading tier disk speeds by writing data

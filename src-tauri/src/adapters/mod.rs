@@ -224,15 +224,18 @@ impl AdapterRegistry {
         }
 
         // Register all adapters — specific ones first, generic fallback last
-        registry
-            .adapters
-            .push(("worldleaks".to_string(), Box::new(worldleaks::WorldLeaksAdapter)));
-        registry
-            .adapters
-            .push(("dragonforce".to_string(), Box::new(dragonforce::DragonForceAdapter)));
-        registry
-            .adapters
-            .push(("inc_ransom".to_string(), Box::new(inc_ransom::IncRansomAdapter)));
+        registry.adapters.push((
+            "worldleaks".to_string(),
+            Box::new(worldleaks::WorldLeaksAdapter),
+        ));
+        registry.adapters.push((
+            "dragonforce".to_string(),
+            Box::new(dragonforce::DragonForceAdapter),
+        ));
+        registry.adapters.push((
+            "inc_ransom".to_string(),
+            Box::new(inc_ransom::IncRansomAdapter),
+        ));
         registry
             .adapters
             .push(("pear".to_string(), Box::new(pear::PearAdapter)));
@@ -241,13 +244,19 @@ impl AdapterRegistry {
             .push(("play".to_string(), Box::new(play::PlayAdapter)));
         registry
             .adapters
+            .push(("lockbit".to_string(), Box::new(lockbit::LockBitAdapter)));
+        registry
+            .adapters
             .push(("qilin".to_string(), Box::new(qilin::QilinAdapter)));
         registry
             .adapters
             .push(("nu_server".to_string(), Box::new(nu::NuServerAdapter)));
         registry // Error placeholder if lines changed again
             .adapters
-            .push(("autoindex".to_string(), Box::new(autoindex::AutoindexAdapter))); // Generic fallback — always last
+            .push((
+                "autoindex".to_string(),
+                Box::new(autoindex::AutoindexAdapter),
+            )); // Generic fallback — always last
 
         // Precompile RegexSet Engine securely for the Tier 2 Bouncer
         let mut regex_patterns = Vec::new();
@@ -258,7 +267,8 @@ impl AdapterRegistry {
                 regex_adapter_map.push(id.clone());
             }
         }
-        registry.regex_set = regex::RegexSet::new(&regex_patterns).unwrap_or_else(|_| regex::RegexSet::empty());
+        registry.regex_set =
+            regex::RegexSet::new(&regex_patterns).unwrap_or_else(|_| regex::RegexSet::empty());
         registry.regex_adapter_map = regex_adapter_map;
 
         registry
@@ -285,7 +295,11 @@ impl AdapterRegistry {
 
         // 2. TIER 2 M.A.C: RegexSet Bouncer Pre-Filtering
         // The regex engine tests the entire 5MB HTML body once instantly in C-Speed.
-        let matches: Vec<_> = self.regex_set.matches(&fingerprint.body).into_iter().collect();
+        let matches: Vec<_> = self
+            .regex_set
+            .matches(&fingerprint.body)
+            .into_iter()
+            .collect();
         let mut candidates_to_check: Vec<&Box<dyn CrawlerAdapter>> = Vec::new();
 
         if !matches.is_empty() {

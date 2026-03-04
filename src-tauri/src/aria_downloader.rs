@@ -36,14 +36,8 @@ impl DownloadLogger {
             .unwrap_or_default();
         let ts = now.as_secs();
         // Sanitize filename for log
-        let safe_name = filename_hint
-            .replace(['/', '\\', ':', '?', '*', '"', '<', '>', '|'], "_");
-        let log_path = format!(
-            "{}/ariaforge_{}_{}.log",
-            output_dir.trim_end_matches('/'),
-            safe_name,
-            ts
-        );
+        let safe_name = filename_hint.replace(['/', '\\', ':', '?', '*', '"', '<', '>', '|'], "_");
+        let log_path = Path::new(output_dir).join(format!("ariaforge_{}_{}.log", safe_name, ts));
 
         let file = OpenOptions::new()
             .create(true)
@@ -52,7 +46,7 @@ impl DownloadLogger {
             .ok();
 
         if file.is_some() {
-            eprintln!("[DownloadLogger] Writing to {}", log_path);
+            eprintln!("[DownloadLogger] Writing to {}", log_path.display());
         }
 
         DownloadLogger {
@@ -154,7 +148,9 @@ pub fn get_tor_path(app: &AppHandle) -> Result<PathBuf> {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    Err(anyhow!("Tor executable not found. Searched paths: {searched}"))
+    Err(anyhow!(
+        "Tor executable not found. Searched paths: {searched}"
+    ))
 }
 
 struct ActiveCircuitGuard {
@@ -176,12 +172,12 @@ const TOR_DATA_DIR_PREFIX: &str = "loki_tor_";
 const TOR_PID_FILE: &str = "loki_tor.pid";
 const STREAM_TIMEOUT_SECS: u64 = 15;
 const MAX_STALL_RETRIES: usize = 30;
-const PROBE_SIZE: u64 = 102_400;  // 100KB micro-probe (80% signal in 10% of time)
+const PROBE_SIZE: u64 = 102_400; // 100KB micro-probe (80% signal in 10% of time)
 const HANDSHAKE_CULL_RATIO: f64 = 0.50; // Kill bottom 50% by handshake latency
 
 // Phase 4.1: Adaptive piece sizing bounds
-const MIN_PIECE_SIZE: u64 = 5_242_880;   // 5MB minimum (Allows Tor TCP Window to reach maximum speed)
-const MAX_PIECE_SIZE: u64 = 52_428_800;  // 50MB maximum
+const MIN_PIECE_SIZE: u64 = 5_242_880; // 5MB minimum (Allows Tor TCP Window to reach maximum speed)
+const MAX_PIECE_SIZE: u64 = 52_428_800; // 50MB maximum
 
 /// Phase 4.1: Compute optimal piece size based on file size and circuit count.
 /// Targets ~8 pieces per circuit to balance granularity vs overhead.
@@ -198,7 +194,6 @@ fn compute_piece_size(content_length: u64, circuits: usize) -> u64 {
 const MIN_SPEED_RATIO: f64 = 0.20; // 20% of median = too slow
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
 
-
 const UNCHOKE_INTERVAL_SECS: u64 = 30; // Test a fresh circuit every 30s
 
 /// UCB1 Multi-Armed Bandit circuit scorer.
@@ -212,8 +207,8 @@ struct CircuitScorer {
     capacity: usize,
     // Phase 3: Mathematical Telemetry (Kalman Filtering)
     latency_kalman: Vec<std::sync::Mutex<crate::kalman::KalmanFilter>>,
-    latency_baseline: Vec<AtomicU64>,  // Baseline from first 3 pieces (ms)
-    latency_samples: Vec<AtomicU64>,   // Number of samples recorded
+    latency_baseline: Vec<AtomicU64>, // Baseline from first 3 pieces (ms)
+    latency_samples: Vec<AtomicU64>,  // Number of samples recorded
 }
 
 #[allow(dead_code)]
@@ -222,7 +217,9 @@ impl CircuitScorer {
         let mut kalmans = Vec::with_capacity(num_circuits);
         for _ in 0..num_circuits {
             // q = 10.0 (process noise), r = 100.0 (measurement noise for volatile Tor relays)
-            kalmans.push(std::sync::Mutex::new(crate::kalman::KalmanFilter::new(10.0, 100.0, 0.0)));
+            kalmans.push(std::sync::Mutex::new(crate::kalman::KalmanFilter::new(
+                10.0, 100.0, 0.0,
+            )));
         }
 
         CircuitScorer {
@@ -251,15 +248,21 @@ impl CircuitScorer {
 
     /// Phase 3: Record latency and update Kalman Filter predictive model
     fn record_latency(&self, cid: usize, elapsed_ms: u64) {
-        if cid >= self.capacity { return; }
+        if cid >= self.capacity {
+            return;
+        }
         let samples = self.latency_samples[cid].fetch_add(1, Ordering::Relaxed);
-        
+
         let mut kf = self.latency_kalman[cid].lock().unwrap();
 
         if samples < 3 {
             // Build baseline from first 3 pieces
             let old = self.latency_baseline[cid].load(Ordering::Relaxed);
-            let new_baseline = if old == 0 { elapsed_ms } else { (old + elapsed_ms) / 2 };
+            let new_baseline = if old == 0 {
+                elapsed_ms
+            } else {
+                (old + elapsed_ms) / 2
+            };
             self.latency_baseline[cid].store(new_baseline, Ordering::Relaxed);
             if kf.x == 0.0 {
                 kf.x = elapsed_ms as f64;
@@ -274,12 +277,18 @@ impl CircuitScorer {
 
     /// Phase 3: Predict if a circuit will stall using Kalman mathematics
     fn is_degrading(&self, cid: usize) -> bool {
-        if cid >= self.capacity { return false; }
+        if cid >= self.capacity {
+            return false;
+        }
         let samples = self.latency_samples[cid].load(Ordering::Relaxed);
-        if samples < 5 { return false; } // Need enough data
-        
+        if samples < 5 {
+            return false;
+        } // Need enough data
+
         let baseline = self.latency_baseline[cid].load(Ordering::Relaxed) as f64;
-        if baseline == 0.0 { return false; }
+        if baseline == 0.0 {
+            return false;
+        }
 
         let kf = self.latency_kalman[cid].lock().unwrap();
         let prediction = kf.predict();
@@ -291,7 +300,9 @@ impl CircuitScorer {
 
     /// Compute Thompson Sampling score for a circuit (higher = should get more pieces)
     fn thompson_score(&self, cid: usize) -> f64 {
-        if cid >= self.capacity { return 0.0; }
+        if cid >= self.capacity {
+            return 0.0;
+        }
         let n = self.pieces_completed[cid].load(Ordering::Relaxed);
         if n == 0 {
             return f64::MAX; // Untested = infinite score (explore first)
@@ -305,23 +316,30 @@ impl CircuitScorer {
             let kf = self.latency_kalman[cid].lock().unwrap();
             kf.p
         };
-        if variance < 0.001 { variance = 0.001; }
-        
+        if variance < 0.001 {
+            variance = 0.001;
+        }
+
         // Box-Muller transform for normal distribution N(mean, variance) Lock-Free
         let std_dev = variance.sqrt();
-        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let u1 = (((time ^ (time >> 12)) % 10000) as f64 / 10000.0).max(0.0001);
         let u2 = (((time ^ (time >> 20)) % 10000) as f64 / 10000.0).max(0.0001);
-        
+
         let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
         let thompson_scaling_factor = 0.01;
-        
+
         avg_speed + (z0 * std_dev * thompson_scaling_factor)
     }
 
     /// Compute average speed in MB/s for a circuit
     fn avg_speed_mbps(&self, cid: usize) -> f64 {
-        if cid >= self.capacity { return 0.0; }
+        if cid >= self.capacity {
+            return 0.0;
+        }
         let total_b = self.total_bytes[cid].load(Ordering::Relaxed) as f64;
         let total_ms = self.total_elapsed_ms[cid].load(Ordering::Relaxed).max(1) as f64;
         (total_b / total_ms) * 1000.0 / 1_048_576.0 // Convert bytes/ms to MB/s
@@ -331,20 +349,28 @@ impl CircuitScorer {
     /// Fast circuits: 0ms. Slow circuits: up to 1000ms.
     /// This naturally gives more work to faster circuits.
     fn yield_delay(&self, cid: usize) -> Duration {
-        if cid >= self.capacity { return Duration::ZERO; }
+        if cid >= self.capacity {
+            return Duration::ZERO;
+        }
         let my_score = self.thompson_score(cid);
-        if my_score == f64::MAX { return Duration::ZERO; } // Untested, no delay
+        if my_score == f64::MAX {
+            return Duration::ZERO;
+        } // Untested, no delay
 
         // Collect scores of all active circuits
         let mut scores: Vec<f64> = (0..self.capacity)
             .filter(|&i| self.pieces_completed[i].load(Ordering::Relaxed) > 0)
             .map(|i| self.thompson_score(i))
             .collect();
-        if scores.is_empty() { return Duration::ZERO; }
+        if scores.is_empty() {
+            return Duration::ZERO;
+        }
 
         scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         let best = scores.first().copied().unwrap_or(1.0);
-        if best <= 0.0 { return Duration::ZERO; }
+        if best <= 0.0 {
+            return Duration::ZERO;
+        }
 
         // Ratio: 0.0 (worst) to 1.0 (best)
         let ratio = (my_score / best).clamp(0.0, 1.0);
@@ -430,7 +456,7 @@ pub struct DownloadCompleteEvent {
 pub struct SpeedEvent {
     pub speed_mbps: f64,
     pub elapsed_secs: f64,
-    pub eta_secs: f64,  // -1 = unknown
+    pub eta_secs: f64, // -1 = unknown
 }
 
 #[derive(Clone, Serialize)]
@@ -537,6 +563,88 @@ fn parse_content_range_total(header_value: &str) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+static DIRECT_IO_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+
+fn open_file_with_adaptive_io(
+    path: &Path,
+    read: bool,
+    write: bool,
+    create: bool,
+    truncate: bool,
+    app: &AppHandle,
+    logger: Option<&DownloadLogger>,
+) -> Result<File> {
+    fn configure_options(
+        opts: &mut OpenOptions,
+        read: bool,
+        write: bool,
+        create: bool,
+        truncate: bool,
+    ) {
+        opts.read(read)
+            .write(write)
+            .create(create)
+            .truncate(truncate);
+    }
+
+    let mut direct_open_error: Option<std::io::Error> = None;
+    let mut attempted_direct = false;
+
+    if crate::io_vanguard::should_try_direct_io() {
+        attempted_direct = true;
+        let mut opts = OpenOptions::new();
+        configure_options(&mut opts, read, write, create, truncate);
+        let _ = crate::io_vanguard::apply_direct_io_if_enabled(&mut opts);
+        match opts.open(path) {
+            Ok(file) => {
+                crate::io_vanguard::post_open_config(&file);
+                return Ok(file);
+            }
+            Err(err) => {
+                direct_open_error = Some(err);
+            }
+        }
+    }
+
+    if let Some(err) = direct_open_error {
+        crate::io_vanguard::mark_direct_io_degraded();
+        if !DIRECT_IO_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+            let warn = format!(
+                "[IO] Direct I/O open failed for {} ({}). Falling back to buffered writes (policy={}).",
+                path.display(),
+                err,
+                crate::io_vanguard::direct_io_policy_label()
+            );
+            let _ = app.emit("log", warn.clone());
+            if let Some(log) = logger {
+                log.log(app, warn);
+            }
+        }
+        if crate::io_vanguard::direct_io_policy() == crate::io_vanguard::DirectIoPolicy::Always {
+            return Err(anyhow!(
+                "direct I/O policy is 'always' and open failed for {}: {}",
+                path.display(),
+                err
+            ));
+        }
+    } else if attempted_direct && crate::io_vanguard::is_direct_io_degraded() {
+        // Keep state explicit in logs when auto mode is already degraded.
+        let _ = app.emit(
+            "log",
+            format!(
+                "[IO] Direct I/O remains degraded; using buffered writes for {}.",
+                path.display()
+            ),
+        );
+    }
+
+    let mut fallback_opts = OpenOptions::new();
+    configure_options(&mut fallback_opts, read, write, create, truncate);
+    let file = fallback_opts.open(path)?;
+    crate::io_vanguard::post_open_config(&file);
+    Ok(file)
+}
+
 fn terminate_pid(pid: u32) {
     #[cfg(target_os = "windows")]
     {
@@ -594,7 +702,6 @@ pub fn cleanup_stale_tor_daemons() {
 fn is_port_available(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
-
 
 async fn probe_target(client: &Client, url: &str, app: &AppHandle) -> Result<ProbeResult> {
     let mut content_length = 0u64;
@@ -700,14 +807,77 @@ pub struct BatchFileEntry {
 #[derive(Clone, Serialize)]
 pub struct BatchProgressEvent {
     pub completed: usize,
+    pub failed: usize,
     pub total: usize,
     pub current_file: String,
     pub speed_mbps: f64,
+    pub downloaded_bytes: u64,
+    pub active_circuits: Option<usize>,
 }
 
 /// Size threshold: files above this use the full work queue + steal mode (existing start_download).
 /// Files below this are downloaded as whole files, one per circuit, concurrently.
 const BATCH_LARGE_THRESHOLD: u64 = 100 * 1_048_576; // 100MB
+
+#[derive(Clone)]
+struct ScheduledBatchFile {
+    entry: BatchFileEntry,
+    estimated_size: u64,
+    enqueue_order: usize,
+}
+
+fn srpt_scheduler_enabled() -> bool {
+    match std::env::var("CRAWLI_BATCH_SRPT") {
+        Ok(value) => {
+            let normalized = value.to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "on" || normalized == "yes"
+        }
+        Err(_) => true,
+    }
+}
+
+fn srpt_starvation_interval() -> usize {
+    std::env::var("CRAWLI_BATCH_STARVATION_INTERVAL")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(12)
+}
+
+fn schedule_srpt_with_starvation(mut files: Vec<ScheduledBatchFile>) -> Vec<BatchFileEntry> {
+    if files.len() <= 1 || !srpt_scheduler_enabled() {
+        files.sort_by_key(|file| file.enqueue_order);
+        return files.into_iter().map(|file| file.entry).collect();
+    }
+
+    let starvation_interval = srpt_starvation_interval();
+    let mut dispatch_order = Vec::with_capacity(files.len());
+    let mut dispatched = 0usize;
+
+    while !files.is_empty() {
+        let use_starvation_guard = dispatched > 0 && dispatched.is_multiple_of(starvation_interval);
+        let selected_idx = if use_starvation_guard {
+            files
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, file)| file.enqueue_order)
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        } else {
+            files
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, file)| (file.estimated_size.max(1), file.enqueue_order))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        };
+        let selected = files.swap_remove(selected_idx);
+        dispatch_order.push(selected.entry);
+        dispatched += 1;
+    }
+
+    dispatch_order
+}
 
 pub async fn start_batch_download(
     app: AppHandle,
@@ -718,72 +888,147 @@ pub async fn start_batch_download(
     control: DownloadControl,
 ) -> Result<()> {
     let requested_circuits = num_circuits.max(1);
-    let is_onion = files.first().map(|f| f.url.contains(".onion")).unwrap_or(false) || force_tor;
+    let total_files = files.len();
+    let overall_completed = Arc::new(AtomicUsize::new(0));
+    let overall_failed = Arc::new(AtomicUsize::new(0));
+    let overall_downloaded_bytes = Arc::new(AtomicU64::new(0));
+    let active_batch_circuits = Arc::new(AtomicUsize::new(0));
+    let is_onion = files
+        .first()
+        .map(|f| f.url.contains(".onion"))
+        .unwrap_or(false)
+        || force_tor;
     // Dynamically detect active Tor daemon ports
     let mut active_ports: Vec<u16> = Vec::new();
-    let daemon_count;
-    if is_onion {
+    let daemon_count = if is_onion {
         for port in 9051..=9070 {
             if !is_port_available(port) {
                 active_ports.push(port);
             }
         }
-        daemon_count = active_ports.len().max(1);
+        active_ports.len().max(1)
     } else {
-        daemon_count = 1;
-    }
+        1
+    };
     if active_ports.is_empty() {
         active_ports.push(9051);
     }
 
     // -- Probe all files and sort into small vs large --
     let sniff_client = stream_download_client(is_onion, active_ports[0])?;
-    let mut small_files: Vec<BatchFileEntry> = Vec::new();
-    let mut large_files: Vec<BatchFileEntry> = Vec::new();
+    let mut small_candidates: Vec<ScheduledBatchFile> = Vec::new();
+    let mut large_candidates: Vec<ScheduledBatchFile> = Vec::new();
+    let mut enqueue_order = 0usize;
 
-    let _ = app.emit("log", format!("[*] Batch: probing {} files...", files.len()));
+    let _ = app.emit(
+        "log",
+        format!("[*] Batch: probing {} files...", files.len()),
+    );
 
     for file in &files {
-        if control.interruption_reason().is_some() { return Ok(()); }
-        
+        if control.interruption_reason().is_some() {
+            return Ok(());
+        }
+
         // Smart Skip Idempotency
         if let Some(hint) = file.size_hint {
             if let Ok(meta) = std::fs::metadata(&file.path) {
                 if meta.len() == hint && hint > 0 {
-                    let _ = app.emit("log", format!("[✓] Smart Skip: File exists and matches size ({} bytes): {}", hint, file.path));
+                    let _ = app.emit(
+                        "log",
+                        format!(
+                            "[✓] Smart Skip: File exists and matches size ({} bytes): {}",
+                            hint, file.path
+                        ),
+                    );
+                    overall_downloaded_bytes.fetch_add(hint, Ordering::Relaxed);
+                    let completed = overall_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = app.emit(
+                        "batch_progress",
+                        BatchProgressEvent {
+                            completed,
+                            failed: overall_failed.load(Ordering::Relaxed),
+                            total: total_files,
+                            current_file: file.path.clone(),
+                            speed_mbps: 0.0,
+                            downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
+                            active_circuits: Some(active_batch_circuits.load(Ordering::Relaxed)),
+                        },
+                    );
                     continue;
                 }
             }
         }
-        
+
         match probe_target(&sniff_client, &file.url, &app).await {
             Ok(probe) => {
+                let estimated_size = file.size_hint.unwrap_or(probe.content_length);
                 if probe.content_length <= BATCH_LARGE_THRESHOLD {
-                    small_files.push(file.clone());
+                    small_candidates.push(ScheduledBatchFile {
+                        entry: file.clone(),
+                        estimated_size,
+                        enqueue_order,
+                    });
                 } else {
-                    large_files.push(file.clone());
+                    large_candidates.push(ScheduledBatchFile {
+                        entry: file.clone(),
+                        estimated_size,
+                        enqueue_order,
+                    });
                 }
             }
-            Err(_) => small_files.push(file.clone()),
+            Err(_) => small_candidates.push(ScheduledBatchFile {
+                entry: file.clone(),
+                estimated_size: file
+                    .size_hint
+                    .unwrap_or(BATCH_LARGE_THRESHOLD.saturating_sub(1)),
+                enqueue_order,
+            }),
         }
+        enqueue_order = enqueue_order.saturating_add(1);
     }
 
-    let _ = app.emit("log", format!(
-        "[+] Batch routing: {} small (concurrent) + {} large (full pipeline)",
-        small_files.len(), large_files.len()
-    ));
+    let scheduler_enabled = srpt_scheduler_enabled();
+    let starvation_interval = srpt_starvation_interval();
+    let small_files = schedule_srpt_with_starvation(small_candidates);
+    let large_files = schedule_srpt_with_starvation(large_candidates);
+
+    let _ = app.emit(
+        "log",
+        format!(
+            "[*] Batch scheduler: {} (starvation guard every {} picks)",
+            if scheduler_enabled {
+                "SRPT+Aging"
+            } else {
+                "FIFO"
+            },
+            starvation_interval
+        ),
+    );
+
+    let _ = app.emit(
+        "log",
+        format!(
+            "[+] Batch routing: {} small (concurrent) + {} large (full pipeline)",
+            small_files.len(),
+            large_files.len()
+        ),
+    );
 
     // -- Phase 1: Download small files concurrently (one file per circuit) --
     if !small_files.is_empty() {
         let total_small = small_files.len();
         let next_file = Arc::new(AtomicUsize::new(0));
-        let files_completed = Arc::new(AtomicUsize::new(0));
-        let total_bytes = Arc::new(AtomicU64::new(0));
+        let phase_completed = Arc::new(AtomicUsize::new(0));
+        let phase_bytes = Arc::new(AtomicU64::new(0));
 
-        let _ = app.emit("log", format!(
-            "[*] Phase 1: {} small files across {} circuits",
-            total_small, requested_circuits
-        ));
+        let _ = app.emit(
+            "log",
+            format!(
+                "[*] Phase 1: {} small files across {} circuits",
+                total_small, requested_circuits
+            ),
+        );
 
         let mut tasks = JoinSet::new();
         for circuit_id in 0..requested_circuits {
@@ -795,8 +1040,12 @@ pub async fn start_batch_download(
 
             let task_files = small_files.clone();
             let task_next = Arc::clone(&next_file);
-            let task_done = Arc::clone(&files_completed);
-            let task_bytes = Arc::clone(&total_bytes);
+            let task_phase_completed = Arc::clone(&phase_completed);
+            let task_phase_bytes = Arc::clone(&phase_bytes);
+            let task_overall_completed = Arc::clone(&overall_completed);
+            let task_overall_failed = Arc::clone(&overall_failed);
+            let task_overall_bytes = Arc::clone(&overall_downloaded_bytes);
+            let task_active_batch_circuits = Arc::clone(&active_batch_circuits);
             let task_app = app.clone();
             let task_control = control.clone();
 
@@ -814,8 +1063,10 @@ pub async fn start_batch_download(
                     }
 
                     // Download entire file with retries
+                    let _active_guard = ActiveCircuitGuard::new(Arc::clone(&task_active_batch_circuits));
                     let mut retries = 0;
                     let mut success = false;
+                    let mut downloaded_len = 0u64;
                     while retries < 5 && !success {
                         let resp = match tokio::time::timeout(
                             Duration::from_secs(120),
@@ -854,7 +1105,7 @@ pub async fn start_batch_download(
                             Ok(Ok(bytes)) => {
                                 let len = bytes.len() as u64;
                                 if fs::write(&entry.path, &bytes).is_ok() {
-                                    task_bytes.fetch_add(len, Ordering::Relaxed);
+                                    downloaded_len = len;
                                     success = true;
                                 }
                             }
@@ -862,44 +1113,173 @@ pub async fn start_batch_download(
                         }
                     }
 
-                    let completed = task_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    let _ = task_app.emit("batch_progress", BatchProgressEvent {
-                        completed,
-                        total: task_files.len(),
-                        current_file: entry.path.clone(),
-                        speed_mbps: 0.0,
-                    });
+                    if success {
+                        task_phase_completed.fetch_add(1, Ordering::Relaxed);
+                        task_phase_bytes.fetch_add(downloaded_len, Ordering::Relaxed);
+                        task_overall_bytes.fetch_add(downloaded_len, Ordering::Relaxed);
+                        let completed = task_overall_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        let failed = task_overall_failed.load(Ordering::Relaxed);
+                        let _ = task_app.emit(
+                            "batch_progress",
+                            BatchProgressEvent {
+                                completed,
+                                failed,
+                                total: total_files,
+                                current_file: entry.path.clone(),
+                                speed_mbps: 0.0,
+                                downloaded_bytes: task_overall_bytes.load(Ordering::Relaxed),
+                                active_circuits: Some(
+                                    task_active_batch_circuits.load(Ordering::Relaxed),
+                                ),
+                            },
+                        );
+                    } else {
+                        let failed = task_overall_failed.fetch_add(1, Ordering::Relaxed) + 1;
+                        let completed = task_overall_completed.load(Ordering::Relaxed);
+                        let _ = task_app.emit(
+                            "batch_progress",
+                            BatchProgressEvent {
+                                completed,
+                                failed,
+                                total: total_files,
+                                current_file: entry.path.clone(),
+                                speed_mbps: 0.0,
+                                downloaded_bytes: task_overall_bytes.load(Ordering::Relaxed),
+                                active_circuits: Some(
+                                    task_active_batch_circuits.load(Ordering::Relaxed),
+                                ),
+                            },
+                        );
+                    }
                 }
             });
         }
 
         while tasks.join_next().await.is_some() {}
 
-        let done = files_completed.load(Ordering::Relaxed);
-        let bytes = total_bytes.load(Ordering::Relaxed);
-        let _ = app.emit("log", format!(
-            "[+] Phase 1 complete: {}/{} small files ({:.2} GB)",
-            done, total_small, bytes as f64 / 1_073_741_824.0
-        ));
+        let done = phase_completed.load(Ordering::Relaxed);
+        let bytes = phase_bytes.load(Ordering::Relaxed);
+        let _ = app.emit(
+            "log",
+            format!(
+                "[+] Phase 1 complete: {}/{} small files ({:.2} GB)",
+                done,
+                total_small,
+                bytes as f64 / 1_073_741_824.0
+            ),
+        );
     }
 
     // -- Phase 2: Download large files with full pipeline (tournament + steal) --
     for (i, file) in large_files.iter().enumerate() {
-        if control.interruption_reason().is_some() { break; }
+        if control.interruption_reason().is_some() {
+            break;
+        }
 
-        let _ = app.emit("log", format!(
-            "[*] Phase 2: Large file {}/{}: {}",
-            i + 1, large_files.len(), file.path
-        ));
+        let _ = app.emit(
+            "log",
+            format!(
+                "[*] Phase 2: Large file {}/{}: {}",
+                i + 1,
+                large_files.len(),
+                file.path
+            ),
+        );
+
+        let _ = app.emit(
+            "batch_progress",
+            BatchProgressEvent {
+                completed: overall_completed.load(Ordering::Relaxed),
+                failed: overall_failed.load(Ordering::Relaxed),
+                total: total_files,
+                current_file: file.path.clone(),
+                speed_mbps: 0.0,
+                downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
+                active_circuits: None,
+            },
+        );
 
         let inner_control = DownloadControl::new();
-        let _ = start_download(
-            app.clone(), file.url.clone(), file.path.clone(),
-            num_circuits, force_tor, output_dir.clone(), inner_control,
-        ).await;
+        let result = start_download(
+            app.clone(),
+            file.url.clone(),
+            file.path.clone(),
+            num_circuits,
+            force_tor,
+            output_dir.clone(),
+            inner_control,
+        )
+        .await;
+
+        match result {
+            Ok(()) => {
+                let bytes = std::fs::metadata(&file.path)
+                    .map(|meta| meta.len())
+                    .ok()
+                    .or(file.size_hint)
+                    .unwrap_or(0);
+                if bytes > 0 {
+                    overall_downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+                let completed = overall_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = app.emit(
+                    "batch_progress",
+                    BatchProgressEvent {
+                        completed,
+                        failed: overall_failed.load(Ordering::Relaxed),
+                        total: total_files,
+                        current_file: file.path.clone(),
+                        speed_mbps: 0.0,
+                        downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
+                        active_circuits: None,
+                    },
+                );
+            }
+            Err(err) => {
+                let failed = overall_failed.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = app.emit(
+                    "log",
+                    format!("[!] Large file failed: {} ({})", file.path, err),
+                );
+                let _ = app.emit(
+                    "batch_progress",
+                    BatchProgressEvent {
+                        completed: overall_completed.load(Ordering::Relaxed),
+                        failed,
+                        total: total_files,
+                        current_file: file.path.clone(),
+                        speed_mbps: 0.0,
+                        downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
+                        active_circuits: None,
+                    },
+                );
+            }
+        }
     }
 
-    let _ = app.emit("log", format!("[✓] Batch complete: {} files processed", files.len()));
+    let completed = overall_completed.load(Ordering::Relaxed);
+    let failed = overall_failed.load(Ordering::Relaxed);
+    let _ = app.emit(
+        "batch_progress",
+        BatchProgressEvent {
+            completed,
+            failed,
+            total: total_files,
+            current_file: "Batch complete".to_string(),
+            speed_mbps: 0.0,
+            downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
+            active_circuits: Some(0),
+        },
+    );
+    let _ = app.emit(
+        "log",
+        format!(
+            "[✓] Batch complete: {} processed ({} success, {} failed)",
+            completed + failed,
+            completed,
+            failed
+        ),
+    );
     Ok(())
 }
 
@@ -931,7 +1311,10 @@ pub async fn start_download(
     logger.log(&app, "[*] Aria Forge Download Session".to_string());
     logger.log(&app, format!("[*] URL: {}", url));
     logger.log(&app, format!("[*] Output: {}", output_target));
-    logger.log(&app, format!("[*] Circuits: {} | Tor: {}", requested_circuits, is_onion));
+    logger.log(
+        &app,
+        format!("[*] Circuits: {} | Tor: {}", requested_circuits, is_onion),
+    );
 
     // Detect or bootstrap Tor daemons dynamically
     let mut daemon_count = 0usize;
@@ -950,29 +1333,48 @@ pub async fn start_download(
 
         if active_ports.is_empty() {
             // No running daemons found — bootstrap our own cluster
-            logger.log(&app, "[*] No active Tor daemons detected. Bootstrapping fresh Aria Forge cluster...".to_string());
-            
+            logger.log(
+                &app,
+                "[*] No active Tor daemons detected. Bootstrapping fresh Aria Forge cluster..."
+                    .to_string(),
+            );
+
             match crate::tor::bootstrap_tor_cluster(app.clone(), 4).await {
                 Ok((guard, ports)) => {
                     _tor_guard = Some(guard);
                     active_ports = ports.clone();
                     daemon_count = ports.len();
-                    logger.log(&app, format!("[✓] Aria Forge Tor cluster ready: {} daemons on {:?}", daemon_count, active_ports));
-                },
+                    logger.log(
+                        &app,
+                        format!(
+                            "[✓] Aria Forge Tor cluster ready: {} daemons on {:?}",
+                            daemon_count, active_ports
+                        ),
+                    );
+                }
                 Err(e) => {
                     return Err(anyhow!("Failed to bootstrap Aria Forge Tor cluster: {}", e));
                 }
             }
         } else {
             daemon_count = active_ports.len();
-            logger.log(&app, format!("[✓] Reusing {} active Crawli Tor daemons on {:?}", daemon_count, active_ports));
+            logger.log(
+                &app,
+                format!(
+                    "[✓] Reusing {} active Crawli Tor daemons on {:?}",
+                    daemon_count, active_ports
+                ),
+            );
         }
 
         let _ = app.emit(
             "tor_status",
             TorStatusEvent {
                 state: "ready".to_string(),
-                message: format!("Aria Forge: {} Tor daemons active on {:?}", daemon_count, active_ports),
+                message: format!(
+                    "Aria Forge: {} Tor daemons active on {:?}",
+                    daemon_count, active_ports
+                ),
                 daemon_count,
             },
         );
@@ -1001,7 +1403,13 @@ pub async fn start_download(
     if probe.content_length > 0 {
         if let Ok(meta) = std::fs::metadata(&output_target) {
             if meta.len() == probe.content_length {
-                logger.log(&app, format!("[✓] Smart Skip: File already completes locally ({} bytes).", probe.content_length));
+                logger.log(
+                    &app,
+                    format!(
+                        "[✓] Smart Skip: File already completes locally ({} bytes).",
+                        probe.content_length
+                    ),
+                );
                 return Ok(());
             }
         }
@@ -1079,22 +1487,32 @@ pub async fn start_download(
     }
 
     if !is_resuming {
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        crate::io_vanguard::apply_direct_io(&mut opts);
-        let file = opts.open(&temp_target)?;
-        crate::io_vanguard::post_open_config(&file);
+        let file = open_file_with_adaptive_io(
+            Path::new(&temp_target),
+            false,
+            true,
+            true,
+            true,
+            &app,
+            Some(&logger),
+        )?;
         // Pre-allocate full file size to prevent fragmentation
         if range_mode && state.content_length > 0 {
             file.set_len(state.content_length)?;
-            let _ = app.emit("log", format!(
-                "[+] Pre-allocated {:.2} GB on disk",
-                state.content_length as f64 / 1_073_741_824.0
-            ));
-            logger.log(&app, format!(
-                "[+] Pre-allocated {:.2} GB on disk",
-                state.content_length as f64 / 1_073_741_824.0
-            ));
+            let _ = app.emit(
+                "log",
+                format!(
+                    "[+] Pre-allocated {:.2} GB on disk",
+                    state.content_length as f64 / 1_073_741_824.0
+                ),
+            );
+            logger.log(
+                &app,
+                format!(
+                    "[+] Pre-allocated {:.2} GB on disk",
+                    state.content_length as f64 / 1_073_741_824.0
+                ),
+            );
         }
     }
 
@@ -1113,6 +1531,8 @@ pub async fn start_download(
         None
     };
 
+    let writer_app = app.clone();
+    let writer_logger = logger.clone();
     let writer_handle = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut active_filepath = String::new();
         let mut active_file: Option<File> = None;
@@ -1148,13 +1568,16 @@ pub async fn start_download(
                     if let Some(dir) = Path::new(&msg.filepath).parent() {
                         fs::create_dir_all(dir)?;
                     }
-                    let mut opts = OpenOptions::new();
-                    // Maps require Read+Write
-                    opts.read(true).write(true).create(true).truncate(false);
-                    crate::io_vanguard::apply_direct_io(&mut opts);
-                    let file = opts.open(&msg.filepath)?;
-                    crate::io_vanguard::post_open_config(&file);
-                    
+                    let file = open_file_with_adaptive_io(
+                        Path::new(&msg.filepath),
+                        true,
+                        true,
+                        true,
+                        false,
+                        &writer_app,
+                        Some(&writer_logger),
+                    )?;
+
                     if let Some((st, _)) = &local_state {
                         if st.content_length > 0 {
                             // Phase 7: HFT Memory-Mapped Virtual Disk (HDD compatibility)
@@ -1198,7 +1621,7 @@ pub async fn start_download(
                         let chunk_start = msg.chunk_id as u64 * state.chunk_size;
                         let written_global = msg.offset + msg.data.len() as u64;
                         let chunk_offset = written_global.saturating_sub(chunk_start);
-                        
+
                         if chunk_offset > state.current_offsets[msg.chunk_id] {
                             state.current_offsets[msg.chunk_id] = chunk_offset;
                         }
@@ -1277,33 +1700,50 @@ pub async fn start_download(
             } else {
                 0.0
             };
-            let bytes_per_sec = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
+            let bytes_per_sec = if elapsed > 0.0 {
+                downloaded as f64 / elapsed
+            } else {
+                0.0
+            };
             let eta_secs = if bytes_per_sec > 0.0 && watcher_content_length > 0 {
                 let remaining = watcher_content_length.saturating_sub(downloaded) as f64;
                 remaining / bytes_per_sec
             } else {
                 -1.0
             };
-            
-            let _ = watcher_app.emit("download_progress_update", DownloadProgressEvent {
-                path: watcher_path.clone(),
-                bytes_downloaded: downloaded,
-                total_bytes: if watcher_content_length > 0 { Some(watcher_content_length) } else { None },
-                speed_bps: bytes_per_sec as u64,
-                active_circuits: watcher_active.load(Ordering::Relaxed),
-            });
 
-            let _ = watcher_app.emit("speed", SpeedEvent {
-                speed_mbps,
-                elapsed_secs: elapsed,
-                eta_secs,
-            });
+            let _ = watcher_app.emit(
+                "download_progress_update",
+                DownloadProgressEvent {
+                    path: watcher_path.clone(),
+                    bytes_downloaded: downloaded,
+                    total_bytes: if watcher_content_length > 0 {
+                        Some(watcher_content_length)
+                    } else {
+                        None
+                    },
+                    speed_bps: bytes_per_sec as u64,
+                    active_circuits: watcher_active.load(Ordering::Relaxed),
+                },
+            );
+
+            let _ = watcher_app.emit(
+                "speed",
+                SpeedEvent {
+                    speed_mbps,
+                    elapsed_secs: elapsed,
+                    eta_secs,
+                },
+            );
         }
-        let _ = watcher_app.emit("speed", SpeedEvent {
-            speed_mbps: 0.0,
-            elapsed_secs: start_time.elapsed().as_secs_f64(),
-            eta_secs: 0.0,
-        });
+        let _ = watcher_app.emit(
+            "speed",
+            SpeedEvent {
+                speed_mbps: 0.0,
+                elapsed_secs: start_time.elapsed().as_secs_f64(),
+                eta_secs: 0.0,
+            },
+        );
     });
 
     let mut tasks = JoinSet::new();
@@ -1315,17 +1755,22 @@ pub async fn start_download(
         let piece_size = compute_piece_size(content_length, effective_circuits);
         let total_pieces = content_length.div_ceil(piece_size) as usize;
 
-        logger.log(&app, format!(
-            "[*] Phase 4.1: Adaptive piece size: {:.1} MB ({} pieces)",
-            piece_size as f64 / 1_048_576.0, total_pieces
-        ));
+        logger.log(
+            &app,
+            format!(
+                "[*] Phase 4.1: Adaptive piece size: {:.1} MB ({} pieces)",
+                piece_size as f64 / 1_048_576.0,
+                total_pieces
+            ),
+        );
 
         // Build or restore the piece completion tracker
-        let piece_completed: Vec<bool> = if state.piece_mode && state.completed_pieces.len() == total_pieces {
-            state.completed_pieces.clone()
-        } else {
-            vec![false; total_pieces]
-        };
+        let piece_completed: Vec<bool> =
+            if state.piece_mode && state.completed_pieces.len() == total_pieces {
+                state.completed_pieces.clone()
+            } else {
+                vec![false; total_pieces]
+            };
 
         // Save piece_mode state
         state.piece_mode = true;
@@ -1337,7 +1782,10 @@ pub async fn start_download(
         if pieces_done_count > 0 {
             let _ = app.emit(
                 "log",
-                format!("[+] Resuming: {}/{} pieces already complete.", pieces_done_count, total_pieces),
+                format!(
+                    "[+] Resuming: {}/{} pieces already complete.",
+                    pieces_done_count, total_pieces
+                ),
             );
         }
 
@@ -1356,7 +1804,7 @@ pub async fn start_download(
         let tournament_pool = if total_pieces >= scaled_circuits * 3 {
             (scaled_circuits * 2).min(effective_circuits * 2) // Full tournament
         } else {
-            scaled_circuits  // Not enough work — skip tournament, direct assign
+            scaled_circuits // Not enough work — skip tournament, direct assign
         };
         let max_promoted = scaled_circuits;
         let skip_tournament = tournament_pool <= scaled_circuits;
@@ -1375,20 +1823,26 @@ pub async fn start_download(
         // Shared state: atomic next-piece index and piece completion array
         let next_piece = Arc::new(AtomicUsize::new(0));
         let piece_flags: Arc<Vec<AtomicBool>> = Arc::new(
-            piece_completed.iter().map(|&done| AtomicBool::new(done)).collect()
+            piece_completed
+                .iter()
+                .map(|&done| AtomicBool::new(done))
+                .collect(),
         );
         // Track which circuit owns each in-progress piece (for kill-after-steal)
         let piece_owner: Arc<Vec<AtomicUsize>> = Arc::new(
-            (0..total_pieces).map(|_| AtomicUsize::new(usize::MAX)).collect()
+            (0..total_pieces)
+                .map(|_| AtomicUsize::new(usize::MAX))
+                .collect(),
         );
         // Kill flags: when a circuit gets stolen from, it's marked for death
         let circuit_killed: Arc<Vec<AtomicBool>> = Arc::new(
-            (0..tournament_pool).map(|_| AtomicBool::new(false)).collect()
+            (0..tournament_pool)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
         );
         // Per-circuit byte counters for health monitoring
-        let circuit_bytes: Arc<Vec<AtomicU64>> = Arc::new(
-            (0..tournament_pool).map(|_| AtomicU64::new(0)).collect()
-        );
+        let circuit_bytes: Arc<Vec<AtomicU64>> =
+            Arc::new((0..tournament_pool).map(|_| AtomicU64::new(0)).collect());
         // Global server health: rises when many circuits fail, triggers coordinated pause
         let server_fail_count = Arc::new(AtomicUsize::new(0));
 
@@ -1401,9 +1855,15 @@ pub async fn start_download(
         let _ = app.emit(
             "log",
             if skip_tournament {
-                format!("[+] {} file ({} pieces) → {} circuits (no tournament)", tier, total_pieces, scaled_circuits)
+                format!(
+                    "[+] {} file ({} pieces) → {} circuits (no tournament)",
+                    tier, total_pieces, scaled_circuits
+                )
             } else {
-                format!("[+] {} file ({} pieces) → {} circuits | Tournament: {} racing for {} slots", tier, total_pieces, scaled_circuits, tournament_pool, max_promoted)
+                format!(
+                    "[+] {} file ({} pieces) → {} circuits | Tournament: {} racing for {} slots",
+                    tier, total_pieces, scaled_circuits, tournament_pool, max_promoted
+                )
             },
         );
 
@@ -1427,12 +1887,16 @@ pub async fn start_download(
 
                 while mon_running.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS)).await;
-                    if !mon_running.load(Ordering::Relaxed) { break; }
+                    if !mon_running.load(Ordering::Relaxed) {
+                        break;
+                    }
 
                     // Compute per-circuit speed since last check
                     let mut speeds: Vec<(usize, f64)> = Vec::new();
                     for cid in 0..mon_pool_size {
-                        if mon_killed[cid].load(Ordering::Relaxed) { continue; }
+                        if mon_killed[cid].load(Ordering::Relaxed) {
+                            continue;
+                        }
                         let current = mon_bytes[cid].load(Ordering::Relaxed);
                         let delta = current.saturating_sub(prev_bytes[cid]);
                         prev_bytes[cid] = current;
@@ -1443,11 +1907,14 @@ pub async fn start_download(
                         }
                     }
 
-                    if speeds.len() < 3 { continue; } // Need enough data points
+                    if speeds.len() < 3 {
+                        continue;
+                    } // Need enough data points
 
                     // Compute median speed
                     let mut sorted_speeds: Vec<f64> = speeds.iter().map(|(_, s)| *s).collect();
-                    sorted_speeds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    sorted_speeds
+                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let median = sorted_speeds[sorted_speeds.len() / 2];
                     let threshold = median * MIN_SPEED_RATIO;
 
@@ -1486,7 +1953,9 @@ pub async fn start_download(
 
                 while unchoke_running.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_secs(UNCHOKE_INTERVAL_SECS)).await;
-                    if !unchoke_running.load(Ordering::Relaxed) { break; }
+                    if !unchoke_running.load(Ordering::Relaxed) {
+                        break;
+                    }
 
                     unchoke_id += 1;
                     let port = if unchoke_is_onion {
@@ -1508,21 +1977,26 @@ pub async fn start_download(
 
                     let probe_ok = match tokio::time::timeout(
                         Duration::from_secs(15),
-                        client.get(&unchoke_url)
+                        client
+                            .get(&unchoke_url)
                             .header(RANGE, format!("bytes={probe_start}-{probe_end}"))
-                            .send()
-                    ).await {
-                        Ok(Ok(resp)) if resp.status() == StatusCode::PARTIAL_CONTENT || resp.status() == StatusCode::OK => {
+                            .send(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp))
+                            if resp.status() == StatusCode::PARTIAL_CONTENT
+                                || resp.status() == StatusCode::OK =>
+                        {
                             use futures::StreamExt;
                             let mut stream = resp.bytes_stream();
                             let mut bytes = 0u64;
-                            loop {
-                                match tokio::time::timeout(Duration::from_secs(7), stream.next()).await {
-                                    Ok(Some(Ok(chunk))) => {
-                                        bytes += chunk.len() as u64;
-                                        if bytes >= PROBE_SIZE { break; }
-                                    }
-                                    _ => break,
+                            while let Ok(Some(Ok(chunk))) =
+                                tokio::time::timeout(Duration::from_secs(7), stream.next()).await
+                            {
+                                bytes += chunk.len() as u64;
+                                if bytes >= PROBE_SIZE {
+                                    break;
                                 }
                             }
                             bytes > 0
@@ -1530,7 +2004,9 @@ pub async fn start_download(
                         _ => false,
                     };
 
-                    if !probe_ok { continue; }
+                    if !probe_ok {
+                        continue;
+                    }
 
                     let probe_ms = probe_timer.elapsed().as_millis() as u64;
                     let unchoke_speed = PROBE_SIZE as f64 / probe_ms.max(1) as f64; // bytes/ms
@@ -1538,12 +2014,17 @@ pub async fn start_download(
                     // Compare to slowest active circuit
                     if let Some(slowest_cid) = unchoke_scorer.slowest_circuit() {
                         let slowest_speed = {
-                            let total_b = unchoke_scorer.total_bytes[slowest_cid].load(Ordering::Relaxed) as f64;
-                            let total_ms = unchoke_scorer.total_elapsed_ms[slowest_cid].load(Ordering::Relaxed).max(1) as f64;
+                            let total_b = unchoke_scorer.total_bytes[slowest_cid]
+                                .load(Ordering::Relaxed)
+                                as f64;
+                            let total_ms = unchoke_scorer.total_elapsed_ms[slowest_cid]
+                                .load(Ordering::Relaxed)
+                                .max(1) as f64;
                             total_b / total_ms
                         };
 
-                        if unchoke_speed > slowest_speed * 1.3 { // 30% faster threshold
+                        if unchoke_speed > slowest_speed * 1.3 {
+                            // 30% faster threshold
                             // Kill the slowest circuit → it will recycle with fresh identity
                             if slowest_cid < unchoke_killed.len() {
                                 unchoke_killed[slowest_cid].store(true, Ordering::Relaxed);
@@ -1566,9 +2047,13 @@ pub async fn start_download(
         // This costs 0 bytes and takes ~200ms total (all parallel).
         let mut circuit_candidates: Vec<(usize, reqwest::Client, usize)> = Vec::new();
         {
-            logger.log(&app, format!(
-                "[*] Phase 1: Handshake pre-filter — racing {} circuits...", tournament_pool
-            ));
+            logger.log(
+                &app,
+                format!(
+                    "[*] Phase 1: Handshake pre-filter — racing {} circuits...",
+                    tournament_pool
+                ),
+            );
 
             let mut handshake_tasks = JoinSet::new();
             for cid in 0..tournament_pool {
@@ -1586,8 +2071,10 @@ pub async fn start_download(
                     // HEAD request to force the SOCKS5 handshake through Tor
                     let latency = match tokio::time::timeout(
                         Duration::from_secs(15),
-                        client.head(&probe_url).send()
-                    ).await {
+                        client.head(&probe_url).send(),
+                    )
+                    .await
+                    {
                         Ok(Ok(_)) => start.elapsed().as_millis(),
                         _ => u128::MAX, // Failed — assign worst latency
                     };
@@ -1605,7 +2092,8 @@ pub async fn start_download(
             results.sort_by_key(|r| r.3);
 
             // Keep top circuits (cull bottom HANDSHAKE_CULL_RATIO)
-            let keep_count = ((results.len() as f64 * (1.0 - HANDSHAKE_CULL_RATIO)) as usize).max(1);
+            let keep_count =
+                ((results.len() as f64 * (1.0 - HANDSHAKE_CULL_RATIO)) as usize).max(1);
             let cutoff_latency = results.get(keep_count).map(|r| r.3).unwrap_or(u128::MAX);
 
             for (i, (cid, port, client_opt, _latency)) in results.into_iter().enumerate() {
@@ -1616,16 +2104,22 @@ pub async fn start_download(
                 }
             }
 
-            logger.log(&app, format!(
-                "[+] Handshake filter: {} survived / {} culled (cutoff: {}ms)",
-                circuit_candidates.len(),
-                tournament_pool - circuit_candidates.len(),
-                if cutoff_latency < u128::MAX { cutoff_latency.to_string() } else { "∞".to_string() }
-            ));
+            logger.log(
+                &app,
+                format!(
+                    "[+] Handshake filter: {} survived / {} culled (cutoff: {}ms)",
+                    circuit_candidates.len(),
+                    tournament_pool - circuit_candidates.len(),
+                    if cutoff_latency < u128::MAX {
+                        cutoff_latency.to_string()
+                    } else {
+                        "∞".to_string()
+                    }
+                ),
+            );
         }
 
         for (circuit_id, circuit_client, daemon_port) in circuit_candidates {
-
             let task_tx = tx.clone();
             let task_app = app.clone();
             let task_url = url.clone();
@@ -1832,7 +2326,7 @@ pub async fn start_download(
                                 stalls += 1;
                                 task_aimd.on_reject(); // Phase 4.4
                                 let fails = task_server_fails.fetch_add(1, Ordering::Relaxed);
-                                
+
                                 if err.is_connect() || err.is_request() {
                                     let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Circuit {} connection reset. Blasting NEWNYM to Daemon {}...", circuit_id, task_daemon_port));
                                     let port = task_daemon_port as u16;
@@ -1876,10 +2370,10 @@ pub async fn start_download(
                             stalls += 1;
                             task_server_fails.fetch_add(1, Ordering::Relaxed);
                             task_aimd.on_reject(); // Phase 4.4: bad status = server pushback
-                            
+
                             let status = response.status();
-                            if status == reqwest::StatusCode::TOO_MANY_REQUESTS 
-                                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE 
+                            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                             {
                                 let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Circuit {} hit HTTP {}. Blasting NEWNYM to Daemon {}...", circuit_id, status, task_daemon_port));
                                 let port = task_daemon_port as u16;
@@ -2066,7 +2560,8 @@ pub async fn start_download(
             });
         }
     } else {
-        let stream_client = stream_download_client(is_onion, active_ports.first().copied().unwrap_or(9051))?;
+        let stream_client =
+            stream_download_client(is_onion, active_ports.first().copied().unwrap_or(9051))?;
         let task_tx = tx.clone();
         let task_app = app.clone();
         let task_url = url.clone();
@@ -2089,29 +2584,32 @@ pub async fn start_download(
                     return TaskOutcome::Interrupted(reason);
                 }
 
-                let response_future = stream_client
-                    .get(&task_url)
-                    .send();
+                let response_future = stream_client.get(&task_url).send();
 
-                let response = match tokio::time::timeout(Duration::from_secs(45), response_future).await {
-                    Ok(Ok(resp)) => resp,
-                    Ok(Err(err)) => {
-                        retries += 1;
-                        if retries > MAX_STALL_RETRIES {
-                            return TaskOutcome::Failed(format!("stream request failed repeatedly: {err}"));
+                let response =
+                    match tokio::time::timeout(Duration::from_secs(45), response_future).await {
+                        Ok(Ok(resp)) => resp,
+                        Ok(Err(err)) => {
+                            retries += 1;
+                            if retries > MAX_STALL_RETRIES {
+                                return TaskOutcome::Failed(format!(
+                                    "stream request failed repeatedly: {err}"
+                                ));
+                            }
+                            tokio::time::sleep(backoff_duration(retries)).await;
+                            continue;
                         }
-                        tokio::time::sleep(backoff_duration(retries)).await;
-                        continue;
-                    }
-                    Err(_) => {
-                        retries += 1;
-                        if retries > MAX_STALL_RETRIES {
-                            return TaskOutcome::Failed("stream request timeout (header wait)".to_string());
+                        Err(_) => {
+                            retries += 1;
+                            if retries > MAX_STALL_RETRIES {
+                                return TaskOutcome::Failed(
+                                    "stream request timeout (header wait)".to_string(),
+                                );
+                            }
+                            tokio::time::sleep(backoff_duration(retries)).await;
+                            continue;
                         }
-                        tokio::time::sleep(backoff_duration(retries)).await;
-                        continue;
-                    }
-                };
+                    };
 
                 if !response.status().is_success() {
                     retries += 1;
@@ -2187,7 +2685,10 @@ pub async fn start_download(
                             }
                         }
                         Ok(Some(Err(err))) => {
-                            let _ = task_app.emit("log", format!("[*] Stream transient error: {err}. Re-establishing..."));
+                            let _ = task_app.emit(
+                                "log",
+                                format!("[*] Stream transient error: {err}. Re-establishing..."),
+                            );
                             drop(stream);
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             break;
@@ -2226,7 +2727,10 @@ pub async fn start_download(
 
                                 return TaskOutcome::Completed;
                             } else {
-                                let _ = task_app.emit("log", "[*] Stream dropped prematurely. Reconnecting...".to_string());
+                                let _ = task_app.emit(
+                                    "log",
+                                    "[*] Stream dropped prematurely. Reconnecting...".to_string(),
+                                );
                                 drop(stream);
                                 tokio::time::sleep(Duration::from_millis(500)).await;
                                 break;
@@ -2288,7 +2792,10 @@ pub async fn start_download(
         if range_mode {
             let downloaded = total_downloaded.load(Ordering::Relaxed);
             if downloaded >= probe.content_length {
-                logger.log(&app, "[+] All data received — aborting remaining circuits".to_string());
+                logger.log(
+                    &app,
+                    "[+] All data received — aborting remaining circuits".to_string(),
+                );
                 tasks.abort_all();
                 break;
             }
@@ -2296,7 +2803,7 @@ pub async fn start_download(
     }
 
     run_flag.store(false, Ordering::Relaxed);
-    
+
     // Poison pill to shut down the lock-free background writer
     let mut eof = WriteMsg {
         filepath: String::new(),
@@ -2361,20 +2868,31 @@ pub async fn start_download(
         // — the overall download succeeds if all bytes were received.
         let downloaded = total_downloaded.load(Ordering::Relaxed);
         if !range_mode || downloaded < probe.content_length {
-        logger.log(&app, format!(
-            "[!] Download failed (got {} / {} bytes): {}", downloaded, probe.content_length, err
-        ));
+            logger.log(
+                &app,
+                format!(
+                    "[!] Download failed (got {} / {} bytes): {}",
+                    downloaded, probe.content_length, err
+                ),
+            );
             return Err(anyhow!(err));
         }
         // All data received despite task errors — proceed to SHA verification
-        logger.log(&app, format!(
-            "[*] Ignoring {} task errors — all data received successfully", err
-        ));
+        logger.log(
+            &app,
+            format!(
+                "[*] Ignoring {} task errors — all data received successfully",
+                err
+            ),
+        );
     }
 
     let download_elapsed = start_time.elapsed().as_secs_f64();
 
-    logger.log(&app, "[+] Download complete. Verifying SHA256...".to_string());
+    logger.log(
+        &app,
+        "[+] Download complete. Verifying SHA256...".to_string(),
+    );
     let _ = app.emit(
         "download_status",
         serde_json::json!({
@@ -2401,7 +2919,7 @@ pub async fn start_download(
                     hashed_bytes = bytes;
                 }
                 Ok(None) => break, // Channel closed, SHA done
-                Err(_) => {} // Timeout, emit current progress
+                Err(_) => {}       // Timeout, emit current progress
             }
 
             // Drain any buffered updates to get latest
@@ -2412,7 +2930,11 @@ pub async fn start_download(
             if content_length > 0 && hashed_bytes > 0 {
                 let pct = (hashed_bytes as f64 / content_length as f64 * 100.0).min(100.0);
                 let elapsed = sha_start.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 { hashed_bytes as f64 / elapsed } else { 0.0 };
+                let speed = if elapsed > 0.0 {
+                    hashed_bytes as f64 / elapsed
+                } else {
+                    0.0
+                };
                 let eta = if speed > 0.0 {
                     (content_length.saturating_sub(hashed_bytes) as f64 / speed).max(0.0)
                 } else {
@@ -2430,7 +2952,10 @@ pub async fn start_download(
                 let msg = if total_mb >= 1024.0 {
                     format!(
                         "SHA256: {:.0}% ({:.1} GB / {:.1} GB) — {}",
-                        pct, hashed_mb / 1024.0, total_mb / 1024.0, eta_str
+                        pct,
+                        hashed_mb / 1024.0,
+                        total_mb / 1024.0,
+                        eta_str
                     )
                 } else {
                     format!(
@@ -2456,7 +2981,7 @@ pub async fn start_download(
         let mut file = File::open(&output_target_clone)?;
         let mut hasher = Sha256::new();
         // Massively accelerate SHA256 disk I/O with 4MB pipelined heap buffers
-        let mut buffer = vec![0u8; 4 * 1024 * 1024]; 
+        let mut buffer = vec![0u8; 4 * 1024 * 1024];
         let mut total_hashed: u64 = 0;
         let mut last_report: u64 = 0;
         loop {
@@ -2490,10 +3015,16 @@ pub async fn start_download(
             "sha_time_secs": sha_elapsed,
         }),
     );
-    logger.log(&app, format!("[+] SHA256 verified in {:.1}s: {}", sha_elapsed, hash));
+    logger.log(
+        &app,
+        format!("[+] SHA256 verified in {:.1}s: {}", sha_elapsed, hash),
+    );
     // Rename from .ariaforge temp file to final name
     if let Err(e) = fs::rename(&temp_target, &output_target) {
-        logger.log(&app, format!("[!] Rename failed: {} — file is at {}", e, temp_target));
+        logger.log(
+            &app,
+            format!("[!] Rename failed: {} — file is at {}", e, temp_target),
+        );
     } else {
         logger.log(&app, format!("[+] Renamed to final: {}", output_target));
     }
@@ -2520,7 +3051,10 @@ pub async fn start_download(
     } else {
         format!("{}s", secs)
     };
-    logger.log(&app, format!("[✓] Total time: {} | File: {}", time_str, output_target));
+    logger.log(
+        &app,
+        format!("[✓] Total time: {} | File: {}", time_str, output_target),
+    );
 
     let _ = fs::remove_file(state_file_path);
     Ok(())

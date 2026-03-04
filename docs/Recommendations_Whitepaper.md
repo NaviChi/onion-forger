@@ -1,5 +1,5 @@
-Version: 1.0.0
-Updated: 2026-03-03
+Version: 1.0.1
+Updated: 2026-03-04
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [CRITICAL-L0] Native/Web Boundary, [MANDATORY-L1] Docs Management, [MANDATORY-L1] Living Documents, [MANDATORY-L1] Performance/Cost/Quality, [MANDATORY-L1] Testing & Validation
 
@@ -41,6 +41,12 @@ Implemented baseline:
 - **Vibe Architecture Aesthetics:** Deprecated rudimentary frontend spinners in favor of high-fidelity, halo-free 8-bit true-alpha Animated WebP sequence components (`<VibeLoader />`). This strictly aligns the UX with the intended premium "SnoozeSlayer" visual identity.
 - **DragonForce Adaptive JWT Parsing:** Evaded obfuscated Next.js JSON API requirements on DragonForce SPAs. Instead of attempting brittle HTTP header decryption to fetch directory arrays, the `dragonforce.rs` scraper intercepts the native HTML, extracts the Base64 JWT authenticated DOM `<iframe>` parameters via Regex, and reinjects the inner payload URL into the Crawl Frontier for autonomous topological parsing.
 
+Implementation status (2026-03-04):
+- Added adaptive direct-I/O fallback policy for unsupported disks/filesystems.
+- Added adaptive tournament sizing telemetry and SRPT+aging batch scheduling controls.
+- Added EWMA throughput + ETA confidence in dashboard download telemetry.
+- Added strict cross-stack quality gates (`fmt`, `clippy`, Rust tests, frontend build, overlay integrity) and `rust-toolchain.toml`.
+
 # Prevention Rules
 **1. Always resolve crawl children with URL parser semantics; never by string concatenation.**
 **2. Every async crawl worker path must decrement queue accounting exactly once (success/failure/cancel).**
@@ -74,6 +80,7 @@ Based on the final regression matrix yielding 0 files for WorldLeaks, INC Ransom
 
 # History
 - 2026-03-03: Initial recommendations written after recursion/progress/scaling remediation.
+- 2026-03-04: Marked latest recommendation bundle as implemented and synchronized with quality workflow/toolchain updates.
 
 # Appendices
 - Validation commands:

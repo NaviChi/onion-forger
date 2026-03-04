@@ -20,8 +20,6 @@ struct BatchProgressPayload {
     current_file: String,
     speed_mbps: f64,
     downloaded_bytes: u64,
-    bbr_bottleneck_mbps: f64,
-    ekf_covariance: f64,
 }
 
 fn now_epoch_secs() -> u64 {

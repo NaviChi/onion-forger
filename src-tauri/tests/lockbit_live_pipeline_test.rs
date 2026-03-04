@@ -20,8 +20,6 @@ struct BatchProgressPayload {
     current_file: String,
     pub speed_mbps: f64,
     pub downloaded_bytes: u64,
-    pub bbr_bottleneck_mbps: f64,
-    pub ekf_covariance: f64,
 }
 
 fn now_epoch_secs() -> u64 {
@@ -202,6 +200,7 @@ fn live_lockbit_pipeline_default_ui_settings() {
             sizes: true,
             download: false,
             circuits: Some(120),
+            daemons: Some(4),
         };
 
         let daemon_count = active_ports.len().max(1);

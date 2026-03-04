@@ -16,6 +16,27 @@ const TORSWEEP_PORT_END: u16 = 9070;
 
 use dashmap::DashMap;
 static SOCKS_TO_CONTROL: std::sync::OnceLock<DashMap<u16, u16>> = std::sync::OnceLock::new();
+static TOURNAMENT_TELEMETRY: std::sync::OnceLock<std::sync::Mutex<TournamentTelemetry>> =
+    std::sync::OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct TournamentTelemetry {
+    samples: usize,
+    p50_ms: f64,
+    p95_ms: f64,
+    winner_ratio: f64,
+}
+
+impl Default for TournamentTelemetry {
+    fn default() -> Self {
+        Self {
+            samples: 0,
+            p50_ms: 0.0,
+            p95_ms: 0.0,
+            winner_ratio: 1.0,
+        }
+    }
+}
 
 pub fn get_tor_controls() -> &'static DashMap<u16, u16> {
     SOCKS_TO_CONTROL.get_or_init(DashMap::new)
@@ -51,10 +72,88 @@ fn is_reserved(port: u16) -> bool {
 
 fn tournament_candidate_count(target: usize) -> usize {
     let target = target.max(1);
-    if target == 1 {
+    let baseline = if target == 1 {
         2 // Always race at least 2 for a single winner to skip a dead node
     } else {
         target + (target / 2).max(1) // 50% buffer for stragglers without quadratic bloat
+    };
+
+    if !dynamic_tournament_enabled() {
+        return baseline;
+    }
+
+    let telemetry = TOURNAMENT_TELEMETRY
+        .get_or_init(|| std::sync::Mutex::new(TournamentTelemetry::default()))
+        .lock()
+        .ok()
+        .map(|guard| *guard)
+        .unwrap_or_default();
+
+    if telemetry.samples < 2 {
+        return baseline;
+    }
+
+    let latency_spread = if telemetry.p50_ms > 0.0 {
+        (telemetry.p95_ms / telemetry.p50_ms).clamp(1.0, 3.0)
+    } else {
+        1.0
+    };
+    let reliability_penalty = (1.0 - telemetry.winner_ratio).clamp(0.0, 1.0);
+    let dynamic_bonus = ((latency_spread - 1.0) * target as f64 * 0.5
+        + reliability_penalty * target as f64)
+        .ceil() as usize;
+    let adaptive = baseline.saturating_add(dynamic_bonus);
+
+    adaptive.clamp(target + 1, target.saturating_mul(2).max(2))
+}
+
+fn dynamic_tournament_enabled() -> bool {
+    match std::env::var("CRAWLI_TOURNAMENT_DYNAMIC") {
+        Ok(value) => {
+            let normalized = value.to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "on" || normalized == "yes"
+        }
+        Err(_) => true,
+    }
+}
+
+fn percentile(mut data: Vec<u64>, p: f64) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    data.sort_unstable();
+    let idx = ((data.len() - 1) as f64 * p.clamp(0.0, 1.0)).round() as usize;
+    data[idx] as f64
+}
+
+fn update_tournament_telemetry(
+    ready_durations_ms: &[u64],
+    winner_count: usize,
+    candidate_count: usize,
+) {
+    let p50 = percentile(ready_durations_ms.to_vec(), 0.50);
+    let p95 = percentile(ready_durations_ms.to_vec(), 0.95);
+    let winner_ratio = if candidate_count > 0 {
+        (winner_count as f64 / candidate_count as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    if let Ok(mut telemetry) = TOURNAMENT_TELEMETRY
+        .get_or_init(|| std::sync::Mutex::new(TournamentTelemetry::default()))
+        .lock()
+    {
+        let alpha = 0.35;
+        if telemetry.samples == 0 {
+            telemetry.p50_ms = p50;
+            telemetry.p95_ms = p95;
+            telemetry.winner_ratio = winner_ratio;
+        } else {
+            telemetry.p50_ms = telemetry.p50_ms * (1.0 - alpha) + p50 * alpha;
+            telemetry.p95_ms = telemetry.p95_ms * (1.0 - alpha) + p95 * alpha;
+            telemetry.winner_ratio = telemetry.winner_ratio * (1.0 - alpha) + winner_ratio * alpha;
+        }
+        telemetry.samples = telemetry.samples.saturating_add(1);
     }
 }
 
@@ -428,7 +527,9 @@ fn establish_free_port(preferred: u16, active_ports: &[u16]) -> Result<u16> {
         }
     }
 
-    Err(anyhow!("Failed to acquire any free TCP port for Tor networking from the OS"))
+    Err(anyhow!(
+        "Failed to acquire any free TCP port for Tor networking from the OS"
+    ))
 }
 
 /// Spawns `daemon_count` number of Tor instances.
@@ -441,6 +542,7 @@ pub async fn bootstrap_tor_cluster(
 
     let target_count = daemon_count.max(1);
     let candidate_count = tournament_candidate_count(target_count);
+    let tournament_started_at = std::time::Instant::now();
 
     let mut tor_guard = TorProcessGuard::new();
     let bootstrapped_daemons = Arc::new(AtomicUsize::new(0));
@@ -470,15 +572,27 @@ pub async fn bootstrap_tor_cluster(
         TorStatusEvent {
             state: "starting".to_string(),
             message: format!(
-                "Bootstrapping {} Tor daemon(s) using tournament {}→{}...",
-                target_count, candidate_count, target_count
+                "Bootstrapping {} Tor daemon(s) using tournament {}→{}{}...",
+                target_count,
+                candidate_count,
+                target_count,
+                if dynamic_tournament_enabled() {
+                    " (adaptive)"
+                } else {
+                    ""
+                }
             ),
             daemon_count: target_count,
             ports: vec![],
         },
     );
 
-    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    #[derive(Clone, Copy)]
+    struct ReadySignal {
+        index: usize,
+        elapsed_ms: u64,
+    }
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<ReadySignal>();
 
     for daemon_index in 0..candidate_count {
         let target_port = 9051 + daemon_index as u16;
@@ -551,6 +665,7 @@ pub async fn bootstrap_tor_cluster(
             let app_clone = app.clone();
             let ready_flag = Arc::clone(&daemon_ready);
             let ready_sender = ready_tx.clone();
+            let tournament_started = tournament_started_at;
             tokio::task::spawn_blocking(move || {
                 use std::io::{BufRead, BufReader};
                 let reader = BufReader::new(stdout);
@@ -578,7 +693,10 @@ pub async fn bootstrap_tor_cluster(
                     if line.contains("Bootstrapped 100%") {
                         if !ready_flag.swap(true, Ordering::Relaxed) {
                             ready_counter.fetch_add(1, Ordering::Relaxed);
-                            let _ = ready_sender.send(daemon_index);
+                            let _ = ready_sender.send(ReadySignal {
+                                index: daemon_index,
+                                elapsed_ms: tournament_started.elapsed().as_millis() as u64,
+                            });
                         }
                         break;
                     }
@@ -592,6 +710,7 @@ pub async fn bootstrap_tor_cluster(
             let app_clone_err = app.clone();
             let ready_flag_err = Arc::clone(&daemon_ready);
             let ready_sender_err = ready_tx.clone();
+            let tournament_started_err = tournament_started_at;
             tokio::task::spawn_blocking(move || {
                 use std::io::{BufRead, BufReader};
                 let reader = BufReader::new(stderr);
@@ -618,7 +737,10 @@ pub async fn bootstrap_tor_cluster(
                     if line.contains("Bootstrapped 100%") {
                         if !ready_flag_err.swap(true, Ordering::Relaxed) {
                             ready_counter_err.fetch_add(1, Ordering::Relaxed);
-                            let _ = ready_sender_err.send(daemon_index);
+                            let _ = ready_sender_err.send(ReadySignal {
+                                index: daemon_index,
+                                elapsed_ms: tournament_started_err.elapsed().as_millis() as u64,
+                            });
                         }
                         break;
                     }
@@ -653,6 +775,7 @@ pub async fn bootstrap_tor_cluster(
     let quorum_grace = Duration::from_secs(8);
     let mut selected_indices: Vec<usize> = Vec::new();
     let mut selected_lookup: HashSet<usize> = HashSet::new();
+    let mut ready_durations_ms: Vec<u64> = Vec::new();
     let mut last_selected = 0usize;
     let mut last_selected_elapsed = Duration::from_millis(0);
 
@@ -660,9 +783,10 @@ pub async fn bootstrap_tor_cluster(
         tokio::time::sleep(Duration::from_millis(500)).await;
         elapsed += Duration::from_millis(500);
 
-        while let Ok(idx) = ready_rx.try_recv() {
-            if selected_lookup.insert(idx) {
-                selected_indices.push(idx);
+        while let Ok(ready) = ready_rx.try_recv() {
+            if selected_lookup.insert(ready.index) {
+                selected_indices.push(ready.index);
+                ready_durations_ms.push(ready.elapsed_ms);
             }
         }
 
@@ -707,6 +831,19 @@ pub async fn bootstrap_tor_cluster(
     }
 
     let winner_count = selected_indices.len();
+    update_tournament_telemetry(&ready_durations_ms, winner_count, candidate_count);
+    if let Ok(telemetry) = TOURNAMENT_TELEMETRY
+        .get_or_init(|| std::sync::Mutex::new(TournamentTelemetry::default()))
+        .lock()
+    {
+        let _ = app.emit(
+            "crawl_log",
+            format!(
+                "[TOR] Adaptive tournament telemetry: p50={:.0}ms p95={:.0}ms winner_ratio={:.2} (samples={})",
+                telemetry.p50_ms, telemetry.p95_ms, telemetry.winner_ratio, telemetry.samples
+            ),
+        );
+    }
 
     if winner_count == 0 {
         return Err(anyhow!(
@@ -805,14 +942,22 @@ pub async fn request_newnym(socks_port: u16) -> Result<()> {
     let n = stream.read(&mut resp).await?;
     let reply = String::from_utf8_lossy(&resp[..n]);
     if !reply.starts_with("250") {
-        return Err(anyhow!("Tor auth failed on port {}: {}", control_port, reply));
+        return Err(anyhow!(
+            "Tor auth failed on port {}: {}",
+            control_port,
+            reply
+        ));
     }
 
     stream.write_all(b"SIGNAL NEWNYM\r\n").await?;
     let n = stream.read(&mut resp).await?;
     let reply = String::from_utf8_lossy(&resp[..n]);
     if !reply.starts_with("250") {
-        return Err(anyhow!("Tor NEWNYM failed on port {}: {}", control_port, reply));
+        return Err(anyhow!(
+            "Tor NEWNYM failed on port {}: {}",
+            control_port,
+            reply
+        ));
     }
 
     Ok(())

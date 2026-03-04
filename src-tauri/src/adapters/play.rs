@@ -78,7 +78,9 @@ impl CrawlerAdapter for PlayAdapter {
             workers.spawn(async move {
                 loop {
                     // Check cancellation before doing work
-                    if f.is_cancelled() { break; }
+                    if f.is_cancelled() {
+                        break;
+                    }
 
                     let next_url = match q_clone.pop() {
                         Some(url) => url,
@@ -92,147 +94,144 @@ impl CrawlerAdapter for PlayAdapter {
                     };
 
                     let _permit = f.politeness_semaphore.acquire().await.ok();
-                        let (cid, client) = f.get_client();
+                    let (cid, client) = f.get_client();
 
-                        // Enforce predictive yield delay from CircuitScorer
-                        let delay = f.scorer.yield_delay(cid);
-                        if delay > std::time::Duration::ZERO {
-                            tokio::time::sleep(delay).await;
-                        }
+                    // Enforce predictive yield delay from CircuitScorer
+                    let delay = f.scorer.yield_delay(cid);
+                    if delay > std::time::Duration::ZERO {
+                        tokio::time::sleep(delay).await;
+                    }
 
-                        let mut new_files = Vec::new();
+                    let mut new_files = Vec::new();
 
-                        let is_root = next_url.trim_end_matches('/') == current_base
-                            || next_url == format!("{}/", current_base);
+                    let is_root = next_url.trim_end_matches('/') == current_base
+                        || next_url == format!("{}/", current_base);
 
-                        let start_time = std::time::Instant::now();
-                        let mut fetch_success = true;
-                        let mut bytes_downloaded = 0;
+                    let start_time = std::time::Instant::now();
+                    let mut fetch_success = true;
+                    let mut bytes_downloaded = 0;
 
-                        if is_root && f.active_options.listing {
-                            let dir_name = path_utils::extract_target_dirname(&current_base);
+                    if is_root && f.active_options.listing {
+                        let dir_name = path_utils::extract_target_dirname(&current_base);
 
-                            // Emit parent folder entry
-                            new_files.push(FileEntry {
-                                path: format!("/{}", dir_name),
-                                size_bytes: None,
-                                entry_type: EntryType::Folder,
-                                raw_url: current_base.clone(),
-                            });
+                        // Emit parent folder entry
+                        new_files.push(FileEntry {
+                            path: format!("/{}", dir_name),
+                            size_bytes: None,
+                            entry_type: EntryType::Folder,
+                            raw_url: current_base.clone(),
+                        });
 
-                            // Fetch the HTML listing page
-                            let html = match client.get(&next_url).send().await {
-                                Ok(resp) => {
-                                    if resp.status().is_success() {
-                                        match resp.text().await {
-                                            Ok(body) => {
-                                                bytes_downloaded += body.len() as u64;
-                                                body
-                                            }
-                                            Err(_) => {
-                                                fetch_success = false;
-                                                String::new()
-                                            }
+                        // Fetch the HTML listing page
+                        let html = match client.get(&next_url).send().await {
+                            Ok(resp) => {
+                                if resp.status().is_success() {
+                                    match resp.text().await {
+                                        Ok(body) => {
+                                            bytes_downloaded += body.len() as u64;
+                                            body
                                         }
-                                    } else {
-                                        fetch_success = false;
-                                        String::new()
-                                    }
-                                }
-                                Err(_) => {
-                                    fetch_success = false;
-                                    build_fallback_html()
-                                }
-                            };
-
-                            // Use the shared autoindex HTML parser
-                            let parsed_files = parse_autoindex_html(&html);
-
-                            for parsed_entry in parsed_files {
-                                let filename = parsed_entry.0.clone();
-                                let mut raw_url = match url::Url::parse(&next_url)
-                                    .ok()
-                                    .and_then(|base| base.join(&parsed_entry.0).ok())
-                                {
-                                    Some(resolved) => resolved.to_string(),
-                                    None => format!(
-                                        "{}/{}",
-                                        current_base,
-                                        parsed_entry.0.trim_start_matches('/')
-                                    ),
-                                };
-                                if parsed_entry.2 && !raw_url.ends_with('/') {
-                                    raw_url.push('/');
-                                }
-
-                                let display_path = format!(
-                                    "/{}/{}",
-                                    dir_name,
-                                    path_utils::sanitize_path(&filename)
-                                );
-
-                                if parsed_entry.2 {
-                                    new_files.push(FileEntry {
-                                        path: display_path,
-                                        size_bytes: None,
-                                        entry_type: EntryType::Folder,
-                                        raw_url,
-                                    });
-                                    continue;
-                                }
-
-                                let size = if f.active_options.sizes {
-                                    if let Some(s) = parsed_entry.1 {
-                                        Some(s)
-                                    } else {
-                                        // Try HTTP HEAD to get Content-Length
-                                        match client.head(&raw_url).send().await {
-                                            Ok(head_resp) => head_resp
-                                                .headers()
-                                                .get("content-length")
-                                                .and_then(|v| v.to_str().ok())
-                                                .and_then(|s| s.parse::<u64>().ok()),
-                                            Err(_) => None,
+                                        Err(_) => {
+                                            fetch_success = false;
+                                            String::new()
                                         }
                                     }
                                 } else {
-                                    None
-                                };
+                                    fetch_success = false;
+                                    String::new()
+                                }
+                            }
+                            Err(_) => {
+                                fetch_success = false;
+                                build_fallback_html()
+                            }
+                        };
 
+                        // Use the shared autoindex HTML parser
+                        let parsed_files = parse_autoindex_html(&html);
+
+                        for parsed_entry in parsed_files {
+                            let filename = parsed_entry.0.clone();
+                            let mut raw_url = match url::Url::parse(&next_url)
+                                .ok()
+                                .and_then(|base| base.join(&parsed_entry.0).ok())
+                            {
+                                Some(resolved) => resolved.to_string(),
+                                None => format!(
+                                    "{}/{}",
+                                    current_base,
+                                    parsed_entry.0.trim_start_matches('/')
+                                ),
+                            };
+                            if parsed_entry.2 && !raw_url.ends_with('/') {
+                                raw_url.push('/');
+                            }
+
+                            let display_path =
+                                format!("/{}/{}", dir_name, path_utils::sanitize_path(&filename));
+
+                            if parsed_entry.2 {
                                 new_files.push(FileEntry {
                                     path: display_path,
-                                    size_bytes: size,
-                                    entry_type: EntryType::File,
+                                    size_bytes: None,
+                                    entry_type: EntryType::Folder,
                                     raw_url,
                                 });
+                                continue;
                             }
-                        }
 
-                        // Report to AIMD and CircuitScorer
-                        let elapsed_ms = start_time.elapsed().as_millis() as u64;
-                        if fetch_success {
-                            f.record_success(cid, bytes_downloaded, elapsed_ms);
-                        } else {
-                            f.record_failure(cid);
-                        }
+                            let size = if f.active_options.sizes {
+                                if let Some(s) = parsed_entry.1 {
+                                    Some(s)
+                                } else {
+                                    // Try HTTP HEAD to get Content-Length
+                                    match client.head(&raw_url).send().await {
+                                        Ok(head_resp) => head_resp
+                                            .headers()
+                                            .get("content-length")
+                                            .and_then(|v| v.to_str().ok())
+                                            .and_then(|s| s.parse::<u64>().ok()),
+                                        Err(_) => None,
+                                    }
+                                }
+                            } else {
+                                None
+                            };
 
-                        // Flush to IPC batcher
-                        for file in &new_files {
-                            let _ = ui_tx_clone.send(file.clone()).await;
+                            new_files.push(FileEntry {
+                                path: display_path,
+                                size_bytes: size,
+                                entry_type: EntryType::File,
+                                raw_url,
+                            });
                         }
+                    }
 
-                        if !new_files.is_empty() {
-                            let mut lock = discovered_ref.lock().await;
-                            lock.extend(new_files);
-                        }
+                    // Report to AIMD and CircuitScorer
+                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                    if fetch_success {
+                        f.record_success(cid, bytes_downloaded, elapsed_ms);
+                    } else {
+                        f.record_failure(cid);
+                    }
 
-                        // Decrement the active task in our custom closure
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    // Flush to IPC batcher
+                    for file in &new_files {
+                        let _ = ui_tx_clone.send(file.clone()).await;
+                    }
+
+                    if !new_files.is_empty() {
+                        let mut lock = discovered_ref.lock().await;
+                        lock.extend(new_files);
+                    }
+
+                    // Decrement the active task in our custom closure
+                    pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }
 
-        while let Some(_) = workers.join_next().await {}
+        while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
         let mut final_results = all_discovered_entries.lock().await;

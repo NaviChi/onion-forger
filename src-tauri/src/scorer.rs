@@ -131,25 +131,30 @@ impl CircuitScorer {
         if n == 0 {
             return f64::MAX; // Untested = infinite score (explore first)
         }
-        
+
         let total_b = self.total_bytes[cid].load(Ordering::Relaxed) as f64;
         let total_ms = self.total_elapsed_ms[cid].load(Ordering::Relaxed).max(1) as f64;
         let avg_speed = total_b / total_ms; // bytes per ms (mean)
 
         // The Kalman filter tracks latency. We use its covariance (uncertainty) to drive exploration.
         let mut variance = load_f64(&self.kalman_p[cid]);
-        if variance < 0.001 { variance = 0.001; }
-        
+        if variance < 0.001 {
+            variance = 0.001;
+        }
+
         // Box-Muller transform for normal distribution N(mean, variance) Lock-Free
         let std_dev = variance.sqrt();
-        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let u1 = (((time ^ (time >> 12)) % 10000) as f64 / 10000.0).max(0.0001);
         let u2 = (((time ^ (time >> 20)) % 10000) as f64 / 10000.0).max(0.0001);
-        
+
         let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-        
+
         let thompson_scaling_factor = 0.01; // map latency variance to bw speed scale
-        
+
         avg_speed + (z0 * std_dev * thompson_scaling_factor)
     }
 

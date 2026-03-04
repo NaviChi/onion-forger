@@ -25,7 +25,15 @@ interface DashboardProps {
     unknownSizeFiles: number;
     currentFile: string;
     speedMbps: number;
+    smoothedSpeedMbps: number;
     downloadedBytes: number;
+    activeCircuits: number;
+    peakActiveCircuits: number;
+    peakBandwidthMbps: number;
+    diskWriteMbps: number;
+    peakDiskWriteMbps: number;
+    etaConfidence: number;
+    outputDir: string;
     bbrBottleneckMbps: number;
     ekfCovariance: number;
     startedAt: number | null;
@@ -70,7 +78,7 @@ export function Dashboard({
   const batchRemaining = Math.max(batchTotal - batchProcessed, 0);
   const hasBatch = batchTotal > 0;
   const showDownloadProgress = hasBatch && (isCrawling || batchProcessed > 0 || !!downloadBatchStatus.currentFile);
-  const downloadPercent = hasBatch ? Math.min(100, (batchProcessed / Math.max(batchTotal, 1)) * 100) : 0;
+  const filePercent = hasBatch ? Math.min(100, (batchProcessed / Math.max(batchTotal, 1)) * 100) : 0;
   const downloadEtaLabel =
     batchRemaining > 0 && downloadBatchStatus.etaSeconds && downloadBatchStatus.etaSeconds > 0
       ? `ETA ${downloadBatchStatus.etaSeconds}s`
@@ -93,8 +101,20 @@ export function Dashboard({
     throughputFromProgress > 0
       ? throughputFromProgress
       : (throughputFromBatch > 0 ? throughputFromBatch : throughputFromAverage);
+  const bytePercent =
+    hasBatch && downloadBatchStatus.totalBytesHint > 0
+      ? Math.min(100, (resolvedDownloadedBytes / downloadBatchStatus.totalBytesHint) * 100)
+      : 0;
+  const downloadPercent = hasBatch ? Math.max(filePercent, bytePercent) : 0;
   const speedMb = resolvedSpeedMbps.toFixed(2);
+  const smoothedSpeedMb = Math.max(
+    0,
+    downloadBatchStatus.smoothedSpeedMbps || resolvedSpeedMbps || 0,
+  ).toFixed(2);
   const downloadedMb = (resolvedDownloadedBytes / 1048576).toFixed(2);
+  const diskWriteMbps = Math.max(0, downloadBatchStatus.diskWriteMbps || 0);
+  const activeCircuits = Math.max(0, downloadBatchStatus.activeCircuits || 0);
+  const etaConfidencePct = Math.round(Math.max(0, Math.min(1, downloadBatchStatus.etaConfidence || 0)) * 100);
 
   if (isCrawling) {
     phase = "PROBING TARGET";
@@ -170,6 +190,9 @@ export function Dashboard({
         <div className="dash-info">
           <div className="dash-title">NETWORK I/O (BBR)</div>
           <div className="dash-value">{speedMb} MB/s</div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Peak BW: {downloadBatchStatus.peakBandwidthMbps?.toFixed(2) || "0.00"} MB/s</div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Disk I/O: {diskWriteMbps.toFixed(2)} MB/s (Peak {downloadBatchStatus.peakDiskWriteMbps?.toFixed(2) || "0.00"})</div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Active Circuits: {activeCircuits} (Peak {downloadBatchStatus.peakActiveCircuits || 0})</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>BBR Bottleneck: {downloadBatchStatus.bbrBottleneckMbps?.toFixed(2) || "0.00"} MB/s</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>EKF Var/Cov: {downloadBatchStatus.ekfCovariance?.toFixed(3) || "0.000"} P</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Total Payload: {downloadedMb} MB</div>
@@ -199,7 +222,7 @@ export function Dashboard({
                 Total: {batchTotal.toLocaleString()} | Downloaded: {batchDone.toLocaleString()} | Failed: {batchFailed.toLocaleString()} | Remaining: {batchRemaining.toLocaleString()}
               </div>
               <div className="dash-sub" style={{ fontFamily: "JetBrains Mono" }}>
-                Elapsed: {downloadElapsedSec}s | Throughput: {speedMb} MB/s | Hint Size: {hintedGb} GB | Unknown Sizes: {downloadBatchStatus.unknownSizeFiles.toLocaleString()}
+                Elapsed: {downloadElapsedSec}s | Throughput: {speedMb} MB/s (EWMA {smoothedSpeedMb}) | ETA Confidence: {etaConfidencePct}% | Disk I/O: {diskWriteMbps.toFixed(2)} MB/s | Hint Size: {hintedGb} GB | Unknown Sizes: {downloadBatchStatus.unknownSizeFiles.toLocaleString()}
               </div>
               {downloadBatchStatus.currentFile ? (
                 <div className="dash-sub" style={{ fontFamily: "JetBrains Mono" }}>

@@ -1,5 +1,4 @@
 use std::time::Duration;
-use serde_json::Value;
 
 #[tokio::main]
 async fn main() {
@@ -7,7 +6,9 @@ async fn main() {
         .build(tauri::generate_context!())
         .expect("build tauri app");
 
-    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 1).await.unwrap();
+    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 1)
+        .await
+        .unwrap();
 
     let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{}", ports[0])).unwrap();
     let client = reqwest::Client::builder()
@@ -37,10 +38,13 @@ async fn main() {
     let full_url = format!("{}?path=/", api_url);
 
     // Try sending Authorization header
-    match client.get(&full_url)
+    match client
+        .get(&full_url)
         .header("Authorization", format!("Bearer {}", token_parsed))
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-        .send().await {
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status();
             println!("Status 1 (Deploy-Uuid): {}", status);

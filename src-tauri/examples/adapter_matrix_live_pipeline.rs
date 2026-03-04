@@ -281,18 +281,19 @@ async fn run_single_adapter(
         let mut final_resp = None;
         for _ in 0..4 {
             let client = frontier_arc.get_client().1;
-            let fetched = tokio::time::timeout(Duration::from_secs(45), client.get(url).send()).await;
+            let fetched =
+                tokio::time::timeout(Duration::from_secs(45), client.get(url).send()).await;
             if let Ok(Ok(resp)) = fetched {
                 final_resp = Some(resp);
                 break;
             }
         }
-        
+
         let resp = match final_resp {
             Some(resp) => resp,
             None => {
                 result.status = "skip".to_string();
-                result.reason = format!("fingerprint fetch failed after 4 retries");
+                result.reason = "fingerprint fetch failed after 4 retries".to_string();
                 return result;
             }
         };
@@ -378,7 +379,7 @@ async fn run_single_adapter(
 
     let sig_path = Path::new("tests").join("matrix_signatures.json");
     let mut registry: HashMap<String, SignatureMap> = HashMap::new();
-    
+
     if let Ok(data) = fs::read_to_string(&sig_path) {
         if let Ok(parsed) = serde_json::from_str(&data) {
             registry = parsed;
@@ -390,9 +391,15 @@ async fn run_single_adapter(
         // 0/0 allows gracefully passing for known-offline targets or intentionally empty yields.
         if result.file_count < expected.files {
             signature_breach = true;
-            expected_message = format!("Expected >= {} files. Got {} files.", expected.files, result.file_count);
+            expected_message = format!(
+                "Expected >= {} files. Got {} files.",
+                expected.files, result.file_count
+            );
         } else if result.file_count > expected.files || result.dir_count > expected.dirs {
-            println!("\n[WARNING] Adapter {} naturally Grew! Files: {} -> {}, Dirs: {} -> {}", adapter.id, expected.files, result.file_count, expected.dirs, result.dir_count);
+            println!(
+                "\n[WARNING] Adapter {} naturally Grew! Files: {} -> {}, Dirs: {} -> {}",
+                adapter.id, expected.files, result.file_count, expected.dirs, result.dir_count
+            );
             // Autonomous Learning Update: Automatically bump the HWM threshold avoiding manual CI maintenance.
             if let Some(entry) = registry.get_mut(adapter.id) {
                 entry.files = std::cmp::max(entry.files, result.file_count);
@@ -403,12 +410,18 @@ async fn run_single_adapter(
             }
         }
     } else {
-        println!("\n[WARNING] Adapter {} missing from matrix_signatures.json registry bounds!", adapter.id);
+        println!(
+            "\n[WARNING] Adapter {} missing from matrix_signatures.json registry bounds!",
+            adapter.id
+        );
     }
-    
+
     if signature_breach {
         result.status = "fail".to_string();
-        result.reason = format!("ANTI_CONTAMINATION_ERROR: Adapter {} violated historical DOM extraction signature! {}", adapter.id, expected_message);
+        result.reason = format!(
+            "ANTI_CONTAMINATION_ERROR: Adapter {} violated historical DOM extraction signature! {}",
+            adapter.id, expected_message
+        );
         println!("\n[FATAL] {}", result.reason);
         // Force the pipeline to return error immediately to break CI
         return result;
@@ -419,9 +432,9 @@ async fn run_single_adapter(
         "[SPACE] free before download: {:.2} GB",
         bytes_to_gb(result.free_before_download_bytes)
     );
-    if result
-        .free_before_download_bytes
-        .lt(&result.est_required_bytes.saturating_add(SAFETY_RESERVE_BYTES))
+    if result.free_before_download_bytes.lt(&result
+        .est_required_bytes
+        .saturating_add(SAFETY_RESERVE_BYTES))
     {
         result.status = "skip".to_string();
         result.reason = format!(
@@ -435,7 +448,10 @@ async fn run_single_adapter(
 
     if !options.download {
         result.status = "pass".to_string();
-        result.reason = format!("crawl completed in {:.2}s. download bypassed by options.", result.crawl_secs);
+        result.reason = format!(
+            "crawl completed in {:.2}s. download bypassed by options.",
+            result.crawl_secs
+        );
         return result;
     }
 
@@ -548,7 +564,11 @@ fn select_candidate_urls(adapter: &adapters::AdapterSupportInfo) -> Vec<String> 
         ];
     }
 
-    let mut urls: Vec<String> = adapter.sample_urls.iter().map(|u| normalize_url(u)).collect();
+    let mut urls: Vec<String> = adapter
+        .sample_urls
+        .iter()
+        .map(|u| normalize_url(u))
+        .collect();
     urls.sort_by_key(|u| priority_url_key(u));
     urls.dedup();
     urls
@@ -558,7 +578,10 @@ fn print_summary(results: &[AdapterRunResult], report_path: &Path) {
     let pass = results.iter().filter(|r| r.status == "pass").count();
     let fail = results.iter().filter(|r| r.status == "fail").count();
     let skip = results.iter().filter(|r| r.status == "skip").count();
-    let total_downloaded = results.iter().map(|r| r.downloaded_event_bytes).sum::<u64>();
+    let total_downloaded = results
+        .iter()
+        .map(|r| r.downloaded_event_bytes)
+        .sum::<u64>();
     let total_disk = results.iter().map(|r| r.disk_bytes).sum::<u64>();
     println!("\n=== ADAPTER MATRIX SUMMARY ===");
     println!(
@@ -590,7 +613,7 @@ fn print_summary(results: &[AdapterRunResult], report_path: &Path) {
             ci_fail = true;
         }
     }
-    
+
     // [PHASE 15] CI Anti-Contamination Enforcement
     if ci_fail {
         println!("Exit code: 1 (ANTI_CONTAMINATION_ERROR)");
@@ -672,7 +695,10 @@ fn main() {
             let adapter_output = root.join(format!("adapter_{}", adapter.id));
 
             if candidates.is_empty() {
-                println!("[SKIP] Adapter {} has no configured candidate testing URLs.", adapter.name);
+                println!(
+                    "[SKIP] Adapter {} has no configured candidate testing URLs.",
+                    adapter.name
+                );
                 continue;
             }
 

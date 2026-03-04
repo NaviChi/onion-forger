@@ -5,8 +5,6 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
-const CRAWL_TIMEOUT_SECS: u64 = 300;
-
 #[derive(Clone, Debug)]
 struct MatrixTarget {
     id: &'static str,
@@ -48,32 +46,26 @@ fn main() -> anyhow::Result<()> {
 
     for target in &targets {
         println!("\n🛸 Probing [{}] -> {}", target.id.to_uppercase(), target.url);
-        
+
         let client = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all("socks5h://127.0.0.1:9050").unwrap())
             .timeout(Duration::from_secs(60))
             .build().unwrap();
 
-        let mut body = String::new();
-        let mut status_code = 0;
-        let mut headers = HeaderMap::new();
-        let mut is_mock_mode = false;
-
-        match client.get(target.url).send().await {
+        let (status_code, headers, body, is_mock_mode) = match client.get(target.url).send().await {
             Ok(res) => {
-                status_code = res.status().as_u16();
-                headers = res.headers().clone();
-                body = res.text().await.unwrap_or_default();
+                let status_code = res.status().as_u16();
+                let headers = res.headers().clone();
+                let body = res.text().await.unwrap_or_default();
                 println!("   [✓] Tor Link Established! Building Live AST Tree...");
+                (status_code, headers, body, false)
             }
             Err(e) => {
                 println!("   [!] INGRESS FAILURE: {} \n   [⚠️] Node is OFFLINE. Falling back to CDN Health Mock Protocol...", e);
                 if let Some(mock_path) = target.mock_file {
                     if let Ok(mock_html) = fs::read_to_string(mock_path) {
-                        body = mock_html;
-                        status_code = 200;
-                        is_mock_mode = true;
                         println!("   [♻️] Loaded Offline Immutable Snapshot from {}", mock_path);
+                        (200, HeaderMap::new(), mock_html, true)
                     } else {
                         println!("   [❌] FATAL: Missing offline mock payload.");
                         continue;
@@ -83,7 +75,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
             }
-        }
+        };
 
         let fingerprint = SiteFingerprint {
             url: target.url.to_string(),
@@ -114,22 +106,26 @@ fn main() -> anyhow::Result<()> {
             frontier.mark_visited(target.url);
 
             let (_tx, _rx) = tokio::sync::mpsc::channel::<crawli_lib::adapters::FileEntry>(1);
-            
+
             // Instead of running the full recursive engine which takes hours, we pass the root to `crawl()`
             // and count the immediate vector yield. For deep validation, we simulate depth parsing.
             let (f_count, d_count, max_depth) = if is_mock_mode {
                 println!("   [⚙️] MOCK MODE ACTIVE: Engaging Raw Text AST Payload parsing (bypassing TCP Sockets)...");
                 let mut file_yield = 0;
                 let mut dir_yield = 0;
-                
+
                 if adapter.name().contains("Qilin") || adapter.name().contains("Autoindex") {
                     let entries = crawli_lib::adapters::autoindex::parse_autoindex_html(&fingerprint.body);
                     for entry in entries {
-                        if entry.is_dir { dir_yield += 1; } else { file_yield += 1; }
+                        if entry.2 { dir_yield += 1; } else { file_yield += 1; }
                     }
                     (file_yield, dir_yield, 1)
                 } else if adapter.name().contains("DragonForce") {
-                    let entries = crawli_lib::adapters::dragonforce::parse_dragonforce_fsguest(&fingerprint.body, "mock.onion");
+                    let entries = crawli_lib::adapters::dragonforce::parse_dragonforce_fsguest(
+                        &fingerprint.body,
+                        "mock.onion",
+                        target.url,
+                    );
                     for entry in entries {
                         if entry.entry_type == EntryType::Folder { dir_yield += 1; } else { file_yield += 1; }
                     }
@@ -150,7 +146,7 @@ fn main() -> anyhow::Result<()> {
                             } else {
                                 file_yield += 1;
                             }
-                            
+
                             // Calculate pseudo-depth based on path separators
                             let depth = entry.path.split('/').filter(|s| !s.is_empty()).count();
                             if depth > max_d {

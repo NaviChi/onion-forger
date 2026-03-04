@@ -19,7 +19,7 @@ impl BftQuorum {
 
         let total_nodes = payloads.len();
         let threshold = (total_nodes / 2) + 1;
-        
+
         let max_len = payloads.iter().map(|p| p.len()).max().unwrap_or(0);
         if max_len == 0 {
             return Ok(Vec::new());
@@ -34,7 +34,9 @@ impl BftQuorum {
             let mut hash_to_chunk: HashMap<String, Vec<u8>> = HashMap::new();
 
             for payload in &payloads {
-                if payload.len() <= start { continue; } // Byzantine truncation
+                if payload.len() <= start {
+                    continue;
+                } // Byzantine truncation
                 let end = (start + MERKLE_CHUNK_SIZE).min(payload.len());
                 let chunk_data = &payload[start..end];
 
@@ -43,7 +45,9 @@ impl BftQuorum {
                 let hex_hash = format!("{:x}", hasher.finalize());
 
                 *hash_votes.entry(hex_hash.clone()).or_insert(0) += 1;
-                hash_to_chunk.entry(hex_hash).or_insert_with(|| chunk_data.to_vec());
+                hash_to_chunk
+                    .entry(hex_hash)
+                    .or_insert_with(|| chunk_data.to_vec());
             }
 
             let mut best_hash = String::new();

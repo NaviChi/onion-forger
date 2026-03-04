@@ -46,6 +46,7 @@ interface BatchProgressEvent {
   currentFile: string;
   speedMbps?: number;
   downloadedBytes?: number;
+  activeCircuits?: number;
   bbrBottleneckMbps?: number;
   ekfCovariance?: number;
 }
@@ -58,7 +59,15 @@ interface DownloadBatchStatus {
   unknownSizeFiles: number;
   currentFile: string;
   speedMbps: number;
+  smoothedSpeedMbps: number;
   downloadedBytes: number;
+  activeCircuits: number;
+  peakActiveCircuits: number;
+  peakBandwidthMbps: number;
+  diskWriteMbps: number;
+  peakDiskWriteMbps: number;
+  etaConfidence: number;
+  outputDir: string;
   bbrBottleneckMbps: number;
   ekfCovariance: number;
   startedAt: number | null;
@@ -193,6 +202,45 @@ const FALLBACK_SUPPORT_CATALOG: AdapterSupportInfo[] = [
 
 // Kept dummy function so lines don't shift too much
 
+function stripWindowsVerbatimPrefix(path: string): string {
+  if (!path) return path;
+  if (path.startsWith("\\\\?\\UNC\\")) {
+    return `\\\\${path.slice(8)}`;
+  }
+  if (path.startsWith("\\\\?\\")) {
+    return path.slice(4);
+  }
+  return path;
+}
+
+function normalizePathForCompare(path: string): string {
+  return stripWindowsVerbatimPrefix(path)
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/\/$/, "")
+    .toLowerCase();
+}
+
+function deriveRelativePath(rawPath: string, roots: string[]): string {
+  const cleaned = stripWindowsVerbatimPrefix(rawPath).replace(/\\/g, "/");
+  const cleanedCmp = normalizePathForCompare(cleaned);
+  for (const root of roots) {
+    if (!root) continue;
+    const normalizedRoot = normalizePathForCompare(root);
+    if (!normalizedRoot) continue;
+    if (cleanedCmp === normalizedRoot) return "";
+    if (cleanedCmp.startsWith(`${normalizedRoot}/`)) {
+      return cleaned.slice(normalizedRoot.length + 1).replace(/^[/\\]+/, "");
+    }
+  }
+  return cleaned.replace(/^[/\\]+/, "");
+}
+
+function toDisplayPath(rawPath: string, roots: string[]): string {
+  const relative = deriveRelativePath(rawPath, roots);
+  return relative || stripWindowsVerbatimPrefix(rawPath).replace(/\\/g, "/");
+}
+
 function formatDuration(ms: number): string {
   const totalSec = Math.floor(ms / 1000);
   const min = Math.floor(totalSec / 60);
@@ -221,7 +269,15 @@ const INITIAL_DOWNLOAD_BATCH_STATUS: DownloadBatchStatus = {
   unknownSizeFiles: 0,
   currentFile: "",
   speedMbps: 0,
+  smoothedSpeedMbps: 0,
   downloadedBytes: 0,
+  activeCircuits: 0,
+  peakActiveCircuits: 0,
+  peakBandwidthMbps: 0,
+  diskWriteMbps: 0,
+  peakDiskWriteMbps: 0,
+  etaConfidence: 0,
+  outputDir: "",
   bbrBottleneckMbps: 0,
   ekfCovariance: 0,
   startedAt: null,
@@ -264,6 +320,10 @@ function App() {
   const supportButtonRef = useRef<HTMLButtonElement>(null);
   const supportPopoverRef = useRef<HTMLDivElement>(null);
   const batchSpeedSampleRef = useRef<{ ts: number; bytes: number } | null>(null);
+  const aggregateDownloadBytesRef = useRef(0);
+  const aggregateDiskSampleRef = useRef<{ ts: number; bytes: number } | null>(null);
+  const perFileDownloadedBytesRef = useRef<Record<string, number>>({});
+  const activeDownloadOutputDirRef = useRef("");
 
   const [crawlOptions, setCrawlOptions] = useState({
     listing: true,
@@ -360,7 +420,8 @@ function App() {
       try {
         const dl = await downloadDir();
         const defaultPath = await join(dl, "OnionForger_Downloads");
-        setOutputDir((prev) => prev || defaultPath);
+        const normalizedDefaultPath = stripWindowsVerbatimPrefix(defaultPath);
+        setOutputDir((prev) => prev || normalizedDefaultPath);
       } catch (e) {
         console.warn("Could not retrieve download directory", e);
       }
@@ -425,6 +486,11 @@ function App() {
       unlistenPromises.push(
         listen<DownloadBatchStartedEvent>("download_batch_started", (event) => {
           const startedAt = Date.now();
+          const normalizedOutput = stripWindowsVerbatimPrefix(event.payload.outputDir || "");
+          activeDownloadOutputDirRef.current = normalizedOutput;
+          aggregateDownloadBytesRef.current = 0;
+          aggregateDiskSampleRef.current = { ts: startedAt, bytes: 0 };
+          perFileDownloadedBytesRef.current = {};
           batchSpeedSampleRef.current = { ts: startedAt, bytes: 0 };
           setDownloadElapsed(0);
           setDownloadBatchStatus({
@@ -435,7 +501,15 @@ function App() {
             unknownSizeFiles: Math.max(event.payload.unknownSizeFiles || 0, 0),
             currentFile: "Routing download queue...",
             speedMbps: 0,
+            smoothedSpeedMbps: 0,
             downloadedBytes: 0,
+            activeCircuits: 0,
+            peakActiveCircuits: 0,
+            peakBandwidthMbps: 0,
+            diskWriteMbps: 0,
+            peakDiskWriteMbps: 0,
+            etaConfidence: 0,
+            outputDir: normalizedOutput,
             bbrBottleneckMbps: 0,
             ekfCovariance: 0,
             startedAt,
@@ -450,12 +524,14 @@ function App() {
             speed_mbps?: number;
             downloaded_bytes?: number;
             current_file?: string;
+            active_circuits?: number;
             bbr_bottleneck_mbps?: number;
             ekf_covariance?: number;
           };
           const speedMbpsRaw = payload.speedMbps ?? payload.speed_mbps;
           const downloadedBytesRaw = payload.downloadedBytes ?? payload.downloaded_bytes;
           const currentFileRaw = payload.currentFile ?? payload.current_file;
+          const activeCircuitsRaw = payload.activeCircuits ?? payload.active_circuits;
           const bbrRaw = payload.bbrBottleneckMbps ?? payload.bbr_bottleneck_mbps ?? 0;
           const ekfRaw = payload.ekfCovariance ?? payload.ekf_covariance ?? 0;
           const now = Date.now();
@@ -469,7 +545,12 @@ function App() {
             const elapsedSeconds = Math.max(1, Math.floor((now - startedAt) / 1000));
             const etaSeconds =
               done > 0 && remaining > 0 ? Math.ceil((elapsedSeconds / done) * remaining) : null;
-            const mergedDownloadedBytes = Math.max(prev.downloadedBytes, downloadedBytesRaw || 0);
+            const mergedDownloadedBytes = Math.max(
+              prev.downloadedBytes,
+              downloadedBytesRaw || 0,
+              aggregateDownloadBytesRef.current,
+            );
+            aggregateDownloadBytesRef.current = mergedDownloadedBytes;
 
             let resolvedSpeedMbps = speedMbpsRaw ?? prev.speedMbps;
             if ((speedMbpsRaw === undefined || speedMbpsRaw <= 0) && batchSpeedSampleRef.current) {
@@ -482,18 +563,59 @@ function App() {
             }
             batchSpeedSampleRef.current = { ts: now, bytes: mergedDownloadedBytes };
 
+            let diskWriteMbps = prev.diskWriteMbps;
+            if (aggregateDiskSampleRef.current) {
+              const sample = aggregateDiskSampleRef.current;
+              const deltaBytes = Math.max(0, mergedDownloadedBytes - sample.bytes);
+              const deltaSeconds = Math.max((now - sample.ts) / 1000, 0);
+              if (deltaBytes > 0 && deltaSeconds > 0) {
+                diskWriteMbps = (deltaBytes / deltaSeconds) / 1048576;
+              }
+            }
+            aggregateDiskSampleRef.current = { ts: now, bytes: mergedDownloadedBytes };
+
             if (prev.startedAt === null) {
               setDownloadElapsed(0);
             }
+
+            const roots = [activeDownloadOutputDirRef.current, prev.outputDir, outputDir];
+            const currentFile = currentFileRaw ? toDisplayPath(currentFileRaw, roots) : prev.currentFile;
+            const activeCircuits = activeCircuitsRaw ?? prev.activeCircuits;
+            const peakBandwidthMbps = Math.max(prev.peakBandwidthMbps, resolvedSpeedMbps || 0);
+            const peakDiskWriteMbps = Math.max(prev.peakDiskWriteMbps, diskWriteMbps || 0);
+            const instant = Math.max(0, resolvedSpeedMbps || 0);
+            const smoothedSpeedMbps =
+              prev.smoothedSpeedMbps > 0
+                ? prev.smoothedSpeedMbps * 0.72 + instant * 0.28
+                : instant;
+            const progressFactor = totalFiles > 0 ? done / totalFiles : 0;
+            const unknownFactor =
+              totalFiles > 0 ? 1 - (prev.unknownSizeFiles / totalFiles) : 0.5;
+            const speedStability =
+              smoothedSpeedMbps > 0
+                ? 1 - Math.min(Math.abs(instant - smoothedSpeedMbps) / smoothedSpeedMbps, 1)
+                : 0;
+            const etaConfidence = Math.max(
+              0.05,
+              Math.min(0.99, progressFactor * 0.45 + unknownFactor * 0.20 + speedStability * 0.35),
+            );
 
             return {
               ...prev,
               totalFiles,
               completedFiles,
               failedFiles,
-              currentFile: currentFileRaw || prev.currentFile,
+              currentFile,
               speedMbps: resolvedSpeedMbps,
+              smoothedSpeedMbps,
               downloadedBytes: mergedDownloadedBytes,
+              activeCircuits,
+              peakActiveCircuits: Math.max(prev.peakActiveCircuits, activeCircuits || 0),
+              peakBandwidthMbps,
+              diskWriteMbps,
+              peakDiskWriteMbps,
+              etaConfidence,
+              outputDir: prev.outputDir || activeDownloadOutputDirRef.current || outputDir,
               bbrBottleneckMbps: bbrRaw,
               ekfCovariance: ekfRaw,
               startedAt,
@@ -515,55 +637,115 @@ function App() {
 
       unlistenPromises.push(
         listen<DownloadProgressEvent>("download_progress_update", (event) => {
-          let relativePath = event.payload.path;
-          // Convert absolute `targetPath` from aria_downloader back to relative `node.id`
-          if (typeof outputDir === "string" && relativePath.startsWith(outputDir)) {
-            relativePath = relativePath.substring(outputDir.length);
-          }
-          // Ensure leading slashes are stripped since `node.id` doesn't have them
-          relativePath = relativePath.replace(/^[/\\]+/, "");
+          const roots = [activeDownloadOutputDirRef.current, outputDir];
+          const displayPath = toDisplayPath(event.payload.path, roots);
+          const normalizedPayload: DownloadProgressEvent = {
+            ...event.payload,
+            path: displayPath,
+          };
 
           setDownloadProgress((prev) => ({
             ...prev,
-            [relativePath]: event.payload,
-            [event.payload.path]: event.payload, // Fallback
+            [displayPath]: normalizedPayload,
           }));
-        })
-      );
 
-      unlistenPromises.push(
-        listen<{ url: string; path: string; hash: string; time_taken_secs: number }>("complete", (event) => {
-          let relativePath = event.payload.path;
-          if (typeof outputDir === "string" && relativePath.startsWith(outputDir)) {
-            relativePath = relativePath.substring(outputDir.length);
+          const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
+          const nextBytes = Math.max(previousBytes, event.payload.bytes_downloaded || 0);
+          if (nextBytes > previousBytes) {
+            perFileDownloadedBytesRef.current[displayPath] = nextBytes;
+            aggregateDownloadBytesRef.current += nextBytes - previousBytes;
           }
-          relativePath = relativePath.replace(/^[/\\]+/, "");
+          const aggregateBytes = aggregateDownloadBytesRef.current;
+          const now = Date.now();
+          let diskWriteMbps = 0;
+          if (aggregateDiskSampleRef.current) {
+            const sample = aggregateDiskSampleRef.current;
+            const deltaBytes = Math.max(0, aggregateBytes - sample.bytes);
+            const deltaSeconds = Math.max((now - sample.ts) / 1000, 0);
+            if (deltaBytes > 0 && deltaSeconds > 0) {
+              diskWriteMbps = (deltaBytes / deltaSeconds) / 1048576;
+            }
+          }
+          aggregateDiskSampleRef.current = { ts: now, bytes: aggregateBytes };
 
-          setLogs((l) => [...l.slice(-399), `[✓] Download finished: ${relativePath} (SHA256: ${event.payload.hash})`]);
-          showToast("success", "Download Finished", `File saved and verified (${event.payload.hash})`);
-          setDownloadProgress((prev) => {
-            const p = prev[relativePath] || prev[event.payload.path];
-            if (!p) return prev;
+          const speedMbps = Math.max(0, (event.payload.speed_bps || 0) / 1048576);
+          const activeCircuits = Math.max(0, event.payload.active_circuits || 0);
+          setDownloadBatchStatus((prev) => {
+            const done = prev.completedFiles + prev.failedFiles;
+            const total = Math.max(prev.totalFiles, 1);
+            const progressFactor = done / total;
+            const unknownFactor = 1 - (prev.unknownSizeFiles / total);
+            const instant = speedMbps > 0 ? speedMbps : prev.speedMbps;
+            const smoothedSpeedMbps =
+              instant > 0
+                ? (prev.smoothedSpeedMbps > 0
+                    ? prev.smoothedSpeedMbps * 0.72 + instant * 0.28
+                    : instant)
+                : prev.smoothedSpeedMbps;
+            const speedStability =
+              smoothedSpeedMbps > 0
+                ? 1 - Math.min(Math.abs(instant - smoothedSpeedMbps) / smoothedSpeedMbps, 1)
+                : 0;
             return {
               ...prev,
-              [relativePath]: { ...p, bytes_downloaded: p.total_bytes || p.bytes_downloaded, speed_bps: 0 },
-              [event.payload.path]: { ...p, bytes_downloaded: p.total_bytes || p.bytes_downloaded, speed_bps: 0 },
+              currentFile: displayPath || prev.currentFile,
+              downloadedBytes: Math.max(prev.downloadedBytes, aggregateBytes),
+              speedMbps: instant,
+              smoothedSpeedMbps,
+              activeCircuits,
+              peakActiveCircuits: Math.max(prev.peakActiveCircuits, activeCircuits),
+              peakBandwidthMbps: Math.max(prev.peakBandwidthMbps, speedMbps),
+              diskWriteMbps: diskWriteMbps > 0 ? diskWriteMbps : prev.diskWriteMbps,
+              peakDiskWriteMbps: Math.max(prev.peakDiskWriteMbps, diskWriteMbps),
+              etaConfidence: Math.max(
+                0.05,
+                Math.min(0.99, progressFactor * 0.45 + unknownFactor * 0.20 + speedStability * 0.35),
+              ),
             };
           });
         })
       );
 
       unlistenPromises.push(
+        listen<{ url: string; path: string; hash: string; time_taken_secs: number }>("complete", (event) => {
+          const roots = [activeDownloadOutputDirRef.current, outputDir];
+          const displayPath = toDisplayPath(event.payload.path, roots);
+          setLogs((l) => [...l.slice(-399), `[✓] Download finished: ${displayPath} (SHA256: ${event.payload.hash})`]);
+          showToast("success", "Download Finished", `File saved and verified (${event.payload.hash})`);
+          setDownloadProgress((prev) => {
+            const p = prev[displayPath];
+            if (!p) return prev;
+            const completedBytes = p.total_bytes || p.bytes_downloaded;
+            const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
+            if (completedBytes > previousBytes) {
+              perFileDownloadedBytesRef.current[displayPath] = completedBytes;
+              aggregateDownloadBytesRef.current += completedBytes - previousBytes;
+            }
+            return {
+              ...prev,
+              [displayPath]: { ...p, bytes_downloaded: completedBytes, speed_bps: 0 },
+            };
+          });
+          setDownloadBatchStatus((prev) => ({
+            ...prev,
+            downloadedBytes: Math.max(prev.downloadedBytes, aggregateDownloadBytesRef.current),
+          }));
+        })
+      );
+
+      unlistenPromises.push(
         listen<{ url: string; path: string; error: string }>("download_failed", (event) => {
-          setLogs((l) => [...l.slice(-399), `[ERROR] Download failed for ${event.payload.path}: ${event.payload.error}`]);
+          const displayPath = toDisplayPath(event.payload.path, [activeDownloadOutputDirRef.current, outputDir]);
+          setLogs((l) => [...l.slice(-399), `[ERROR] Download failed for ${displayPath}: ${event.payload.error}`]);
           showToast("error", "Download Failed", event.payload.error);
         })
       );
 
       unlistenPromises.push(
         listen<{ url: string; path: string; reason: string }>("download_interrupted", (event) => {
-          setLogs((l) => [...l.slice(-399), `[SYSTEM] Download interrupted for ${event.payload.path}: ${event.payload.reason}`]);
-          showToast("success", "Download Interrupted", `${event.payload.reason} for ${event.payload.path}`);
+          const displayPath = toDisplayPath(event.payload.path, [activeDownloadOutputDirRef.current, outputDir]);
+          setLogs((l) => [...l.slice(-399), `[SYSTEM] Download interrupted for ${displayPath}: ${event.payload.reason}`]);
+          showToast("success", "Download Interrupted", `${event.payload.reason} for ${displayPath}`);
         })
       );
     } else if (!previewNoticeShownRef.current) {
@@ -611,6 +793,10 @@ function App() {
     setCrawlElapsed(0);
     setDownloadProgress({});
     setDownloadBatchStatus(INITIAL_DOWNLOAD_BATCH_STATUS);
+    aggregateDownloadBytesRef.current = 0;
+    aggregateDiskSampleRef.current = null;
+    perFileDownloadedBytesRef.current = {};
+    activeDownloadOutputDirRef.current = "";
     batchSpeedSampleRef.current = null;
     setDownloadElapsed(0);
     setLogs((l) => [...l, `--- Initiating Crawl ---`]);
@@ -684,6 +870,8 @@ function App() {
         setDownloadBatchStatus((prev) => ({
           ...prev,
           currentFile: "cancelled",
+          speedMbps: 0,
+          activeCircuits: 0,
           etaSeconds: null,
         }));
         setLogs((l) => [...l, `[SYSTEM] Cancel acknowledged in preview mode (no native crawl workers active).`]);
@@ -697,6 +885,8 @@ function App() {
       setDownloadBatchStatus((prev) => ({
         ...prev,
         currentFile: "cancelled",
+        speedMbps: 0,
+        activeCircuits: 0,
         etaSeconds: null,
       }));
       setLogs((l) => [...l, `[SYSTEM] ⚠ ${result}`]);
@@ -733,11 +923,10 @@ function App() {
         setLogs((l) => [...l, `[MIRROR] Saved ${filePath} to disk`]);
       } else {
         // High concurrency chunked download for single files
-        let targetPath = outputDir.endsWith('/') || outputDir.endsWith('\\') ? `${outputDir}${filePath}` : `${outputDir}/${filePath}`;
         await invoke("initiate_download", {
           args: {
             url: rawUrl,
-            path: targetPath,
+            path: filePath,
             output_root: outputDir,
             connections: crawlOptions.circuits || 120,
             force_tor: rawUrl.includes(".onion"),
@@ -833,9 +1022,10 @@ function App() {
         title: "Select Download Location",
       });
       if (selected && typeof selected === "string") {
-        setOutputDir(selected);
-        setLogs((l) => [...l.slice(-399), `[PATH] Output location set to: ${selected}`]);
-        showToast("success", "Storage Linked", `Updated target extraction path to ${selected}`);
+        const normalizedSelected = stripWindowsVerbatimPrefix(selected);
+        setOutputDir(normalizedSelected);
+        setLogs((l) => [...l.slice(-399), `[PATH] Output location set to: ${normalizedSelected}`]);
+        showToast("success", "Storage Linked", `Updated target extraction path to ${normalizedSelected}`);
       }
     } catch (e) {
       console.warn("Failed to open dialog", e);

@@ -1,21 +1,33 @@
-use tauri::AppHandle;
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use crate::adapters::{CrawlerAdapter, SiteFingerprint, FileEntry, EntryType};
+use crate::adapters::{CrawlerAdapter, EntryType, FileEntry, SiteFingerprint};
 use crate::frontier::CrawlerFrontier;
 use scraper::{Html, Selector};
+use std::sync::Arc;
+use tauri::AppHandle;
+use tokio::sync::mpsc;
 
 #[derive(Default)]
 pub struct DragonForceAdapter;
 
-fn recursive_extract_json(val: &serde_json::Value, entries: &mut Vec<FileEntry>, current_path: String, host: &str, token: &str) {
+fn recursive_extract_json(
+    val: &serde_json::Value,
+    entries: &mut Vec<FileEntry>,
+    current_path: String,
+    host: &str,
+    token: &str,
+) {
     match val {
         serde_json::Value::Object(map) => {
             if let Some(name_val) = map.get("name").and_then(|v| v.as_str()) {
-                let is_dir = map.get("isDir").and_then(|v| v.as_bool())
-                    .unwrap_or_else(|| map.get("type").and_then(|v| v.as_str()).map_or(false, |s| s == "dir" || s == "directory"));
+                let is_dir = map
+                    .get("isDir")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or_else(|| {
+                        map.get("type")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| s == "dir" || s == "directory")
+                    });
                 let has_size = map.contains_key("size");
-                
+
                 if is_dir || has_size {
                     let path = if current_path.is_empty() {
                         format!("/{}", name_val)
@@ -26,17 +38,26 @@ fn recursive_extract_json(val: &serde_json::Value, entries: &mut Vec<FileEntry>,
                     };
 
                     let size_bytes = map.get("size").and_then(|v| v.as_u64());
-                    let raw_url = format!("http://{}/?path={}&token={}", host, urlencoding::encode(path.trim_start_matches('/')), token);
-                    
+                    let raw_url = format!(
+                        "http://{}/?path={}&token={}",
+                        host,
+                        urlencoding::encode(path.trim_start_matches('/')),
+                        token
+                    );
+
                     entries.push(FileEntry {
                         path: path.clone(),
                         size_bytes,
-                        entry_type: if is_dir { EntryType::Folder } else { EntryType::File },
+                        entry_type: if is_dir {
+                            EntryType::Folder
+                        } else {
+                            EntryType::File
+                        },
                         raw_url,
                     });
                 }
             }
-            
+
             for (_k, v) in map {
                 recursive_extract_json(v, entries, current_path.clone(), host, token);
             }
@@ -54,7 +75,10 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
     let mut entries = Vec::new();
 
     if html.contains("<iframe") {
-        let re = regex::Regex::new(r#"src="([^"]+token=[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+[^"]*)""#).unwrap();
+        let re = regex::Regex::new(
+            r#"src="([^"]+token=[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+[^"]*)""#,
+        )
+        .unwrap();
         if let Some(caps) = re.captures(html) {
             let iframe_src = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             if !iframe_src.is_empty() {
@@ -63,7 +87,7 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
                 } else {
                     format!("http://{}{}", host, iframe_src.trim_start_matches('/'))
                 };
-                
+
                 entries.push(FileEntry {
                     path: "/_bridge".to_string(),
                     size_bytes: None,
@@ -76,13 +100,13 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
     }
 
     let token = if let Some(t_idx) = current_url.find("token=") {
-        &current_url[t_idx + 6..].split('&').next().unwrap_or("")
+        current_url[t_idx + 6..].split('&').next().unwrap_or("")
     } else {
         ""
     };
 
     let document = Html::parse_document(html);
-    
+
     let script_selector = Selector::parse("script#__NEXT_DATA__").unwrap();
     if let Some(script) = document.select(&script_selector).next() {
         if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&script.inner_html()) {
@@ -92,7 +116,7 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
             }
         }
     }
-    
+
     let item_selector = Selector::parse(".item").unwrap();
     let link_selector = Selector::parse("a.text-pointer-animations").unwrap();
     let size_selector = Selector::parse("div.size").unwrap();
@@ -101,14 +125,14 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
         if let Some(link) = item.select(&link_selector).next() {
             let is_dir = link.value().classes().any(|c| c == "dir");
             let href = link.value().attr("href").unwrap_or("");
-            
+
             // Skip back link
             if href.starts_with("javascript:") {
                 continue;
             }
 
             let raw_url = format!("http://{}{}", host, href);
-            
+
             // Extract the path from the href
             // href is like: /?path=RJZ-APP1/G/01%20RJZ&token=...
             // or /download?path=RJZ-APP1/...&token=...
@@ -117,7 +141,7 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
                 let after_path = &href[path_start + 5..];
                 if let Some(path_end) = after_path.find("&token=") {
                     let encoded_path = &after_path[..path_end];
-                    
+
                     // Robust URL decode instead of just replace("%20")
                     extracted_path = urlencoding::decode(encoded_path)
                         .unwrap_or(std::borrow::Cow::Borrowed(encoded_path))
@@ -149,7 +173,11 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
             entries.push(FileEntry {
                 path,
                 size_bytes,
-                entry_type: if is_dir { EntryType::Folder } else { EntryType::File },
+                entry_type: if is_dir {
+                    EntryType::Folder
+                } else {
+                    EntryType::File
+                },
                 raw_url,
             });
         }
@@ -165,10 +193,10 @@ impl CrawlerAdapter for DragonForceAdapter {
     }
 
     async fn crawl(
-        &self, 
-        current_url: &str, 
-        frontier: Arc<CrawlerFrontier>, 
-        app: AppHandle
+        &self,
+        current_url: &str,
+        frontier: Arc<CrawlerFrontier>,
+        app: AppHandle,
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
@@ -177,7 +205,7 @@ impl CrawlerAdapter for DragonForceAdapter {
 
         queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
-        
+
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -218,7 +246,9 @@ impl CrawlerAdapter for DragonForceAdapter {
 
             workers.spawn(async move {
                 loop {
-                    if f.is_cancelled() { break; }
+                    if f.is_cancelled() {
+                        break;
+                    }
 
                     let next_url = match q_clone.pop() {
                         Some(url) => url,
@@ -238,71 +268,77 @@ impl CrawlerAdapter for DragonForceAdapter {
                     };
 
                     let _permit = f.politeness_semaphore.acquire().await.ok();
-                        let (cid, _client) = f.get_client();
+                    let (cid, _client) = f.get_client();
 
-                        let delay = f.scorer.yield_delay(cid);
-                        if delay > std::time::Duration::ZERO {
-                            tokio::time::sleep(delay).await;
-                        }
+                    let delay = f.scorer.yield_delay(cid);
+                    if delay > std::time::Duration::ZERO {
+                        tokio::time::sleep(delay).await;
+                    }
 
-                        let start_time = std::time::Instant::now();
-                        let mut fetch_success = false;
-                        let mut bytes_downloaded = 0;
-                        let mut html = String::new();
-                        let mut active_cid = cid;
+                    let start_time = std::time::Instant::now();
+                    let mut fetch_success = false;
+                    let mut bytes_downloaded = 0;
+                    let mut html = String::new();
+                    let mut active_cid = cid;
 
-                        for _ in 0..4 {
-                            let (current_cid, current_client) = f.get_client();
-                            active_cid = current_cid;
-                            
-                            let req = current_client.get(&next_url).send();
-                            if let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(45), req).await {
-                                if resp.status().is_success() {
-                                    if let Ok(Ok(body)) = tokio::time::timeout(std::time::Duration::from_secs(45), resp.text()).await {
-                                        bytes_downloaded += body.len() as u64;
-                                        html = body;
-                                        fetch_success = true;
-                                        break;
-                                    }
-                                } else if resp.status() == 404 {
+                    for _ in 0..4 {
+                        let (current_cid, current_client) = f.get_client();
+                        active_cid = current_cid;
+
+                        let req = current_client.get(&next_url).send();
+                        if let Ok(Ok(resp)) =
+                            tokio::time::timeout(std::time::Duration::from_secs(45), req).await
+                        {
+                            if resp.status().is_success() {
+                                if let Ok(Ok(body)) = tokio::time::timeout(
+                                    std::time::Duration::from_secs(45),
+                                    resp.text(),
+                                )
+                                .await
+                                {
+                                    bytes_downloaded += body.len() as u64;
+                                    html = body;
+                                    fetch_success = true;
                                     break;
                                 }
-                            }
-                            f.record_failure(active_cid);
-                        }
-
-                        let elapsed_ms = start_time.elapsed().as_millis() as u64;
-                        if fetch_success {
-                            f.record_success(active_cid, bytes_downloaded, elapsed_ms);
-                        } else {
-                            f.record_failure(active_cid);
-                        }
-
-                        if fetch_success && !html.is_empty() {
-                            let mut new_files = parse_dragonforce_fsguest(&html, &dynamic_host, &next_url);
-                            let _is_nextjs = html.contains("__NEXT_DATA__");
-                            
-                            for doc in &new_files {
-                                if doc.entry_type == EntryType::Folder {
-                                    if f.mark_visited(&doc.raw_url) {
-                                        pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                        q_clone.push(doc.raw_url.clone());
-                                    }
-                                }
-                                let _ = ui_tx_clone.send(doc.clone()).await;
-                            }
-
-                            if !new_files.is_empty() {
-                                discovered_ref.lock().await.append(&mut new_files);
+                            } else if resp.status() == 404 {
+                                break;
                             }
                         }
-                        
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        f.record_failure(active_cid);
+                    }
+
+                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                    if fetch_success {
+                        f.record_success(active_cid, bytes_downloaded, elapsed_ms);
+                    } else {
+                        f.record_failure(active_cid);
+                    }
+
+                    if fetch_success && !html.is_empty() {
+                        let mut new_files =
+                            parse_dragonforce_fsguest(&html, &dynamic_host, &next_url);
+                        let _is_nextjs = html.contains("__NEXT_DATA__");
+
+                        for doc in &new_files {
+                            if doc.entry_type == EntryType::Folder && f.mark_visited(&doc.raw_url) {
+                                pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                q_clone.push(doc.raw_url.clone());
+                            }
+                            let _ = ui_tx_clone.send(doc.clone()).await;
+                        }
+
+                        if !new_files.is_empty() {
+                            discovered_ref.lock().await.append(&mut new_files);
+                        }
+                    }
+
+                    pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }
 
-        while let Some(_) = workers.join_next().await {}
+        while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
         let mut final_results = all_discovered_entries.lock().await;
@@ -316,7 +352,7 @@ impl CrawlerAdapter for DragonForceAdapter {
     fn known_domains(&self) -> Vec<&'static str> {
         vec![
             "fsguestuctexqqaoxuahuydfa6ovxuhtng66pgyr5gqcrsi7qgchpkad.onion",
-            "dragonforxxbp3awc7mzs5dkswrua3znqyx5roefmi4smjrsdi22xwqd.onion"
+            "dragonforxxbp3awc7mzs5dkswrua3znqyx5roefmi4smjrsdi22xwqd.onion",
         ]
     }
 }

@@ -167,7 +167,7 @@ impl CrawlerFrontier {
         let hashes = DashSet::new();
 
         let safe_name = sanitize_filename(&target_url);
-        let wal_path = format!("/tmp/crawli_{}.wal", safe_name);
+        let wal_path = std::env::temp_dir().join(format!("crawli_{}.wal", safe_name));
         let allow_wal_resume = wal_resume_enabled();
 
         // Default to fresh crawls so stale WAL state never suppresses new traversal.

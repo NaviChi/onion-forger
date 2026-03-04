@@ -1,6 +1,6 @@
 pub mod adapters;
-pub mod bbr;
 pub mod aria_downloader;
+pub mod bbr;
 pub mod bft_quorum;
 pub mod db;
 pub mod frontier;
@@ -274,7 +274,7 @@ async fn start_crawl(
             format!("[System] Bootstrapping Target: {}", url),
         )
         .unwrap();
-        
+
         let target_daemons = options.daemons.unwrap_or(4).max(1);
         match tor::bootstrap_tor_cluster(app.clone(), target_daemons).await {
             Ok((guard, ports)) => {
@@ -717,7 +717,7 @@ async fn scaffold_download(
     // Write a manifest index at the root
     let manifest_path = support_dir.join("_onionforge_manifest.txt");
     let mut manifest = String::new();
-    manifest.push_str(&"# OnionForge Download Manifest\n".to_string());
+    manifest.push_str("# OnionForge Download Manifest\n");
     manifest.push_str(&format!("# Generated: {}\n", chrono_stub()));
     manifest.push_str(&format!("# Total Entries: {}\n\n", entries.len()));
     for entry in entries {

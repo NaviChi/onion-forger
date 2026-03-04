@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
 use std::sync::RwLock;
+use std::time::Instant;
 
 /// Application-Layer BBR (Bottleneck Bandwidth and RTT) congestion controller.
 /// Paces active circuit count instantly to the bottleneck bandwidth rather than linear AIMD scaling.
@@ -8,11 +8,11 @@ pub struct BbrController {
     active: AtomicUsize,
     max: usize,
     min: usize,
-    
+
     // Track bytes delivered in a timing window
     window_start: RwLock<Instant>,
     delivered_bytes: AtomicU64,
-    
+
     // Sliding max bandwidth (bytes per ms)
     max_bw_bps: AtomicU64,
     // Sliding min RTT (ms)
@@ -32,11 +32,11 @@ impl BbrController {
         }
     }
 
-    /// Update with actual bytes delivered and RTT. 
+    /// Update with actual bytes delivered and RTT.
     /// If payload is unknown or metadata-only, use est_bytes.
     pub fn on_success(&self, bytes: u64, rtt_ms: u64) {
         let rtt = rtt_ms.max(1);
-        
+
         let current_min_rtt = self.min_rtt_ms.load(Ordering::Relaxed);
         if rtt < current_min_rtt {
             // Update min RTT if we found a better route
@@ -44,12 +44,13 @@ impl BbrController {
             self.min_rtt_ms.store(rtt, Ordering::Relaxed);
         } else {
             // Decay min_rtt to allow discovery of new higher floors if target degrades
-            self.min_rtt_ms.fetch_add(1.max(rtt / 1000), Ordering::Relaxed);
+            self.min_rtt_ms
+                .fetch_add(1.max(rtt / 1000), Ordering::Relaxed);
         }
 
         // Add to window
         self.delivered_bytes.fetch_add(bytes, Ordering::Relaxed);
-        
+
         let now = Instant::now();
         let elapsed_ms = {
             let start = self.window_start.read().unwrap();
@@ -64,7 +65,7 @@ impl BbrController {
                 if final_elapsed >= 1000 {
                     let final_delivered = self.delivered_bytes.swap(0, Ordering::Relaxed);
                     let current_bw = final_delivered / final_elapsed.max(1);
-                    
+
                     let mut max_bw = self.max_bw_bps.load(Ordering::Relaxed);
                     if current_bw > max_bw {
                         self.max_bw_bps.store(current_bw, Ordering::Relaxed);
@@ -85,20 +86,20 @@ impl BbrController {
     fn recalculate_concurrency(&self, max_bw_bps: u64, min_rtt_ms: u64) {
         // BBR fundamentally limits inflight to BDP = BtlBw * RTprop
         let bdp_bytes = max_bw_bps * min_rtt_ms;
-        
+
         // Assume an average web request response is 32KB for Tor operations
-        let avg_req_size = 32768; 
-        
+        let avg_req_size = 32768;
+
         let target_concurrency = (bdp_bytes / avg_req_size) as usize;
         let clamped = target_concurrency.clamp(self.min, self.max);
-        
+
         let current = self.active.load(Ordering::Relaxed);
         let next = if clamped > current {
             clamped // Snap up instantly (HFT style BBR probe block)
         } else {
             (current * 3 / 4).max(clamped) // Multiplicatively drift down smoothly
         };
-        
+
         self.active.store(next, Ordering::Relaxed);
     }
 

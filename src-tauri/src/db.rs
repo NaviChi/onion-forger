@@ -74,49 +74,47 @@ impl SledVfs {
 
             let mut seen_dirs = std::collections::HashSet::new();
 
-            for item in db.scan_prefix(prefix.as_bytes()) {
-                if let Ok((_k, v)) = item {
-                    if let Ok(entry) = serde_json::from_slice::<FileEntry>(&v) {
-                        // Extract relative part after prefix
-                        let relative_path = if prefix.is_empty() {
-                            entry.path.clone()
-                        } else if entry.path.starts_with(&prefix) {
-                            entry.path[prefix.len()..].to_string()
-                        } else {
-                            continue;
-                        };
+            for (_k, v) in db.scan_prefix(prefix.as_bytes()).flatten() {
+                if let Ok(entry) = serde_json::from_slice::<FileEntry>(&v) {
+                    // Extract relative part after prefix
+                    let relative_path = if prefix.is_empty() {
+                        entry.path.clone()
+                    } else if entry.path.starts_with(&prefix) {
+                        entry.path[prefix.len()..].to_string()
+                    } else {
+                        continue;
+                    };
 
-                        let relative_path = relative_path.trim_start_matches('/');
-                        let parts: Vec<&str> = relative_path.split('/').collect();
+                    let relative_path = relative_path.trim_start_matches('/');
+                    let parts: Vec<&str> = relative_path.split('/').collect();
 
-                        if parts.is_empty() || parts[0].is_empty() {
-                            continue;
-                        }
+                    if parts.is_empty() || parts[0].is_empty() {
+                        continue;
+                    }
 
-                        if parts.len() == 1 {
-                            // Direct child file or empty dir
-                            if entry.entry_type == crate::adapters::EntryType::Folder {
-                                let dir_name = parts[0].to_string();
-                                if !seen_dirs.contains(&dir_name) {
-                                    seen_dirs.insert(dir_name);
-                                    entries.push(entry);
-                                }
-                            } else {
+                    if parts.len() == 1 {
+                        // Direct child file or empty dir
+                        if entry.entry_type == crate::adapters::EntryType::Folder {
+                            let dir_name = parts[0].to_string();
+                            if !seen_dirs.contains(&dir_name) {
+                                seen_dirs.insert(dir_name);
                                 entries.push(entry);
                             }
                         } else {
-                            // It's a subdirectory, construct a virtual Folder entry if not seen
-                            let dir_name = parts[0].to_string();
-                            if !seen_dirs.contains(&dir_name) {
-                                seen_dirs.insert(dir_name.clone());
-                                let virtual_dir_path = format!("{}{}", prefix, dir_name);
-                                entries.push(FileEntry {
-                                    path: virtual_dir_path,
-                                    size_bytes: None,
-                                    entry_type: crate::adapters::EntryType::Folder,
-                                    raw_url: "".to_string(), // Virtual folders don't have direct raw URLs
-                                });
-                            }
+                            entries.push(entry);
+                        }
+                    } else {
+                        // It's a subdirectory, construct a virtual Folder entry if not seen
+                        let dir_name = parts[0].to_string();
+                        if !seen_dirs.contains(&dir_name) {
+                            seen_dirs.insert(dir_name.clone());
+                            let virtual_dir_path = format!("{}{}", prefix, dir_name);
+                            entries.push(FileEntry {
+                                path: virtual_dir_path,
+                                size_bytes: None,
+                                entry_type: crate::adapters::EntryType::Folder,
+                                raw_url: "".to_string(), // Virtual folders don't have direct raw URLs
+                            });
                         }
                     }
                 }

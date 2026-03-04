@@ -33,7 +33,7 @@ async fn test_dragonforce_cli_crawl() {
     };
 
     let host = "fsguestuctexqqaoxuahuydfa6ovxuhtng66pgyr5gqcrsi7qgchpkad.onion";
-    let entries = parse_dragonforce_fsguest(&html, host);
+    let entries = parse_dragonforce_fsguest(&html, host, url);
 
     println!("=================== CLI CRAWL RESULTS ===================");
     println!("Crawled: {}", url);

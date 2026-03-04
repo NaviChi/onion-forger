@@ -7,7 +7,9 @@ pub struct QilinAdapter;
 impl super::CrawlerAdapter for QilinAdapter {
     async fn can_handle(&self, fingerprint: &super::SiteFingerprint) -> bool {
         // Qilin uses a themed autoindex but lacks standard "Index of /" headers.
-        fingerprint.body.contains("<div class=\"page-header-title\">QData</div>")
+        fingerprint
+            .body
+            .contains("<div class=\"page-header-title\">QData</div>")
             || fingerprint.body.contains("Data browser")
     }
 

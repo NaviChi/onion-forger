@@ -72,7 +72,9 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
 
             workers.spawn(async move {
                 loop {
-                    if f.is_cancelled() { break; }
+                    if f.is_cancelled() {
+                        break;
+                    }
 
                     let next_url = match q_clone.pop() {
                         Some(url) => url,
@@ -85,60 +87,60 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
                         }
                     };
 
-                        // Advanced Politeness Throttle
-                        let _permit = f.politeness_semaphore.acquire().await.ok();
+                    // Advanced Politeness Throttle
+                    let _permit = f.politeness_semaphore.acquire().await.ok();
 
-                        // Round Robin Persistent Client
-                        let (cid, _client) = f.get_client();
+                    // Round Robin Persistent Client
+                    let (cid, _client) = f.get_client();
 
-                        let start_time = std::time::Instant::now();
+                    let start_time = std::time::Instant::now();
 
-                        // Emulated network fetch
-                        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                    // Emulated network fetch
+                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
-                        f.record_success(cid, 1024, start_time.elapsed().as_millis() as u64);
+                    f.record_success(cid, 1024, start_time.elapsed().as_millis() as u64);
 
-                        // Emulating parsed discoveries (In reality we client.get(&next_url).await...)
-                        let mut new_files = Vec::new();
-                        let items_to_find = rand::random::<u8>() % 5;
+                    // Emulating parsed discoveries (In reality we client.get(&next_url).await...)
+                    let mut new_files = Vec::new();
+                    let items_to_find = rand::random::<u8>() % 5;
 
-                        for i in 0..items_to_find {
-                            let dummy_url = format!("{next_url}/node_{i}");
-                            if f.mark_visited(&dummy_url) {
-                                // Add back to queue to recurse inside
-                                pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                q_clone.push(dummy_url.clone());
+                    for i in 0..items_to_find {
+                        let dummy_url = format!("{next_url}/node_{i}");
+                        if f.mark_visited(&dummy_url) {
+                            // Add back to queue to recurse inside
+                            pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            q_clone.push(dummy_url.clone());
 
-                                let entry = super::FileEntry {
-                                    path: format!(
-                                        "/Target Server/{}",
-                                        dummy_url.replace("http://", "")
-                                    ),
-                                    size_bytes: Some(1024 * (i as u64 + 1)),
-                                    entry_type: super::EntryType::File,
-                                    raw_url: dummy_url,
-                                };
-                                new_files.push(entry);
-                            }
+                            let entry = super::FileEntry {
+                                path: format!(
+                                    "/Target Server/{}",
+                                    dummy_url.replace("http://", "")
+                                ),
+                                size_bytes: Some(1024 * (i as u64 + 1)),
+                                entry_type: super::EntryType::File,
+                                raw_url: dummy_url,
+                            };
+                            new_files.push(entry);
                         }
+                    }
 
-                        // Send to IPC batcher
-                        for file in &new_files {
-                            let _ = ui_tx_clone.send(file.clone()).await;
-                        }
+                    // Send to IPC batcher
+                    for file in &new_files {
+                        let _ = ui_tx_clone.send(file.clone()).await;
+                    }
 
-                        // Save internally
-                        if !new_files.is_empty() {
-                            let mut lock = discovered_ref.lock().await;
-                            lock.extend(new_files);
-                        }
+                    // Save internally
+                    if !new_files.is_empty() {
+                        let mut lock = discovered_ref.lock().await;
+                        lock.extend(new_files);
+                    }
 
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }
 
-        while let Some(_) = workers.join_next().await {}
+        while workers.join_next().await.is_some() {}
 
         drop(ui_tx); // Signals the UI batcher to flush and shutdown
         let mut final_results = all_discovered_entries.lock().await;

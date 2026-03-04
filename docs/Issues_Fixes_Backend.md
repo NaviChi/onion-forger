@@ -1,5 +1,5 @@
-Version: 1.0.6
-Updated: 2026-03-03
+Version: 1.0.9
+Updated: 2026-03-04
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [MANDATORY-L1] Prevention Discipline, [MANDATORY-L1] Testing & Validation, [MANDATORY-L1] Performance/Cost/Quality
 
@@ -28,6 +28,9 @@ Confirmed backend issues:
 - Linux release job failed while building AppImage bundles in GitHub Actions (`linuxdeploy` execution failure on runner), leaving release artifacts incomplete for Linux.
 - Windows runtime could flash visible command prompts when starting scans due child process spawn defaults.
 - Downloader stale-Tor cleanup used hardcoded `/tmp`, reducing process cleanup reliability on Windows.
+- Batch progress counters could drift on mixed smart-skip/small/large runs, causing UI progress plateaus.
+- Frontier WAL path used hardcoded `/tmp`, creating cross-platform path risk on Windows.
+- LockBit adapter could resolve as `Unidentified` because registry wiring missed adapter registration.
 
 # Details
 Issue-to-fix mapping:
@@ -100,9 +103,30 @@ Issue-to-fix mapping:
 - Issue: Downloader Tor cleanup missed stale daemon dirs on Windows.
   - Root Cause: cleanup routine scanned hardcoded `/tmp` instead of platform temp directory.
   - Fix: switch cleanup root to `std::env::temp_dir()`.
+- Issue: Download progress bar could appear frozen on Windows while transfers were still active.
+  - Root Cause: `batch_progress` semantics were phase-local: small-file events only, large-file completions not counted, smart-skipped files not counted, and no cumulative byte field.
+  - Fix: unify batch telemetry with global counters (`completed`, `failed`, `total`, `downloaded_bytes`) across smart skip + small + large phases.
+- Issue: Frontier WAL file location was OS-specific.
+  - Root Cause: crawler frontier used hardcoded `/tmp/crawli_*.wal`.
+  - Fix: switch WAL root to `std::env::temp_dir()` for platform-safe behavior.
+- Issue: LockBit detection intermittently failed despite adapter implementation existing.
+  - Root Cause: `LockBitAdapter` was defined but not registered in `AdapterRegistry::new()`.
+  - Fix: add explicit LockBit registration in adapter registry and restore engine test coverage.
 - Issue: Re-crawling an existing directory tree overwrites 100% completed files and wastes bandwidth.
   - Root Cause: `start_batch_download` queued every file unconditionally. Partial-resume (`.ariaforge_state`) only prevents data loss, not redundant starts.
   - Fix: implement "Smart Skip" in the pre-flight routine using local filesystem metadata and the `size_hint` from the crawler.
+- Issue: Direct I/O open flags could fail on older disks, network-mapped filesystems, or virtualized Windows mounts.
+  - Root Cause: write path used a single acceleration mode without policy-level fallback behavior.
+  - Fix: add `CRAWLI_DIRECT_IO=auto|always|off` and degrade to buffered writes in `auto` mode after first direct-open failure.
+- Issue: Tournament sizing was static and did not adapt when bootstrap conditions changed across runs.
+  - Root Cause: fixed candidate ratio ignored observed ready latency and winner conversion.
+  - Fix: add adaptive tournament mode (`CRAWLI_TOURNAMENT_DYNAMIC`) and rolling telemetry (`p50`, `p95`, winner ratio) for sizing feedback.
+- Issue: Batch completion tail could stretch on mixed-size payload sets.
+  - Root Cause: queue ordering favored insertion order, allowing large late jobs to delay final completion.
+  - Fix: introduce SRPT + periodic starvation guard (`CRAWLI_BATCH_SRPT`, `CRAWLI_BATCH_STARVATION_INTERVAL`) for fairer tail behavior.
+- Issue: Quality drift risk across contributor machines.
+  - Root Cause: no repository-level rust toolchain pin and no single strict CI quality workflow.
+  - Fix: add `rust-toolchain.toml` + `quality.yml` enforcing `cargo fmt`, strict `clippy`, Rust tests, frontend build, and overlay integrity checks.
 - Issue (HFT): Sub-optimal AIMD ramp-up on high-speed circuits.
   - Root Cause: standard AIMD adds +1 worker linearly, wasting potential bandwidth available instantly.
   - Fix (Implemented): Integrated BBR congestion control to instantly probe bandwidth limits geometrically instead of linear ramp-up.
@@ -148,6 +172,12 @@ Issue-to-fix mapping:
 **20. CI release matrices must include only empirically validated bundle targets per runner image; avoid unstable packagers in default release paths.**
 **21. Windows child processes in GUI runtime must set no-window creation flags unless user-visible console output is explicitly required.**
 **22. Temp-directory cleanup logic must use platform APIs (`std::env::temp_dir`) instead of OS-specific literals.**
+**23. Batch progress telemetry must use one global denominator and include smart-skip/large/small phases uniformly.**
+**24. Any adapter present in support catalog must also be explicitly registered in `AdapterRegistry`, with a matching engine test assertion.**
+**25. Direct I/O acceleration must be policy-driven and degradable to buffered writes on unsupported targets.**
+**26. Tournament sizing should be data-informed from prior bootstrap telemetry, not fixed constants only.**
+**27. Mixed-size batch schedulers must include starvation prevention when shortest-job strategies are enabled.**
+**28. Repository-level quality gates must be enforced in CI, not left to local developer defaults.**
 
 # Risk
 - Aggressive worker startup may increase transient connection churn on weak targets.
@@ -162,10 +192,16 @@ Issue-to-fix mapping:
 - 2026-03-03: Added batch heartbeat telemetry to prevent frozen UI states during long-tail phases.
 - 2026-03-03: Fixed Linux release pipeline stability by removing AppImage from default CI bundle targets.
 - 2026-03-03: Suppressed Windows scan-time command prompt popups with no-window process flags; normalized temp-dir cleanup for Windows.
+- 2026-03-03: Unified batch progress counters/bytes across phases and moved frontier WAL path to platform temp directory.
+- 2026-03-03: Re-registered LockBit adapter in runtime registry and fixed `engine_test` `CrawlOptions` fixtures for `daemons` field parity.
+- 2026-03-04: Added adaptive Direct I/O fallback policy, adaptive tournament telemetry/sizing, SRPT+aging batch scheduling controls, and strict quality workflow/toolchain pinning.
 
 # Appendices
 - Validation:
   - `cargo check`
+  - `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check`
+  - `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings`
   - `cargo test --lib`
   - `cargo test --test engine_test`
-  - `cargo run --example lockbit_live_pipeline` (live onion run, completed 379/379)
+  - `npm run build`
+  - `npm run overlay:integrity`

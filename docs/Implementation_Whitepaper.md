@@ -1,5 +1,5 @@
-Version: 1.0.4
-Updated: 2026-03-03
+Version: 1.0.7
+Updated: 2026-03-04
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [CRITICAL-L0] Framework Boundaries, [MANDATORY-L1] Docs Management, [MANDATORY-L1] Living Documents, [MANDATORY-L1] Whitepaper Template, [MANDATORY-L1] Workflow
 
@@ -53,6 +53,7 @@ Implemented behavior:
   - Tor binary path/integrity resolution now happens once before daemon launch loop.
   - Added tournament startup policy (default `8→4` for standard swarm): launch extra candidates, keep first healthy winners, terminate stragglers.
   - Added quorum fallback during tournament so one stalled daemon does not block crawl start.
+  - Added adaptive tournament sizing (`CRAWLI_TOURNAMENT_DYNAMIC`) and rolling telemetry (`p50`, `p95`, winner ratio) to tune future launches from observed bootstrap behavior.
 - Backend Aria downloader hardening:
   - Added pre-flight "Smart Download" logic to `start_batch_download`. Fully downloaded files in the target directory are skipped entirely if their sizes match the crawler's size hints.
   - Active Tor daemon discovery now spans full managed range (`9051-9070`) and reuses tournament winners.
@@ -60,6 +61,9 @@ Implemented behavior:
   - Small-file phase now uses size-aware retry limits/timeouts, retry port rotation, and capped fast backoff.
   - Small-file completion requires expected-byte completion or clean stream EOF (no partial-write false positives).
   - Batch telemetry now includes periodic heartbeat `batch_progress` frames during long phases.
+  - Batch telemetry counters are now globally normalized across smart-skip + small-file + large-file phases, with cumulative `downloaded_bytes` emission.
+  - Added adaptive Direct I/O policy (`CRAWLI_DIRECT_IO=auto|always|off`) with one-way degraded fallback in `auto` mode for legacy/virtual disks where direct open flags fail.
+  - Added batch scheduling controls for SRPT + starvation guard (`CRAWLI_BATCH_SRPT`, `CRAWLI_BATCH_STARVATION_INTERVAL`) to reduce end-of-run tail latency on mixed file sizes.
 - Backend telemetry:
   - Added `crawl_status_update` payload with `phase`, `progressPercent`, `visitedNodes`, `processedNodes`, `queuedNodes`, `activeWorkers`, `workerTarget`, `etaSeconds`.
   - Periodic emitter runs during crawl and emits final complete/cancel/error snapshot.
@@ -70,9 +74,19 @@ Implemented behavior:
   - Added download-batch telemetry listeners and state machine in `App.tsx`.
   - Dashboard now transitions from crawl progress to download progress automatically and surfaces total/downloaded/failed/remaining, elapsed timer, ETA, throughput, and current file.
   - Added frontend delta-based throughput fallback when batch payload speed is sparse/zero.
+  - Windows path rendering now strips verbatim prefixes (`\\?\`) and binds root-relative display paths for progress/current-file fields.
+  - Download progress fill now uses `max(filePercent, bytePercent)` to prevent plateau during long single-file transfers.
+  - Added operator telemetry for active/peak circuits, peak bandwidth, and current/peak disk I/O.
+  - Added EWMA throughput smoothing and ETA confidence scoring to stabilize operator-facing rate/ETA readouts during sparse or bursty telemetry windows.
+- Adapter registry integrity:
+  - Reintroduced explicit runtime registration for `LockBitAdapter` in `AdapterRegistry::new()` to align detection runtime with support catalog and tests.
+  - Updated `engine_test` `CrawlOptions` fixtures to include `daemons` field after options schema extension.
 - Release packaging:
   - GitHub Actions release matrix now uses Linux bundles `deb,rpm` (AppImage removed from default CI path due runner linuxdeploy instability).
   - Windows portable release packaging remains enabled and uploads `crawli_<tag>_windows_x64_portable.zip` with runtime dependencies under `bin/win_x64`.
+- Quality gates and toolchain:
+  - Added repository `rust-toolchain.toml` pinning stable + shared target list.
+  - Added `.github/workflows/quality.yml` for strict `fmt`, `clippy -D warnings`, Rust tests, frontend build, and overlay-integrity regression checks.
 - Windows process UX hardening:
   - Tor daemon spawn path now sets `CREATE_NO_WINDOW` on Windows to prevent console popups during scan bootstrap.
   - Windows `taskkill` paths in Tor and downloader cleanup now run with no-window flags.
@@ -126,6 +140,9 @@ Based on the final regression matrix yielding 0 files for WorldLeaks, INC Ransom
 **3. Progress events are contract-based; frontend field names must remain camelCase-compatible with backend serde settings.**
 **4. Throughput changes must preserve cancellation semantics and avoid orphan task accounting.**
 **5. Test expectations tied to concurrency windows must be updated when policy changes are intentional.**
+**6. Disk-write acceleration features must have an adaptive fallback path so unsupported filesystems can degrade without stalling downloads.**
+**7. Mixed-size batch dispatch should include starvation guardrails whenever shortest-job scheduling is enabled.**
+**8. New runtime behavior must ship with enforceable CI gates (`fmt`, `clippy`, tests, UI build, and overlay integrity).**
 
 # Risk
 - Progress remains estimate-driven for unknown total trees.
@@ -136,6 +153,9 @@ Based on the final regression matrix yielding 0 files for WorldLeaks, INC Ransom
 - 2026-03-03: v1.0.1 updated for downloader port reuse, small-file reliability, and heartbeat telemetry.
 - 2026-03-03: v1.0.3 updated for Linux release matrix stability and portable Windows artifact continuity.
 - 2026-03-03: v1.0.4 updated for Windows no-console process spawn behavior and cross-platform temp cleanup.
+- 2026-03-03: v1.0.5 updated for Windows-safe progress path rendering, byte-accurate batch progress, and circuit/throughput ceiling telemetry.
+- 2026-03-03: v1.0.6 updated for LockBit registry wiring restoration and engine test schema parity (`daemons`).
+- 2026-03-04: v1.0.7 updated for adaptive Direct I/O fallback, adaptive tournament telemetry, SRPT+aging batch scheduling, EWMA/ETA confidence UI, and quality workflow/toolchain pinning.
 
 # Appendices
 - Files touched:
@@ -143,11 +163,16 @@ Based on the final regression matrix yielding 0 files for WorldLeaks, INC Ransom
   - `src-tauri/src/adapters/play.rs`
   - `src-tauri/src/frontier.rs`
   - `src-tauri/src/lib.rs`
+  - `src-tauri/src/adapters/mod.rs`
   - `src-tauri/src/tor.rs`
   - `src-tauri/src/aria_downloader.rs`
+  - `src-tauri/src/io_vanguard.rs`
+  - `src-tauri/src/frontier.rs`
   - `src/App.tsx`
   - `src/components/Dashboard.tsx`
   - `src/components/Dashboard.css`
   - `src-tauri/tests/play_e2e_test.rs`
+  - `.github/workflows/quality.yml`
+  - `rust-toolchain.toml`
   - `.github/workflows/release.yml`
   - `README.md`

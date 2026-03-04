@@ -214,7 +214,8 @@ impl CrawlerAdapter for IncRansomAdapter {
                     }
                     impl Drop for TaskGuard {
                         fn drop(&mut self) {
-                            self.counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            self.counter
+                                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
                     let _guard = TaskGuard {
@@ -226,8 +227,7 @@ impl CrawlerAdapter for IncRansomAdapter {
                         safe_path = format!("./{}", safe_path.trim_start_matches('/'));
                     }
 
-                    let folder_api_url =
-                        format!("{}/api/v1/blog/get/folder", cdn_onion_clone);
+                    let folder_api_url = format!("{}/api/v1/blog/get/folder", cdn_onion_clone);
 
                     let body = serde_json::json!({
                         "disclosureId": disc_id_clone,
@@ -239,20 +239,13 @@ impl CrawlerAdapter for IncRansomAdapter {
                     let mut success = false;
                     for _attempt in 1..=5 {
                         let start_time = std::time::Instant::now();
-                        let resp_result =
-                            client.post(&folder_api_url).json(&body).send().await;
+                        let resp_result = client.post(&folder_api_url).json(&body).send().await;
 
-                        f.record_success(
-                            cid,
-                            4096,
-                            start_time.elapsed().as_millis() as u64,
-                        );
+                        f.record_success(cid, 4096, start_time.elapsed().as_millis() as u64);
 
                         if let Ok(resp) = resp_result {
                             if resp.status().is_success() {
-                                if let Ok(folder_res) =
-                                    resp.json::<FolderResponse>().await
-                                {
+                                if let Ok(folder_res) = resp.json::<FolderResponse>().await {
                                     if folder_res.success {
                                         if let Some(entries) = folder_res.payload {
                                             success = true;
@@ -264,21 +257,16 @@ impl CrawlerAdapter for IncRansomAdapter {
                                                     EntryType::File
                                                 };
 
-                                                let clean_path = entry
-                                                    .path
-                                                    .trim_start_matches("./")
-                                                    .to_string();
-                                                let mut file_path =
-                                                    if !clean_path.starts_with('/') {
-                                                        format!("/{}", clean_path)
-                                                    } else {
-                                                        clean_path.clone()
-                                                    };
+                                                let clean_path =
+                                                    entry.path.trim_start_matches("./").to_string();
+                                                let mut file_path = if !clean_path.starts_with('/')
+                                                {
+                                                    format!("/{}", clean_path)
+                                                } else {
+                                                    clean_path.clone()
+                                                };
                                                 if file_path == "/" {
-                                                    file_path = format!(
-                                                        "/{}",
-                                                        entry.originalname
-                                                    );
+                                                    file_path = format!("/{}", entry.originalname);
                                                 }
 
                                                 let raw_url = format!(
@@ -288,8 +276,7 @@ impl CrawlerAdapter for IncRansomAdapter {
 
                                                 new_files.push(FileEntry {
                                                     path: file_path.clone(),
-                                                    size_bytes: if f.active_options.sizes
-                                                    {
+                                                    size_bytes: if f.active_options.sizes {
                                                         entry.size
                                                     } else {
                                                         None
@@ -298,11 +285,8 @@ impl CrawlerAdapter for IncRansomAdapter {
                                                     raw_url,
                                                 });
 
-                                                if entry.is_folder
-                                                    && f.active_options.listing
-                                                {
-                                                    let mut sub_path =
-                                                        entry.path.clone();
+                                                if entry.is_folder && f.active_options.listing {
+                                                    let mut sub_path = entry.path.clone();
                                                     if !sub_path.ends_with('/') {
                                                         sub_path.push('/');
                                                     }
@@ -318,12 +302,9 @@ impl CrawlerAdapter for IncRansomAdapter {
 
                                             // Flush partial results to IPC batcher
                                             if !new_files.is_empty() {
-                                                let mut locked =
-                                                    discovered_ref.lock().await;
+                                                let mut locked = discovered_ref.lock().await;
                                                 for file in new_files {
-                                                    let _ = ui_tx_clone
-                                                        .send(file.clone())
-                                                        .await;
+                                                    let _ = ui_tx_clone.send(file.clone()).await;
                                                     locked.push(file);
                                                 }
                                             }
@@ -332,20 +313,15 @@ impl CrawlerAdapter for IncRansomAdapter {
                                         } // end if let Some(entries)
                                     } // end if folder_res.success
                                 } // end if let Ok(folder_res)
-                            } else if resp.status()
-                                == reqwest::StatusCode::TOO_MANY_REQUESTS
-                            {
+                            } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                                 f.record_failure(cid);
                             } // end if resp.status().is_success()
                         } // end if let Ok(resp)
 
                         // Failed this attempt — exponential backoff with jitter
-                        let variance =
-                            (rand::random::<f64>() * backoff as f64 * 0.5) as u64;
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            backoff + variance,
-                        ))
-                        .await;
+                        let variance = (rand::random::<f64>() * backoff as f64 * 0.5) as u64;
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff + variance))
+                            .await;
                         backoff *= 2;
                     } // end for _attempt in 1..=5
 
@@ -356,7 +332,7 @@ impl CrawlerAdapter for IncRansomAdapter {
             }); // end workers.spawn
         } // end for _ in 0..max_concurrent
 
-        while let Some(_) = workers.join_next().await {}
+        while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
         let mut final_results = all_discovered_entries.lock().await;

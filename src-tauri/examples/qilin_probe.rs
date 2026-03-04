@@ -8,7 +8,9 @@ async fn main() {
 
     crawli_lib::tor::cleanup_stale_tor_daemons();
 
-    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 1).await.unwrap();
+    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 1)
+        .await
+        .unwrap();
 
     let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{}", ports[0])).unwrap();
     let client = reqwest::Client::builder()
@@ -21,7 +23,7 @@ async fn main() {
 
     for attempt in 1..=5 {
         println!("Fetching Qilin (Attempt {}): {}", attempt, target_url);
-        
+
         match client.get(target_url).send().await {
             Ok(resp) => {
                 let status = resp.status();
