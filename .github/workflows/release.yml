@@ -24,7 +24,7 @@ jobs:
         include:
           - platform: ubuntu-24.04
             label: linux-x64
-            args: "--bundles appimage,deb,rpm"
+            args: "--bundles deb,rpm"
           - platform: windows-latest
             label: windows-x64
             args: ""

@@ -1,4 +1,4 @@
-Version: 1.0.4
+Version: 1.0.5
 Updated: 2026-03-03
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [MANDATORY-L1] Prevention Discipline, [MANDATORY-L1] Testing & Validation, [MANDATORY-L1] Performance/Cost/Quality
@@ -25,6 +25,7 @@ Confirmed backend issues:
 - Small-file phase could stall in long-tail retries due fixed-circuit retries and oversized request timeout.
 - Small-file phase accepted partial transfers as success if any bytes were written.
 - Batch telemetry lacked heartbeat updates during long phases, making UI appear frozen near completion.
+- Linux release job failed while building AppImage bundles in GitHub Actions (`linuxdeploy` execution failure on runner), leaving release artifacts incomplete for Linux.
 
 # Details
 Issue-to-fix mapping:
@@ -88,6 +89,9 @@ Issue-to-fix mapping:
 - Issue: Batch UI looked frozen when no file completed for several seconds.
   - Root Cause: `batch_progress` emission happened only at file completion/failure boundaries.
   - Fix: add periodic heartbeat `batch_progress` emission with current file, cumulative bytes, and rolling throughput.
+- Issue: Multi-OS release pipeline ended in failure even when Windows/macOS assets uploaded.
+  - Root Cause: Linux matrix attempted AppImage bundling (`--bundles appimage,deb,rpm`) and failed at `linuxdeploy` on GitHub runner.
+  - Fix: restrict Linux release bundles to `deb,rpm` in workflow matrix to keep release deterministic and complete.
 - Issue: Re-crawling an existing directory tree overwrites 100% completed files and wastes bandwidth.
   - Root Cause: `start_batch_download` queued every file unconditionally. Partial-resume (`.ariaforge_state`) only prevents data loss, not redundant starts.
   - Fix: implement "Smart Skip" in the pre-flight routine using local filesystem metadata and the `size_hint` from the crawler.
@@ -133,6 +137,7 @@ Issue-to-fix mapping:
 **17. (HFT Standard) Hot-path memory allocation and disk Mutex locking must be treated as critical path bottlenecks; design for Lock-Free message passing.**
 **18. (Aerospace Standard) File validation must be granular (Merkle-Trees); do not fail the whole operation if a partial chunk can be surgically repaired.**
 **19. (Aerospace Standard) SPA JSON APIs (e.g. Next.js Base64 JWTs) should be bypassed if the DOM natively exposes an authenticated `<iframe>` bridge, limiting exposure to brittle HTTP headers.**
+**20. CI release matrices must include only empirically validated bundle targets per runner image; avoid unstable packagers in default release paths.**
 
 # Risk
 - Aggressive worker startup may increase transient connection churn on weak targets.
@@ -145,6 +150,7 @@ Issue-to-fix mapping:
 - 2026-03-03: Expanded Tor active-port discovery to full managed range and reused tournament winners in downloader flows.
 - 2026-03-03: Hardened small-file retry logic (rotation, timeout/backoff tuning, strict completion validation).
 - 2026-03-03: Added batch heartbeat telemetry to prevent frozen UI states during long-tail phases.
+- 2026-03-03: Fixed Linux release pipeline stability by removing AppImage from default CI bundle targets.
 
 # Appendices
 - Validation:

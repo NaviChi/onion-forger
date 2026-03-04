@@ -1,10 +1,10 @@
-Version: 1.0.2
+Version: 1.0.3
 Updated: 2026-03-03
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [CRITICAL-L0] Framework Boundaries, [MANDATORY-L1] Docs Management, [MANDATORY-L1] Living Documents, [MANDATORY-L1] Whitepaper Template, [MANDATORY-L1] Workflow
 
 # Summary
-This is the implementation spec for deep recursive autoindex crawl completion, adaptive progress estimation, and high-throughput worker scaling in `crawli`.
+This is the implementation spec for deep recursive autoindex crawl completion, adaptive progress estimation, high-throughput worker scaling, and stable multi-OS release packaging in `crawli`.
 
 # Context
 Target flow:
@@ -70,6 +70,9 @@ Implemented behavior:
   - Added download-batch telemetry listeners and state machine in `App.tsx`.
   - Dashboard now transitions from crawl progress to download progress automatically and surfaces total/downloaded/failed/remaining, elapsed timer, ETA, throughput, and current file.
   - Added frontend delta-based throughput fallback when batch payload speed is sparse/zero.
+- Release packaging:
+  - GitHub Actions release matrix now uses Linux bundles `deb,rpm` (AppImage removed from default CI path due runner linuxdeploy instability).
+  - Windows portable release packaging remains enabled and uploads `crawli_<tag>_windows_x64_portable.zip` with runtime dependencies under `bin/win_x64`.
 - Compatibility update:
   - `PlayAdapter` migrated to new autoindex parser entry type.
 - Implemented HFT / Aerospace Upgrades:
@@ -127,6 +130,7 @@ Based on the final regression matrix yielding 0 files for WorldLeaks, INC Ransom
 # History
 - 2026-03-03: v1.0.0 created for recursion/progress/scaling implementation.
 - 2026-03-03: v1.0.1 updated for downloader port reuse, small-file reliability, and heartbeat telemetry.
+- 2026-03-03: v1.0.3 updated for Linux release matrix stability and portable Windows artifact continuity.
 
 # Appendices
 - Files touched:
@@ -140,3 +144,5 @@ Based on the final regression matrix yielding 0 files for WorldLeaks, INC Ransom
   - `src/components/Dashboard.tsx`
   - `src/components/Dashboard.css`
   - `src-tauri/tests/play_e2e_test.rs`
+  - `.github/workflows/release.yml`
+  - `README.md`

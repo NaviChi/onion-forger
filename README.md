@@ -43,7 +43,7 @@ This repository includes a GitHub Actions workflow at:
 
 It builds and uploads release installers for:
 
-- Linux (`.deb` / `.AppImage`)
+- Linux (`.deb` / `.rpm`)
 - Windows (`.msi` / `.exe`)
 - macOS (`.dmg` / `.app`) for both Intel and Apple Silicon
 
@@ -60,7 +60,7 @@ Run `Release` in GitHub Actions with input tag like `v0.1.0`.
 
 Windows releases also publish a portable asset:
 - `crawli_<tag>_windows_x64_portable.zip`
-- Contains `crawli.exe` + `bin/win_x64` Tor runtime resources (no installer required).
+- Contains `crawli.exe` + `bin/win_x64` runtime dependencies (including Tor resources), so it runs without an installer.
 
 ## Browser Fixture Mode
 
