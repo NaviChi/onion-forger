@@ -1,3 +1,5 @@
+> **Last Updated:** 2026-03-04T13:30 CST
+
 # Play Ransomware Adapter Flight Manual
 *Adapter ID: `play`*
 *Matching Strategy: M.A.C Tier 1 Cache | Body Struct Hash*

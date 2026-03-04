@@ -1,3 +1,5 @@
+> **Last Updated:** 2026-03-04T13:30 CST
+
 # DragonForce Adapter Flight Manual
 *Adapter ID: `dragonforce`*
 *Matching Strategy: M.A.C Tier 2 AST Tokenization (`__NEXT_DATA__` | `iframe src=".*token="`)*

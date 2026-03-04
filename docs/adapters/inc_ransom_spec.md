@@ -1,3 +1,5 @@
+> **Last Updated:** 2026-03-04T13:30 CST
+
 # INC Ransom Adapter Flight Manual
 *Adapter ID: `inc_ransom`*
 *Matching Strategy: M.A.C Tier 1 Cache | M.A.C Tier 3 Fallback*

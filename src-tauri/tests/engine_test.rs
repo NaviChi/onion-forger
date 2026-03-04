@@ -330,6 +330,19 @@ async fn test_adapter_fingerprint_matching() {
     assert_eq!(adapter.unwrap().name(), "Nu Server");
     println!("✅ Nu Server adapter matched: {}", adapter.unwrap().name());
 
+    // --- Qilin Pre-Authentication Intelligence ---
+    let qilin_fp = SiteFingerprint {
+        url: "http://unknown-domain-for-qilin.onion/".to_string(),
+        status: 200,
+        headers: HeaderMap::new(),
+        body: "<html><div class=\"page-header-title\">QData</div><input class=\"form-control\" type=\"text\" readonly value=\"ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion\"></html>".to_string(),
+    };
+    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> =
+        registry.determine_adapter(&qilin_fp).await;
+    assert!(adapter.is_some(), "Qilin adapter should match unknown domain via DOM heuristic");
+    assert_eq!(adapter.unwrap().name(), "Qilin Nginx Autoindex / CMS");
+    println!("✅ Qilin Autonomous Detection matched: {}", adapter.unwrap().name());
+
     // --- Autoindex fallback ---
     let ai_fp = SiteFingerprint {
         url: "http://unknown.onion/files/".to_string(),
@@ -474,4 +487,63 @@ async fn test_concurrent_worker_simulation() {
         "✅ Concurrent stress test: 120 workers discovered {} URLs in {:?}",
         total_discovered, elapsed
     );
+}
+
+#[test]
+fn test_dragonforce_nextjs_predictive_hydration() {
+    let mock_html = r#"
+    <!DOCTYPE html>
+    <html>
+    <body>
+        <script id="__NEXT_DATA__" type="application/json">
+        {
+          "props": {
+            "pageProps": {
+              "data": [
+                {
+                  "name": "internal_accounting",
+                  "type": "dir",
+                  "size": 0,
+                  "path": "/internal_accounting"
+                },
+                {
+                  "name": "dragonforce_manifest.json",
+                  "type": "file",
+                  "size": 55621,
+                  "path": "/internal_accounting/dragonforce_manifest.json"
+                }
+              ]
+            }
+          }
+        }
+        </script>
+    </body>
+    </html>
+    "#;
+
+    // Simulate arriving from a deeply nested API URL that contains a path parameter
+    let simulated_parent_url = "http://fsguest.onion/?path=RJZ-APP1/G/01&token=ABC123XYZ";
+    let entries = crawli_lib::adapters::dragonforce::parse_dragonforce_fsguest(
+        mock_html,
+        "fsguest.onion",
+        simulated_parent_url,
+    );
+
+    assert_eq!(entries.len(), 2, "Expected exactly 2 entries extracted from the NextJS mock JSON");
+
+    let folder = entries.iter().find(|e| e.entry_type == crawli_lib::adapters::EntryType::Folder).unwrap();
+    let file = entries.iter().find(|e| e.entry_type == crawli_lib::adapters::EntryType::File).unwrap();
+
+    // Verify Path Context Preservation and HTML routing (/?path=...)
+    assert_eq!(folder.path, "/internal_accounting");
+    assert!(folder.raw_url.contains("/?path="), "Folders must route to HTML endpoint");
+    assert!(!folder.raw_url.contains("/download?path="), "Folders must not map to the download API");
+    
+    // Verify API Segregation (/download?path=...)
+    assert_eq!(file.path, "/internal_accounting/dragonforce_manifest.json");
+    assert_eq!(file.size_bytes, Some(55621));
+    assert!(file.raw_url.contains("/download?path="), "Files MUST route to the backend download API");
+    assert!(!file.raw_url.contains("/?path="), "Files must not map to the HTML viewer endpoint");
+
+    println!("✅ DragonForce Predictive State Hydrator parsed NextJS DOM correctly.");
 }

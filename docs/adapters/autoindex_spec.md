@@ -1,3 +1,5 @@
+> **Last Updated:** 2026-03-04T13:30 CST
+
 # Autoindex Adapter Flight Manual
 *Adapter ID: `autoindex`*
 *Matching Strategy: Universal Fallback (`<a href="...">`)*

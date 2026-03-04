@@ -15,6 +15,7 @@ impl CrawlerAdapter for QilinAdapter {
             || fingerprint.body.contains("Data browser")
             || fingerprint.body.contains("_csrf-blog")
             || fingerprint.body.contains("item_box_photos")
+            || regex::Regex::new(r#"value="[a-z2-7]{56}\.onion""#).unwrap().is_match(&fingerprint.body)
     }
 
     async fn crawl(
@@ -110,7 +111,7 @@ impl CrawlerAdapter for QilinAdapter {
                     // 5-pass Retry Pattern for Tor
                     let (mut fetch_success, mut html) = (false, None);
 
-                    for _attempt in 1..=5 {
+                    for attempt in 1..=5 {
                         let start_time = std::time::Instant::now();
                         let resp_result = tokio::time::timeout(
                             std::time::Duration::from_secs(45),
@@ -119,16 +120,24 @@ impl CrawlerAdapter for QilinAdapter {
 
                         if let Ok(Ok(resp)) = resp_result {
                             f.record_success(cid, 4096, start_time.elapsed().as_millis() as u64);
-                            if resp.status().is_success() {
+                            let status = resp.status();
+                            
+                            if status.is_success() {
                                 if let Ok(body) = resp.text().await {
                                     fetch_success = true;
                                     html = Some(body);
                                     break;
                                 }
-                            } else if resp.status() == 404 {
+                            } else if status == 404 {
+                                // Real 404: skip fallback, it's definitively gone
                                 f.record_failure(cid);
+                                fetch_success = true; // Mark as "handled" so we don't fallback
                                 break;
+                            } else if status.is_server_error() {
+                                // Let it retry via the loop
                             }
+                        } else if let Ok(Err(_e)) = &resp_result {
+                            f.record_failure(cid);
                         } else {
                             f.record_failure(cid);
                         }
@@ -237,11 +246,12 @@ impl CrawlerAdapter for QilinAdapter {
         vec![
             "iv6lrjrd5ioyanvvemnkhturmyfpfbdcy442e22oqd2izkwnjw23m3id.onion",
             "ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion",
-            "a7r2n577n6jqzqexu5an3j2aej3ezb4klm7pkbp44243cqbwi43brjid.onion",
+            "ef4p3qn56susyjy56vym4gawjzaoc52e52w545e7mu6qhbmfut5iwxqd.onion",
+            "6esfx73oxphqeh2lpgporkw72uj2xqm5bbb6pfl24mt27hlll7jdswyd.onion",
         ]
     }
 
     fn regex_marker(&self) -> Option<&'static str> {
-        Some(r#"<div class="page-header-title">QData</div>|Data browser|_csrf-blog|item_box_photos"#)
+        Some(r#"<div class="page-header-title">QData</div>|Data browser|_csrf-blog|item_box_photos|value="[a-z2-7]{56}\.onion""#)
     }
 }

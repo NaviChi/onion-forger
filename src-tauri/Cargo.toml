@@ -1,6 +1,6 @@
 [package]
 name = "crawli"
-version = "0.1.8"
+version = "0.2.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -30,7 +30,7 @@ anyhow = "1.0.102"
 tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2.4.5"
 bloomfilter = "3.0.1"
-rand = "0.10.0"
+rand = "0.8"
 futures = "0.3.32"
 url = "2.5.8"
 bytes = "1.11.1"

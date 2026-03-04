@@ -1,3 +1,5 @@
+> **Last Updated:** 2026-03-04T13:30 CST
+
 # LockBit Adapter Flight Manual
 *Adapter ID: `lockbit`*
 *Matching Strategy: M.A.C Tier 1 Cache | Nested Autoindex Delegation*

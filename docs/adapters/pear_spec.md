@@ -1,3 +1,5 @@
+> **Last Updated:** 2026-03-04T13:30 CST
+
 # Pear Ransomware Adapter Flight Manual
 *Adapter ID: `pear`*
 *Matching Strategy: M.A.C Tier 1 Cache | AST Payload Filtering*

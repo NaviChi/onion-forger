@@ -1,3 +1,5 @@
+> **Last Updated:** 2026-03-04T13:30 CST
+
 # WorldLeaks Adapter Flight Manual
 *Adapter ID: `worldleaks`*
 *Matching Strategy: M.A.C Tier 1 Cache | SPA Graph AST*

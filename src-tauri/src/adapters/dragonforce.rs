@@ -29,7 +29,10 @@ fn recursive_extract_json(
                 let has_size = map.contains_key("size");
 
                 if is_dir || has_size {
-                    let path = if current_path.is_empty() {
+                    // DragonForce's Next.js SPA usually provides the absolute path in `map.get("path")`
+                    let path = if let Some(p) = map.get("path").and_then(|v| v.as_str()) {
+                        p.to_string()
+                    } else if current_path.is_empty() {
                         format!("/{}", name_val)
                     } else if current_path.ends_with('/') {
                         format!("{}{}", current_path, name_val)
@@ -38,9 +41,13 @@ fn recursive_extract_json(
                     };
 
                     let size_bytes = map.get("size").and_then(|v| v.as_u64());
+                    
+                    // Segregate NextJS HTML routes (/?path=) from Backend API downloads (/download?path=)
+                    let api_endpoint = if is_dir { "" } else { "download" };
                     let raw_url = format!(
-                        "http://{}/?path={}&token={}",
+                        "http://{}/{}?path={}&token={}",
                         host,
+                        api_endpoint,
                         urlencoding::encode(path.trim_start_matches('/')),
                         token
                     );
@@ -105,12 +112,21 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
         ""
     };
 
+    // Explicitly grab the `path=` param from the `current_url` so our recursion doesn't reset to root (`/`) when traversing nested JSON nodes sent from the server.
+    let current_path = if let Some(p_idx) = current_url.find("path=") {
+        urlencoding::decode(current_url[p_idx + 5..].split('&').next().unwrap_or(""))
+            .unwrap_or(std::borrow::Cow::Borrowed(""))
+            .into_owned()
+    } else {
+        String::new()
+    };
+
     let document = Html::parse_document(html);
 
     let script_selector = Selector::parse("script#__NEXT_DATA__").unwrap();
     if let Some(script) = document.select(&script_selector).next() {
         if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&script.inner_html()) {
-            recursive_extract_json(&json_val, &mut entries, String::new(), host, token);
+            recursive_extract_json(&json_val, &mut entries, current_path, host, token);
             if !entries.is_empty() {
                 return entries;
             }

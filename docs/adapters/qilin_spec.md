@@ -1,3 +1,5 @@
+> **Last Updated:** 2026-03-04T13:30 CST
+
 # Qilin Adapter Flight Manual
 *Adapter ID: `qilin`*
 *Matching Strategy: M.A.C Tier 2 AST Tokenization (`<div class="page-header-title">QData</div>`)*
