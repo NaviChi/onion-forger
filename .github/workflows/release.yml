@@ -24,7 +24,7 @@ jobs:
         include:
           - platform: ubuntu-24.04
             label: linux-x64
-            args: "--bundles appimage,deb,rpm"
+            args: "--bundles deb,rpm"
           - platform: windows-latest
             label: windows-x64
             args: ""
@@ -82,7 +82,7 @@ jobs:
             Portable-first multi-platform release artifacts for Onion Forger.
             - Windows: portable executable zip with bundled runtime dependencies
             - macOS: portable .app bundles
-            - Linux: portable AppImage + package artifacts
+            - Linux: portable tarball + package artifacts
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: false
@@ -122,24 +122,27 @@ jobs:
         run: |
           gh release upload "${{ github.event.inputs.tag || github.ref_name }}" "$env:PORTABLE_ZIP" --clobber
 
-      - name: Package portable Linux AppImage asset
+      - name: Package portable Linux asset
         if: matrix.platform == 'ubuntu-24.04'
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ github.event.inputs.tag || github.ref_name }}"
-          appimage="$(find src-tauri/target -type f -name '*.AppImage' | head -n1)"
-          if [ -z "$appimage" ]; then
-            echo "No AppImage found under src-tauri/target" >&2
+          portable_root="portable-assets/crawli-linux-x64-portable"
+          portable_bin="$(find src-tauri/target -type f -path '*/release/crawli' | head -n1)"
+          if [ -z "${portable_bin:-}" ]; then
+            echo "No linux release binary found under src-tauri/target/**/release/crawli" >&2
             exit 1
           fi
-          mkdir -p portable-assets
-          out="portable-assets/crawli_${tag}_linux_x64_portable.AppImage"
-          cp "$appimage" "$out"
-          chmod +x "$out"
+          mkdir -p "$portable_root/bin"
+          cp "$portable_bin" "$portable_root/crawli"
+          chmod +x "$portable_root/crawli"
+          cp -R src-tauri/bin/linux_x64 "$portable_root/bin/"
+          out="portable-assets/crawli_${tag}_linux_x64_portable.tar.gz"
+          tar -czf "$out" -C portable-assets "$(basename "$portable_root")"
           echo "PORTABLE_LINUX_ASSET=$out" >> "$GITHUB_ENV"
 
-      - name: Upload portable Linux AppImage asset
+      - name: Upload portable Linux asset
         if: matrix.platform == 'ubuntu-24.04'
         shell: bash
         env:
