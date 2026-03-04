@@ -27,7 +27,7 @@ jobs:
             args: "--bundles appimage,deb,rpm"
           - platform: windows-latest
             label: windows-x64
-            args: "--bundles none"
+            args: ""
           - platform: macos-14
             label: macos-x64
             args: "--target x86_64-apple-darwin"
