@@ -25,6 +25,13 @@ pub fn get_tor_controls() -> &'static DashMap<u16, u16> {
 /// 9150 = Tor Browser SOCKS proxy, 9151 = Tor Browser control port
 const RESERVED_PORTS: &[u16] = &[9150, 9151];
 
+#[cfg(target_os = "windows")]
+fn apply_windows_no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const EXPECTED_TOR_SHA256: &str =
     "338f4814294362868a291d8d3186c2cdb9e5c467bc3295bfcffbba48a6f3eda0";
@@ -238,11 +245,9 @@ pub fn get_tor_path(app: &AppHandle) -> Result<PathBuf> {
 fn terminate_pid(pid: u32) {
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("taskkill")
-            .arg("/F")
-            .arg("/PID")
-            .arg(pid.to_string())
-            .status();
+        let mut cmd = Command::new("taskkill");
+        apply_windows_no_window(&mut cmd);
+        let _ = cmd.arg("/F").arg("/PID").arg(pid.to_string()).status();
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -492,6 +497,8 @@ pub async fn bootstrap_tor_cluster(
         fs::create_dir_all(&data_dir)?;
 
         let mut cmd = Command::new(&tor_path);
+        #[cfg(target_os = "windows")]
+        apply_windows_no_window(&mut cmd);
 
         #[cfg(target_os = "linux")]
         cmd.env("LD_LIBRARY_PATH", tor_dir);

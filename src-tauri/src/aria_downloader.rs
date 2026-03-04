@@ -15,6 +15,13 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use tokio::task::JoinSet;
 
+#[cfg(target_os = "windows")]
+fn apply_windows_no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
 /// Log writer that writes timestamped entries to a file alongside the download
 #[derive(Clone)]
 struct DownloadLogger {
@@ -533,11 +540,9 @@ fn parse_content_range_total(header_value: &str) -> Option<u64> {
 fn terminate_pid(pid: u32) {
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("taskkill")
-            .arg("/F")
-            .arg("/PID")
-            .arg(pid.to_string())
-            .status();
+        let mut cmd = Command::new("taskkill");
+        apply_windows_no_window(&mut cmd);
+        let _ = cmd.arg("/F").arg("/PID").arg(pid.to_string()).status();
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -564,8 +569,8 @@ fn cleanup_tor_data_dir(data_dir: &Path) {
 }
 
 pub fn cleanup_stale_tor_daemons() {
-    let tmp_root = Path::new("/tmp");
-    let entries = match fs::read_dir(tmp_root) {
+    let tmp_root = std::env::temp_dir();
+    let entries = match fs::read_dir(&tmp_root) {
         Ok(entries) => entries,
         Err(_) => return,
     };

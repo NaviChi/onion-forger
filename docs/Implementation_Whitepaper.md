@@ -1,4 +1,4 @@
-Version: 1.0.3
+Version: 1.0.4
 Updated: 2026-03-03
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [CRITICAL-L0] Framework Boundaries, [MANDATORY-L1] Docs Management, [MANDATORY-L1] Living Documents, [MANDATORY-L1] Whitepaper Template, [MANDATORY-L1] Workflow
@@ -73,6 +73,10 @@ Implemented behavior:
 - Release packaging:
   - GitHub Actions release matrix now uses Linux bundles `deb,rpm` (AppImage removed from default CI path due runner linuxdeploy instability).
   - Windows portable release packaging remains enabled and uploads `crawli_<tag>_windows_x64_portable.zip` with runtime dependencies under `bin/win_x64`.
+- Windows process UX hardening:
+  - Tor daemon spawn path now sets `CREATE_NO_WINDOW` on Windows to prevent console popups during scan bootstrap.
+  - Windows `taskkill` paths in Tor and downloader cleanup now run with no-window flags.
+  - Downloader stale-Tor cleanup now uses `std::env::temp_dir()` (cross-platform) instead of `/tmp`.
 - Compatibility update:
   - `PlayAdapter` migrated to new autoindex parser entry type.
 - Implemented HFT / Aerospace Upgrades:
@@ -131,6 +135,7 @@ Based on the final regression matrix yielding 0 files for WorldLeaks, INC Ransom
 - 2026-03-03: v1.0.0 created for recursion/progress/scaling implementation.
 - 2026-03-03: v1.0.1 updated for downloader port reuse, small-file reliability, and heartbeat telemetry.
 - 2026-03-03: v1.0.3 updated for Linux release matrix stability and portable Windows artifact continuity.
+- 2026-03-03: v1.0.4 updated for Windows no-console process spawn behavior and cross-platform temp cleanup.
 
 # Appendices
 - Files touched:
