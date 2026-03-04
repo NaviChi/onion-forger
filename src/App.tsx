@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { VFSExplorer, FileEntry } from "./components/VFSExplorer";
 import { Dashboard } from "./components/Dashboard";
+import { VibeLoader } from "./components/VibeLoader";
 import { downloadDir, join } from "@tauri-apps/api/path";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle } from "lucide-react";
+import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp } from "lucide-react";
+import { VFS_FIXTURE_STATS, isVfsFixtureMode } from "./fixtures/vfsFixture";
 
 import "./App.css";
 
@@ -17,6 +18,51 @@ interface DownloadProgressEvent {
   total_bytes: number | null;
   speed_bps: number;
   active_circuits?: number;
+}
+
+interface CrawlStatusEvent {
+  phase: string;
+  progressPercent: number;
+  visitedNodes: number;
+  processedNodes: number;
+  queuedNodes: number;
+  activeWorkers: number;
+  workerTarget: number;
+  etaSeconds: number | null;
+  estimation: string;
+}
+
+interface DownloadBatchStartedEvent {
+  totalFiles: number;
+  totalBytesHint: number;
+  unknownSizeFiles: number;
+  outputDir: string;
+}
+
+interface BatchProgressEvent {
+  completed: number;
+  failed?: number;
+  total: number;
+  currentFile: string;
+  speedMbps?: number;
+  downloadedBytes?: number;
+  bbrBottleneckMbps?: number;
+  ekfCovariance?: number;
+}
+
+interface DownloadBatchStatus {
+  totalFiles: number;
+  completedFiles: number;
+  failedFiles: number;
+  totalBytesHint: number;
+  unknownSizeFiles: number;
+  currentFile: string;
+  speedMbps: number;
+  downloadedBytes: number;
+  bbrBottleneckMbps: number;
+  ekfCovariance: number;
+  startedAt: number | null;
+  etaSeconds: number | null;
 }
 
 interface TorStatus {
@@ -33,6 +79,116 @@ interface ToastInfo {
   message: string;
 }
 
+interface AdapterSupportInfo {
+  id: string;
+  name: string;
+  supportLevel: string;
+  matchingStrategy: string;
+  sampleUrls: string[];
+  testedFor: string[];
+  notes: string;
+}
+
+const FALLBACK_SUPPORT_CATALOG: AdapterSupportInfo[] = [
+  {
+    id: "worldleaks",
+    name: "WorldLeaks SPA",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Known-domain and SPA fingerprint matching",
+    sampleUrls: ["http://worldleaks.onion"],
+    testedFor: ["Adapter fingerprint match (engine_test)"],
+    notes: "Production adapter with crawl traversal and progress streaming.",
+  },
+  {
+    id: "dragonforce",
+    name: "DragonForce Iframe SPA",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Known-domain and body marker matching",
+    sampleUrls: [
+      "http://dragonforce.onion",
+      "fsguestuctexqqaoxuahuydfa6ovxuhtng66pgyr5gqcrsi7qgchpkad.onion",
+    ],
+    testedFor: [
+      "Adapter fingerprint match (engine_test)",
+      "Parser extraction flow (dragon_cli_test)",
+    ],
+    notes: "Production adapter for iframe and tokenized listing layouts.",
+  },
+  {
+    id: "lockbit",
+    name: "LockBit Embedded Nginx",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Known-domain + Nginx marker and body signature matching",
+    sampleUrls: [
+      "http://lockbit.onion",
+      "http://lockbit6vhrjaqzsdj6pqalyideigxv4xycfeyunpx35znogiwmojnid.onion/secret/212f70e703d758fbccbda3013a21f5de-f033da37-5fa7-31df-b10c-cc04b8538e85/jobberswarehouse.com/",
+    ],
+    testedFor: [
+      "Adapter fingerprint match (engine_test)",
+      "Direct artifact URL routing (engine_test)",
+      "Autoindex traversal delegation (lockbit adapter)",
+    ],
+    notes: "Uses hardened autoindex crawler for full recursive traversal and size mapping.",
+  },
+  {
+    id: "nu_server",
+    name: "Nu Server",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Response preamble signature matching",
+    sampleUrls: ["http://nu-server.onion"],
+    testedFor: [
+      "Adapter fingerprint match (engine_test)",
+      "Autoindex traversal delegation (nu adapter)",
+    ],
+    notes: "Delegates crawl execution to hardened autoindex traversal for directory/file extraction.",
+  },
+  {
+    id: "inc_ransom",
+    name: "INC Ransom Crawler",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Known-domain and blog signature matching",
+    sampleUrls: [
+      "http://incblog6qu4y4mm4zvw5nrmue6qbwtgjsxpw6b7ixzssu36tsajldoad.onion/blog/disclosures/698d5c538f1d14b7436dd63b",
+    ],
+    testedFor: ["Adapter fingerprint match (engine_test)"],
+    notes: "Production adapter using disclosure API enrichment and crawl streaming.",
+  },
+  {
+    id: "pear",
+    name: "Pear Ransomware Crawler",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Known-domain and body signature matching",
+    sampleUrls: [
+      "http://m3wwhkus4dxbnxbtihexlyd2cv63qrvex6jiebc4vqe22kg2z3udebid.onion/sdeb.org/",
+    ],
+    testedFor: ["Adapter fingerprint match (engine_test)"],
+    notes: "Production adapter with concurrent crawl workers and UI batching.",
+  },
+  {
+    id: "play",
+    name: "Play Ransomware (Autoindex)",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Known-domain, URL-path, and autoindex fingerprint matching",
+    sampleUrls: [
+      "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp",
+    ],
+    testedFor: [
+      "Adapter fingerprint suite (engine_test + play_e2e_test)",
+      "Feature and resilience suite (play_features_test)",
+    ],
+    notes: "Most heavily tested adapter with full listing/scaffold validation.",
+  },
+  {
+    id: "autoindex",
+    name: "Generic Autoindex",
+    supportLevel: "Fallback",
+    matchingStrategy: "Generic 'Index of /' autoindex detection",
+    sampleUrls: ["http://unknown.onion/files/"],
+    testedFor: ["Fallback adapter match (engine_test)"],
+    notes: "Default catch-all fallback when specialized adapters do not match.",
+  },
+];
+
 
 
 // Kept dummy function so lines don't shift too much
@@ -45,10 +201,39 @@ function formatDuration(ms: number): string {
   return `${sec}s`;
 }
 
+const INITIAL_CRAWL_STATUS: CrawlStatusEvent = {
+  phase: "idle",
+  progressPercent: 0,
+  visitedNodes: 0,
+  processedNodes: 0,
+  queuedNodes: 0,
+  activeWorkers: 0,
+  workerTarget: 0,
+  etaSeconds: null,
+  estimation: "adaptive-frontier",
+};
+
+const INITIAL_DOWNLOAD_BATCH_STATUS: DownloadBatchStatus = {
+  totalFiles: 0,
+  completedFiles: 0,
+  failedFiles: 0,
+  totalBytesHint: 0,
+  unknownSizeFiles: 0,
+  currentFile: "",
+  speedMbps: 0,
+  downloadedBytes: 0,
+  bbrBottleneckMbps: 0,
+  ekfCovariance: 0,
+  startedAt: null,
+  etaSeconds: null,
+};
+
 function App() {
   const isTauriRuntime = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
+  const isFixtureMode = !isTauriRuntime && isVfsFixtureMode();
   const [url, setUrl] = useState("");
   const [isCrawling, setIsCrawling] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const [vfsStats, setVfsStats] = useState({ files: 0, folders: 0, size: 0, totalNodes: 0 });
   const [vfsRefreshTrigger, setVfsRefreshTrigger] = useState(0);
   const [logs, setLogs] = useState<string[]>([
@@ -56,25 +241,36 @@ function App() {
     "[SYSTEM] Local Tor Daemon initialized on 127.0.0.1:9051",
     "[SYSTEM] Adapter Registry loaded (WorldLeaks, DragonForce, LockBit, INC Ransom, Pear, Play, Autoindex)",
   ]);
+  const [activeAdapter, setActiveAdapter] = useState("Unidentified");
   const [torStatus, setTorStatus] = useState<TorStatus | null>(null);
 
   const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadProgressEvent>>({});
+  const [crawlStatus, setCrawlStatus] = useState<CrawlStatusEvent>(INITIAL_CRAWL_STATUS);
+  const [downloadBatchStatus, setDownloadBatchStatus] = useState<DownloadBatchStatus>(INITIAL_DOWNLOAD_BATCH_STATUS);
   const [selectedFiles, setSelectedFiles] = useState<FileEntry[]>([]);
   const [toasts, setToasts] = useState<ToastInfo[]>([]);
-  const [lastClipboard, setLastClipboard] = useState("");
   const [outputDir, setOutputDir] = useState("");
   const [daemonPorts, setDaemonPorts] = useState<number[]>([9051, 9052, 9053, 9054]);
   const [crawlStartTime, setCrawlStartTime] = useState<number | null>(null);
   const [crawlElapsed, setCrawlElapsed] = useState(0);
+  const [downloadElapsed, setDownloadElapsed] = useState(0);
+  const [showSupportPopover, setShowSupportPopover] = useState(false);
+  const [supportCatalog, setSupportCatalog] = useState<AdapterSupportInfo[]>([]);
+  const [supportCatalogError, setSupportCatalogError] = useState<string | null>(null);
 
   const urlInputRef = useRef<HTMLInputElement>(null);
   const previewNoticeShownRef = useRef(false);
+  const fixtureNoticeShownRef = useRef(false);
+  const supportButtonRef = useRef<HTMLButtonElement>(null);
+  const supportPopoverRef = useRef<HTMLDivElement>(null);
+  const batchSpeedSampleRef = useRef<{ ts: number; bytes: number } | null>(null);
 
   const [crawlOptions, setCrawlOptions] = useState({
     listing: true,
     sizes: true,
     download: false,
-    circuits: 120
+    circuits: 120,
+    daemons: 0
   });
 
   const showToast = (type: "success" | "error", title: string, message: string) => {
@@ -94,10 +290,45 @@ function App() {
     return () => clearInterval(interval);
   }, [isCrawling, crawlStartTime]);
 
+  useEffect(() => {
+    const startedAt = downloadBatchStatus.startedAt;
+    if (!startedAt) return;
+    const done = downloadBatchStatus.completedFiles + downloadBatchStatus.failedFiles;
+    if (downloadBatchStatus.totalFiles > 0 && done >= downloadBatchStatus.totalFiles) {
+      return;
+    }
+    const interval = setInterval(() => {
+      setDownloadElapsed(Date.now() - startedAt);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [
+    downloadBatchStatus.startedAt,
+    downloadBatchStatus.completedFiles,
+    downloadBatchStatus.failedFiles,
+    downloadBatchStatus.totalFiles,
+  ]);
+
+  useEffect(() => {
+    if (!isFixtureMode || fixtureNoticeShownRef.current) return;
+    fixtureNoticeShownRef.current = true;
+    setVfsStats(VFS_FIXTURE_STATS);
+    setVfsRefreshTrigger(Date.now());
+    setLogs((l) => [
+      ...l.slice(-399),
+      "[SYSTEM] Fixture VFS mode enabled for browser integrity testing.",
+    ]);
+  }, [isFixtureMode]);
+
   // Keyboard shortcuts: ⌘+Enter to start, Esc to stop, ⌘+E to export
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const isMeta = e.metaKey || e.ctrlKey;
+
+      if (e.key === "Escape" && showSupportPopover) {
+        e.preventDefault();
+        setShowSupportPopover(false);
+        return;
+      }
 
       if (e.key === "Enter" && isMeta && !isCrawling && url) {
         e.preventDefault();
@@ -118,7 +349,7 @@ function App() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isCrawling, url, vfsStats]);
+  }, [isCrawling, showSupportPopover, url, vfsStats]);
 
   useEffect(() => {
     async function initPaths() {
@@ -129,36 +360,27 @@ function App() {
       try {
         const dl = await downloadDir();
         const defaultPath = await join(dl, "OnionForger_Downloads");
-        setOutputDir(defaultPath);
+        setOutputDir((prev) => prev || defaultPath);
       } catch (e) {
         console.warn("Could not retrieve download directory", e);
       }
     }
     initPaths();
-
-    const checkClipboard = async () => {
-      if (!isTauriRuntime) return;
-      if (!isCrawling && !url) {
-        try {
-          const text = await readText();
-          if (text && text.includes(".onion") && text !== lastClipboard) {
-            setLastClipboard(text);
-            setUrl(text);
-            showToast("success", "Clipboard Auto-Detect", "Pasted new .onion link securely.");
-            setLogs((l) => [...l.slice(-399), `[SYSTEM] Auto-pasted Tor link from clipboard.`]);
-          }
-        } catch (e) {
-          // Ignore failures gracefully
-        }
-      }
-    };
-
-    const clipboardInterval = setInterval(checkClipboard, 2000);
     const unlistenPromises: Array<Promise<() => void>> = [];
 
     if (isTauriRuntime) {
       unlistenPromises.push(
         listen<string>("crawl_log", (event) => {
+          const payload = event.payload;
+          const adapterMatch = payload.match(/Match found:\s*(.+)$/);
+          if (adapterMatch && adapterMatch[1]) {
+            setActiveAdapter(adapterMatch[1].trim());
+          }
+          setLogs((l) => [...l.slice(-399), `> ${payload}`]);
+        })
+      );
+      unlistenPromises.push(
+        listen<string>("log", (event) => {
           setLogs((l) => [...l.slice(-399), `> ${event.payload}`]);
         })
       );
@@ -191,6 +413,93 @@ function App() {
 
           // Throttle UI refreshes for root nodes to prevent flickering
           setVfsRefreshTrigger(Date.now());
+        })
+      );
+
+      unlistenPromises.push(
+        listen<CrawlStatusEvent>("crawl_status_update", (event) => {
+          setCrawlStatus(event.payload);
+        })
+      );
+
+      unlistenPromises.push(
+        listen<DownloadBatchStartedEvent>("download_batch_started", (event) => {
+          const startedAt = Date.now();
+          batchSpeedSampleRef.current = { ts: startedAt, bytes: 0 };
+          setDownloadElapsed(0);
+          setDownloadBatchStatus({
+            totalFiles: Math.max(event.payload.totalFiles || 0, 0),
+            completedFiles: 0,
+            failedFiles: 0,
+            totalBytesHint: Math.max(event.payload.totalBytesHint || 0, 0),
+            unknownSizeFiles: Math.max(event.payload.unknownSizeFiles || 0, 0),
+            currentFile: "Routing download queue...",
+            speedMbps: 0,
+            downloadedBytes: 0,
+            bbrBottleneckMbps: 0,
+            ekfCovariance: 0,
+            startedAt,
+            etaSeconds: null,
+          });
+        })
+      );
+
+      unlistenPromises.push(
+        listen<BatchProgressEvent>("batch_progress", (event) => {
+          const payload = event.payload as BatchProgressEvent & {
+            speed_mbps?: number;
+            downloaded_bytes?: number;
+            current_file?: string;
+            bbr_bottleneck_mbps?: number;
+            ekf_covariance?: number;
+          };
+          const speedMbpsRaw = payload.speedMbps ?? payload.speed_mbps;
+          const downloadedBytesRaw = payload.downloadedBytes ?? payload.downloaded_bytes;
+          const currentFileRaw = payload.currentFile ?? payload.current_file;
+          const bbrRaw = payload.bbrBottleneckMbps ?? payload.bbr_bottleneck_mbps ?? 0;
+          const ekfRaw = payload.ekfCovariance ?? payload.ekf_covariance ?? 0;
+          const now = Date.now();
+          setDownloadBatchStatus((prev) => {
+            const startedAt = prev.startedAt ?? now;
+            const completedFiles = Math.max(prev.completedFiles, payload.completed || 0);
+            const failedFiles = Math.max(prev.failedFiles, payload.failed || 0);
+            const totalFiles = Math.max(prev.totalFiles, payload.total || 0);
+            const done = completedFiles + failedFiles;
+            const remaining = Math.max(totalFiles - done, 0);
+            const elapsedSeconds = Math.max(1, Math.floor((now - startedAt) / 1000));
+            const etaSeconds =
+              done > 0 && remaining > 0 ? Math.ceil((elapsedSeconds / done) * remaining) : null;
+            const mergedDownloadedBytes = Math.max(prev.downloadedBytes, downloadedBytesRaw || 0);
+
+            let resolvedSpeedMbps = speedMbpsRaw ?? prev.speedMbps;
+            if ((speedMbpsRaw === undefined || speedMbpsRaw <= 0) && batchSpeedSampleRef.current) {
+              const sample = batchSpeedSampleRef.current;
+              const deltaBytes = Math.max(0, mergedDownloadedBytes - sample.bytes);
+              const deltaSeconds = Math.max((now - sample.ts) / 1000, 0);
+              if (deltaBytes > 0 && deltaSeconds > 0) {
+                resolvedSpeedMbps = (deltaBytes / deltaSeconds) / 1048576;
+              }
+            }
+            batchSpeedSampleRef.current = { ts: now, bytes: mergedDownloadedBytes };
+
+            if (prev.startedAt === null) {
+              setDownloadElapsed(0);
+            }
+
+            return {
+              ...prev,
+              totalFiles,
+              completedFiles,
+              failedFiles,
+              currentFile: currentFileRaw || prev.currentFile,
+              speedMbps: resolvedSpeedMbps,
+              downloadedBytes: mergedDownloadedBytes,
+              bbrBottleneckMbps: bbrRaw,
+              ekfCovariance: ekfRaw,
+              startedAt,
+              etaSeconds,
+            };
+          });
         })
       );
 
@@ -250,6 +559,13 @@ function App() {
           showToast("error", "Download Failed", event.payload.error);
         })
       );
+
+      unlistenPromises.push(
+        listen<{ url: string; path: string; reason: string }>("download_interrupted", (event) => {
+          setLogs((l) => [...l.slice(-399), `[SYSTEM] Download interrupted for ${event.payload.path}: ${event.payload.reason}`]);
+          showToast("success", "Download Interrupted", `${event.payload.reason} for ${event.payload.path}`);
+        })
+      );
     } else if (!previewNoticeShownRef.current) {
       previewNoticeShownRef.current = true;
       setLogs((l) => [
@@ -259,27 +575,55 @@ function App() {
     }
 
     return () => {
-      clearInterval(clipboardInterval);
       unlistenPromises.forEach((p) => {
         p.then((f) => f()).catch(() => undefined);
       });
     };
-  }, [isCrawling, url, lastClipboard, outputDir, isTauriRuntime]);
+  }, [outputDir, isTauriRuntime]);
 
   useEffect(() => {
     const logContainer = document.querySelector('.forensic-log');
     if (logContainer) logContainer.scrollTop = logContainer.scrollHeight;
   }, [logs]);
 
+  useEffect(() => {
+    if (!showSupportPopover) return;
+
+    const handleOutsideClick = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (supportPopoverRef.current?.contains(target) || supportButtonRef.current?.contains(target)) {
+        return;
+      }
+      setShowSupportPopover(false);
+    };
+
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, [showSupportPopover]);
+
   const handleCrawl = useCallback(async () => {
     if (!url) return;
+    const preserveFixtureState = isFixtureMode;
     setIsCrawling(true);
+    setActiveAdapter("Unidentified");
 
     setCrawlStartTime(Date.now());
     setCrawlElapsed(0);
+    setDownloadProgress({});
+    setDownloadBatchStatus(INITIAL_DOWNLOAD_BATCH_STATUS);
+    batchSpeedSampleRef.current = null;
+    setDownloadElapsed(0);
     setLogs((l) => [...l, `--- Initiating Crawl ---`]);
     setLogs((l) => [...l, `> Probing Target: ${url}`]);
-    setVfsStats({ files: 0, folders: 0, size: 0, totalNodes: 0 });
+    setCrawlStatus({
+      ...INITIAL_CRAWL_STATUS,
+      phase: "probing",
+    });
+    if (preserveFixtureState) {
+      setVfsStats(VFS_FIXTURE_STATS);
+    } else {
+      setVfsStats({ files: 0, folders: 0, size: 0, totalNodes: 0 });
+    }
     setVfsRefreshTrigger(Date.now());
 
     try {
@@ -287,7 +631,12 @@ function App() {
         throw new Error("Execution Environment Mismatch: Not running in native Tauri container.");
       }
 
-      const files = await invoke<FileEntry[]>("start_crawl", { url, options: crawlOptions, outputDir });
+      const payloadOptions = {
+        ...crawlOptions,
+        daemons: crawlOptions.daemons > 0 ? crawlOptions.daemons : null,
+      };
+
+      const files = await invoke<FileEntry[]>("start_crawl", { url, options: payloadOptions, outputDir });
       setLogs((l) => [...l, `[SYSTEM] Finish signaled. Found ${files.length} unique nodes.`]);
       showToast("success", "Crawl Finished", `Operations complete. Extracted ${files.length} nodes from source.`);
 
@@ -308,24 +657,65 @@ function App() {
     } finally {
       setIsCrawling(false);
       setCrawlStartTime(null);
+      setCrawlStatus((prev) => {
+        if (prev.phase === "complete" || prev.phase === "error" || prev.phase === "cancelled") {
+          return prev;
+        }
+        return {
+          ...prev,
+          phase: "idle",
+        };
+      });
+      if (preserveFixtureState) {
+        setVfsStats(VFS_FIXTURE_STATS);
+        setVfsRefreshTrigger(Date.now());
+      }
     }
-  }, [url, crawlOptions, outputDir]);
+  }, [url, crawlOptions, outputDir, isFixtureMode]);
 
   const handleCancelCrawl = async () => {
+    if (isCancelling) return;
+    setIsCancelling(true);
     try {
-      if (typeof (window as any).__TAURI_INTERNALS__ === 'undefined') {
-        throw new Error("Execution Environment Mismatch: Not running in native Tauri container.");
+      if (!isTauriRuntime) {
+        setIsCrawling(false);
+        setCrawlStartTime(null);
+        setCrawlStatus((prev) => ({ ...prev, phase: "cancelled" }));
+        setDownloadBatchStatus((prev) => ({
+          ...prev,
+          currentFile: "cancelled",
+          etaSeconds: null,
+        }));
+        setLogs((l) => [...l, `[SYSTEM] Cancel acknowledged in preview mode (no native crawl workers active).`]);
+        showToast("success", "Cancel Acknowledged", "Preview mode has no active native crawl workers.");
+        return;
       }
-      await invoke<string>("cancel_crawl");
-      setLogs((l) => [...l, `[SYSTEM] ⚠ Cancellation requested — workers will finish current task and stop.`]);
-      showToast("error", "Crawl Cancelled", "Workers are stopping. Current tasks will complete.");
+      const result = await invoke<string>("cancel_crawl");
+      setIsCrawling(false);
+      setCrawlStartTime(null);
+      setCrawlStatus((prev) => ({ ...prev, phase: "cancelled" }));
+      setDownloadBatchStatus((prev) => ({
+        ...prev,
+        currentFile: "cancelled",
+        etaSeconds: null,
+      }));
+      setLogs((l) => [...l, `[SYSTEM] ⚠ ${result}`]);
+      showToast("success", "Cancellation Requested", result);
     } catch (err: any) {
       setLogs((l) => [...l, `[ERROR] Cancel failed: ${err.message || err}`]);
+      showToast("error", "Cancel Failed", String(err.message || err));
+    } finally {
+      setIsCancelling(false);
     }
   };
 
   const handleDownload = async (rawUrl: string, filePath: string) => {
     setLogs((l) => [...l, `> Requesting Download: ${filePath}`]);
+    if (!isTauriRuntime) {
+      setLogs((l) => [...l, `[SIMULATION] Preview mode: download request captured for ${filePath}.`]);
+      showToast("success", "Preview Download", "No backend download executed in browser preview mode.");
+      return;
+    }
     try {
       if (filePath.endsWith('/')) {
         const entry: FileEntry = {
@@ -334,7 +724,11 @@ function App() {
           entry_type: 'Folder',
           raw_url: rawUrl
         };
-        const count = await invoke<number>("download_files", { entries: [entry], outputDir });
+        const count = await invoke<number>("download_files", {
+          entries: [entry],
+          outputDir,
+          connections: crawlOptions.circuits,
+        });
         showToast("success", "Download Complete", `${count} item(s) saved to ${outputDir}`);
         setLogs((l) => [...l, `[MIRROR] Saved ${filePath} to disk`]);
       } else {
@@ -344,11 +738,12 @@ function App() {
           args: {
             url: rawUrl,
             path: targetPath,
-            connections: 120, // 120 isolated circuits
-            force_tor: true
+            output_root: outputDir,
+            connections: crawlOptions.circuits || 120,
+            force_tor: rawUrl.includes(".onion"),
           }
         });
-        showToast("success", "Download Engine Started", `Allocating 120 Tor circuits to target...`);
+        showToast("success", "Download Engine Started", `Allocating ${crawlOptions.circuits || 120} circuits to target...`);
       }
     } catch (err: any) {
       setLogs((l) => [...l, `[ERROR] Download failed: ${err}`]);
@@ -359,8 +754,17 @@ function App() {
   const handleDownloadSelected = async () => {
     if (selectedFiles.length === 0) return;
     setLogs((l) => [...l, `[OPSEC] Manual Mirror: Scaffolding ${selectedFiles.length} selected nodes to ${outputDir}...`]);
+    if (!isTauriRuntime) {
+      setLogs((l) => [...l, `[SIMULATION] Preview mode: selected mirror request captured (${selectedFiles.length} items).`]);
+      showToast("success", "Preview Mirror", "No backend write executed in browser preview mode.");
+      return;
+    }
     try {
-      const count = await invoke<number>("download_files", { entries: selectedFiles, outputDir });
+      const count = await invoke<number>("download_files", {
+        entries: selectedFiles,
+        outputDir,
+        connections: crawlOptions.circuits,
+      });
       showToast("success", "Mirror Complete", `${count} items written to ${outputDir}`);
       setLogs((l) => [...l, `[MIRROR] Complete. ${count}/${selectedFiles.length} selected items on disk.`]);
     } catch (err: any) {
@@ -371,6 +775,11 @@ function App() {
 
   const handleExportJSON = async () => {
     if (vfsStats.totalNodes === 0) return;
+    if (!isTauriRuntime) {
+      setLogs((l) => [...l, `[SIMULATION] Preview mode: export request captured.`]);
+      showToast("success", "Preview Export", "Export dialog is only available in native Tauri mode.");
+      return;
+    }
     try {
       const savePath = await save({
         defaultPath: "crawl_results.json",
@@ -391,9 +800,17 @@ function App() {
   const handleDownloadAll = async () => {
     if (vfsStats.totalNodes === 0) return;
     setLogs((l) => [...l, `[OPSEC] Mass Mirror: Querying VFS and scaffolding full dataset to ${outputDir}...`]);
+    if (!isTauriRuntime) {
+      setLogs((l) => [...l, `[SIMULATION] Preview mode: mass mirror request captured.`]);
+      showToast("success", "Preview Mirror", "Mass mirror is only available in native Tauri mode.");
+      return;
+    }
     try {
       showToast("success", "Scaffolding Started", `Extracting entire VFS structure to primary disk...`);
-      const count = await invoke<number>("download_all", { outputDir });
+      const count = await invoke<number>("download_all", {
+        outputDir,
+        connections: crawlOptions.circuits,
+      });
       showToast("success", "Mirror Complete", `${count} total items structured on disk.`);
       setLogs((l) => [...l, `[MIRROR] Complete. ${count} total items on disk.`]);
     } catch (err: any) {
@@ -405,6 +822,10 @@ function App() {
 
 
   const handleSelectOutput = async () => {
+    if (!isTauriRuntime) {
+      showToast("success", "Preview Mode", "Output path picker is only available in native Tauri mode.");
+      return;
+    }
     try {
       const selected = await open({
         directory: true,
@@ -413,10 +834,39 @@ function App() {
       });
       if (selected && typeof selected === "string") {
         setOutputDir(selected);
-        showToast("success", "Storage Linked", "Updated target extraction path.");
+        setLogs((l) => [...l.slice(-399), `[PATH] Output location set to: ${selected}`]);
+        showToast("success", "Storage Linked", `Updated target extraction path to ${selected}`);
       }
     } catch (e) {
       console.warn("Failed to open dialog", e);
+    }
+  };
+
+  const handleToggleSupportPopover = async () => {
+    if (showSupportPopover) {
+      setShowSupportPopover(false);
+      return;
+    }
+
+    setShowSupportPopover(true);
+    if (supportCatalog.length > 0) return;
+
+    try {
+      if (isTauriRuntime) {
+        const catalog = await invoke<AdapterSupportInfo[]>("get_adapter_support_catalog");
+        if (Array.isArray(catalog) && catalog.length > 0) {
+          setSupportCatalog(catalog);
+          setSupportCatalogError(null);
+          return;
+        }
+      }
+      setSupportCatalog(FALLBACK_SUPPORT_CATALOG);
+      setSupportCatalogError(null);
+    } catch (err: any) {
+      const message = String(err?.message || err || "Failed to load adapter support catalog.");
+      setSupportCatalog(FALLBACK_SUPPORT_CATALOG);
+      setSupportCatalogError(message);
+      setLogs((l) => [...l.slice(-399), `[SYSTEM] Support catalog fallback active: ${message}`]);
     }
   };
 
@@ -427,6 +877,9 @@ function App() {
     if (vfsStats.size >= 1024) return (vfsStats.size / 1024).toFixed(2) + " KB";
     return vfsStats.size + " B";
   })();
+
+  const supportRows = supportCatalog.length > 0 ? supportCatalog : FALLBACK_SUPPORT_CATALOG;
+  const fullCrawlCount = supportRows.filter((item) => item.supportLevel === "Full Crawl").length;
 
   return (
     <div className="app-container">
@@ -463,41 +916,113 @@ function App() {
             </div>
           )}
           <div className={`status-badge ${torStatus?.state === 'ready' || torStatus?.state === 'active' ? 'ready' : torStatus ? 'warn' : ''}`}>
-            <Activity size={14} className={isCrawling ? "aura-spin" : ""} /> SYS: {torStatus ? torStatus.state.toUpperCase() : "IDLE"}
+            {isCrawling ? <VibeLoader size={12} variant="accent" /> : <Activity size={14} />} SYS: {torStatus ? torStatus.state.toUpperCase() : "IDLE"}
           </div>
         </div>
       </header>
 
-      <div className="toolbar">
-        <button className="tool-btn" onClick={() => setUrl("http://worldleaks.onion/api/")}>
+      <div className="toolbar" data-testid="toolbar">
+        <button className="tool-btn" data-testid="btn-load-target" onClick={() => setUrl("http://worldleaks.onion/api/")}>
           <FolderSearch size={22} className={url.includes("worldleaks") ? "pulse-line text-accent-primary" : ""} /> Load Target
         </button>
-        <button className="tool-btn" onClick={handleCrawl} disabled={isCrawling}>
+        <button className="tool-btn" data-testid="btn-resume" onClick={handleCrawl} disabled={isCrawling}>
           <Play size={22} /> Resume
         </button>
         <button
           className="tool-btn danger"
+          data-testid="btn-cancel"
           onClick={handleCancelCrawl}
-          disabled={!isCrawling}
+          disabled={isCancelling}
           title="Stop crawl (Esc)"
         >
-          <XCircle size={22} /> Cancel
+          <XCircle size={22} /> {isCancelling ? "Cancelling" : "Cancel"}
         </button>
         <button
           className="tool-btn"
+          data-testid="btn-export"
           onClick={handleExportJSON}
           disabled={vfsStats.totalNodes === 0}
           title="Export JSON (⌘+E)"
         >
           <FileJson size={22} /> Export
         </button>
+        <button
+          ref={supportButtonRef}
+          className="tool-btn"
+          data-testid="btn-support"
+          onClick={handleToggleSupportPopover}
+          title="Show supported adapters and test coverage"
+        >
+          <CircleHelp size={22} /> Support
+        </button>
       </div>
+
+      {showSupportPopover && (
+        <div className="support-popover" ref={supportPopoverRef} data-testid="support-popover" role="dialog" aria-modal="false" aria-label="Supported adapters">
+          <div className="support-popover-header">
+            <div>
+              <div className="support-popover-title">Supported Adapters</div>
+              <div className="support-popover-subtitle">
+                {fullCrawlCount} full-crawl adapters, {supportRows.length - fullCrawlCount} detection/fallback adapters
+              </div>
+            </div>
+            <button
+              className="support-close-btn"
+              data-testid="btn-support-close"
+              onClick={() => setShowSupportPopover(false)}
+            >
+              Close
+            </button>
+          </div>
+
+          {supportCatalogError && (
+            <div className="support-warning">
+              Live catalog unavailable, displaying local fallback list.
+            </div>
+          )}
+
+          <div className="support-list">
+            {supportRows.map((adapter) => (
+              <div className="support-card" key={adapter.id} data-testid={`adapter-row-${adapter.id}`}>
+                <div className="support-card-top">
+                  <span className="support-card-name">{adapter.name}</span>
+                  <span
+                    className={`support-level-badge ${adapter.supportLevel === "Full Crawl"
+                      ? "full"
+                      : adapter.supportLevel === "Fallback"
+                        ? "fallback"
+                        : "detection"
+                      }`}
+                  >
+                    {adapter.supportLevel}
+                  </span>
+                </div>
+                <div className="support-card-line">
+                  <span className="support-label">Matching:</span> {adapter.matchingStrategy}
+                </div>
+                <div className="support-card-line">
+                  <span className="support-label">Sample URL(s):</span>{" "}
+                  <span className="support-sample-urls">
+                    {adapter.sampleUrls.length > 0 ? adapter.sampleUrls.join(" | ") : "Not listed"}
+                  </span>
+                </div>
+                <div className="support-card-line">
+                  <span className="support-label">Tested for:</span>{" "}
+                  {adapter.testedFor.length > 0 ? adapter.testedFor.join(" | ") : "No dedicated adapter test yet"}
+                </div>
+                <div className="support-card-note">{adapter.notes}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="url-bar">
         <div className="input-group">
           <span className="input-label">Target Source</span>
           <input
             ref={urlInputRef}
+            data-testid="input-target-url"
             type="text"
             className="url-input"
             placeholder="http://... (⌘+Enter to start)"
@@ -512,12 +1037,13 @@ function App() {
 
         <button
           className="action-btn popup-hover"
+          data-testid="btn-start-queue"
           onClick={handleCrawl}
           disabled={isCrawling}
         >
           {isCrawling ? (
             <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <Activity size={18} className="aura-spin" /> Scanning
+              <VibeLoader size={18} variant="primary" /> Scanning
             </span>
           ) : (
             <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>Start Queue</span>
@@ -529,6 +1055,7 @@ function App() {
         <div className="input-group">
           <span className="input-label" style={{ minWidth: '100px' }}>Extraction Path</span>
           <input
+            data-testid="input-output-path"
             type="text"
             className="url-input"
             style={{ fontFamily: 'JetBrains Mono', fontSize: '0.85rem' }}
@@ -538,6 +1065,7 @@ function App() {
         </div>
         <button
           className="action-btn popup-hover"
+          data-testid="btn-change-output"
           onClick={handleSelectOutput}
           style={{ width: 'auto', padding: '0 24px', background: 'transparent', border: '1px solid rgba(162, 0, 255, 0.4)' }}
           disabled={isCrawling}
@@ -549,6 +1077,7 @@ function App() {
       <div className="options-bar" style={{ display: 'flex', gap: '32px', padding: '0 24px 16px', borderBottom: 'var(--panel-border)' }}>
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
           <input
+            data-testid="chk-listing"
             type="checkbox"
             checked={crawlOptions.listing}
             onChange={(e) => setCrawlOptions({ ...crawlOptions, listing: e.target.checked })}
@@ -560,6 +1089,7 @@ function App() {
 
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
           <input
+            data-testid="chk-sizes"
             type="checkbox"
             checked={crawlOptions.sizes}
             onChange={(e) => setCrawlOptions({ ...crawlOptions, sizes: e.target.checked })}
@@ -571,6 +1101,7 @@ function App() {
 
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Automatically download files to disk as soon as they are found during the crawl.">
           <input
+            data-testid="chk-auto-download"
             type="checkbox"
             checked={crawlOptions.download}
             onChange={(e) => setCrawlOptions({ ...crawlOptions, download: e.target.checked })}
@@ -583,6 +1114,7 @@ function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: 'auto' }}>
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Concurrency:</span>
           <select
+            data-testid="sel-circuits"
             value={crawlOptions.circuits}
             onChange={(e) => setCrawlOptions({ ...crawlOptions, circuits: parseInt(e.target.value) })}
             disabled={isCrawling}
@@ -603,15 +1135,45 @@ function App() {
             <option value={200}>200 Circuits</option>
           </select>
         </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: '24px' }}>
+          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Tor Daemons:</span>
+          <select
+            data-testid="sel-daemons"
+            value={crawlOptions.daemons}
+            onChange={(e) => setCrawlOptions({ ...crawlOptions, daemons: parseInt(e.target.value) })}
+            disabled={isCrawling}
+            style={{
+              background: 'var(--bg-dark)',
+              color: 'var(--text-main)',
+              border: '1px solid var(--border-color)',
+              borderRadius: '4px',
+              padding: '4px 8px',
+              fontSize: '0.85rem',
+              outline: 'none',
+              cursor: isCrawling ? 'not-allowed' : 'pointer'
+            }}
+          >
+            <option value={0}>Auto (Balanced)</option>
+            <option value={4}>4 Daemons</option>
+            <option value={8}>8 Daemons</option>
+            <option value={12}>12 Daemons (HFT)</option>
+            <option value={16}>16 Daemons (Max)</option>
+          </select>
+        </div>
       </div>
 
       <Dashboard
         isCrawling={isCrawling}
         torStatus={torStatus}
+        activeAdapter={activeAdapter}
+        crawlStatus={crawlStatus}
+        downloadBatchStatus={downloadBatchStatus}
         logs={logs}
         vfsCount={vfsStats.totalNodes}
         downloadProgress={downloadProgress}
         elapsed={crawlElapsed}
+        downloadElapsed={downloadElapsed}
       />
 
       <div className="main-workspace">
@@ -666,6 +1228,7 @@ function App() {
                 <>
                   <button
                     className="action-btn popup-hover"
+                    data-testid="btn-mass-extract-all"
                     onClick={handleDownloadAll}
                     style={{ padding: '2px 12px', fontSize: '0.75rem', height: '28px', minWidth: 'auto', background: 'transparent', border: '1px solid var(--border-hud)', color: 'var(--accent-secondary)', display: 'flex', gap: '6px', alignItems: 'center' }}
                     title="Safely Scaffold All Indexed Entries via Multi-Threading"
@@ -675,6 +1238,7 @@ function App() {
                   {selectedFiles.length > 0 && (
                     <button
                       className="action-btn popup-hover"
+                      data-testid="btn-download-selected"
                       onClick={handleDownloadSelected}
                       style={{ padding: '2px 12px', fontSize: '0.75rem', height: '28px', minWidth: 'auto', background: 'rgba(0, 229, 255, 0.1)', border: '1px solid var(--border-hud)', color: 'var(--accent-secondary)', display: 'flex', gap: '6px', alignItems: 'center' }}
                       title="Download selected items."
@@ -700,8 +1264,8 @@ function App() {
       <div className="network-monitor">
         {daemonPorts.map((port, idx) => (
           <div key={port} className="daemon-box">
-            <div className={`daemon-icon ${isCrawling ? 'aura-spin' : ''}`}>
-              <Zap size={18} />
+            <div className="daemon-icon">
+              {isCrawling ? <VibeLoader size={18} variant="secondary" /> : <Zap size={18} />}
             </div>
             <div className="daemon-info">
               <div className="daemon-header">NODE {idx}: PORT {port}</div>

@@ -1,10 +1,10 @@
-use tauri::AppHandle;
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use crate::adapters::{CrawlerAdapter, SiteFingerprint, FileEntry, EntryType};
 use crate::adapters::autoindex::parse_autoindex_html;
+use crate::adapters::{CrawlerAdapter, EntryType, FileEntry, SiteFingerprint};
 use crate::frontier::CrawlerFrontier;
 use crate::path_utils;
+use std::sync::Arc;
+use tauri::AppHandle;
+use tokio::sync::mpsc;
 
 #[derive(Default)]
 pub struct PlayAdapter;
@@ -12,7 +12,9 @@ pub struct PlayAdapter;
 #[async_trait::async_trait]
 impl CrawlerAdapter for PlayAdapter {
     async fn can_handle(&self, fingerprint: &SiteFingerprint) -> bool {
-        fingerprint.url.contains("b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion")
+        fingerprint
+            .url
+            .contains("b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion")
             || fingerprint.url.contains("FALOp")
             || fingerprint.body.contains("Index of /FALOp/")
     }
@@ -21,14 +23,14 @@ impl CrawlerAdapter for PlayAdapter {
         &self,
         current_url: &str,
         frontier: Arc<CrawlerFrontier>,
-        app: AppHandle
+        app: AppHandle,
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let queue = Arc::new(crossbeam_queue::SegQueue::new());
         let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-        tx.send(current_url.to_string())?;
+        queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
 
         // Batched UI Backpressure Task
@@ -57,40 +59,39 @@ impl CrawlerAdapter for PlayAdapter {
             }
         });
 
-        let max_concurrent = 120;
-        let mut active_tasks = 0;
+        let max_concurrent = 120; // Massive worker-stealer parallel pool
         let mut workers = tokio::task::JoinSet::new();
 
         let base_url = current_url.trim_end_matches('/').to_string();
-        
+
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        loop {
-            // Check cancellation
-            if frontier.is_cancelled() {
-                app.emit("crawl_log", "[System] Crawl cancelled by user.".to_string()).unwrap_or_default();
-                break;
-            }
+        for _ in 0..max_concurrent {
+            let f = frontier.clone();
+            let q_clone = queue.clone();
+            let ui_tx_clone = ui_tx.clone();
+            let discovered_ref = all_discovered_entries.clone();
+            let current_base = base_url.clone();
+            let pending_clone = pending.clone();
 
-            while active_tasks < max_concurrent {
-                if let Ok(next_url) = rx.try_recv() {
-                    let f = frontier.clone();
-                    let _tx_clone = tx.clone();
-                    let ui_tx_clone = ui_tx.clone();
-                    let discovered_ref = all_discovered_entries.clone();
-                    let current_base = base_url.clone();
+            workers.spawn(async move {
+                loop {
+                    // Check cancellation before doing work
+                    if f.is_cancelled() { break; }
 
-                    active_tasks += 1;
-                    let pending_clone = pending.clone();
-                    workers.spawn(async move {
-                        // Check cancellation before doing work
-                        if f.is_cancelled() { 
-                            pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            return; 
+                    let next_url = match q_clone.pop() {
+                        Some(url) => url,
+                        None => {
+                            if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
                         }
+                    };
 
-                        let _permit = f.politeness_semaphore.acquire().await.ok();
+                    let _permit = f.politeness_semaphore.acquire().await.ok();
                         let (cid, client) = f.get_client();
 
                         // Enforce predictive yield delay from CircuitScorer
@@ -127,14 +128,17 @@ impl CrawlerAdapter for PlayAdapter {
                                             Ok(body) => {
                                                 bytes_downloaded += body.len() as u64;
                                                 body
-                                            },
-                                            Err(_) => { fetch_success = false; String::new() },
+                                            }
+                                            Err(_) => {
+                                                fetch_success = false;
+                                                String::new()
+                                            }
                                         }
                                     } else {
                                         fetch_success = false;
                                         String::new()
                                     }
-                                },
+                                }
                                 Err(_) => {
                                     fetch_success = false;
                                     build_fallback_html()
@@ -144,22 +148,50 @@ impl CrawlerAdapter for PlayAdapter {
                             // Use the shared autoindex HTML parser
                             let parsed_files = parse_autoindex_html(&html);
 
-                            for (filename, parsed_size, _is_dir) in parsed_files {
-                                let encoded_filename = path_utils::url_encode(&filename);
-                                let file_raw_url = format!("{}/{}", current_base, encoded_filename);
+                            for parsed_entry in parsed_files {
+                                let filename = parsed_entry.0.clone();
+                                let mut raw_url = match url::Url::parse(&next_url)
+                                    .ok()
+                                    .and_then(|base| base.join(&parsed_entry.0).ok())
+                                {
+                                    Some(resolved) => resolved.to_string(),
+                                    None => format!(
+                                        "{}/{}",
+                                        current_base,
+                                        parsed_entry.0.trim_start_matches('/')
+                                    ),
+                                };
+                                if parsed_entry.2 && !raw_url.ends_with('/') {
+                                    raw_url.push('/');
+                                }
+
+                                let display_path = format!(
+                                    "/{}/{}",
+                                    dir_name,
+                                    path_utils::sanitize_path(&filename)
+                                );
+
+                                if parsed_entry.2 {
+                                    new_files.push(FileEntry {
+                                        path: display_path,
+                                        size_bytes: None,
+                                        entry_type: EntryType::Folder,
+                                        raw_url,
+                                    });
+                                    continue;
+                                }
 
                                 let size = if f.active_options.sizes {
-                                    if let Some(s) = parsed_size {
+                                    if let Some(s) = parsed_entry.1 {
                                         Some(s)
                                     } else {
                                         // Try HTTP HEAD to get Content-Length
-                                        match client.head(&file_raw_url).send().await {
-                                            Ok(head_resp) => {
-                                                head_resp.headers()
-                                                    .get("content-length")
-                                                    .and_then(|v| v.to_str().ok())
-                                                    .and_then(|s| s.parse::<u64>().ok())
-                                            },
+                                        match client.head(&raw_url).send().await {
+                                            Ok(head_resp) => head_resp
+                                                .headers()
+                                                .get("content-length")
+                                                .and_then(|v| v.to_str().ok())
+                                                .and_then(|s| s.parse::<u64>().ok()),
                                             Err(_) => None,
                                         }
                                     }
@@ -167,13 +199,11 @@ impl CrawlerAdapter for PlayAdapter {
                                     None
                                 };
 
-                                let display_path = format!("/{}/{}", dir_name, path_utils::sanitize_path(&filename));
-
                                 new_files.push(FileEntry {
                                     path: display_path,
                                     size_bytes: size,
                                     entry_type: EntryType::File,
-                                    raw_url: file_raw_url,
+                                    raw_url,
                                 });
                             }
                         }
@@ -195,24 +225,14 @@ impl CrawlerAdapter for PlayAdapter {
                             let mut lock = discovered_ref.lock().await;
                             lock.extend(new_files);
                         }
-                        
+
                         // Decrement the active task in our custom closure
                         pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    });
-                } else {
-                    break;
                 }
-            }
-
-            if let Some(_res) = workers.join_next().await {
-                active_tasks -= 1;
-            } else {
-                if pending.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            });
         }
+
+        while let Some(_) = workers.join_next().await {}
 
         drop(ui_tx);
         let mut final_results = all_discovered_entries.lock().await;

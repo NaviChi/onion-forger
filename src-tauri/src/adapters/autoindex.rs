@@ -97,11 +97,14 @@ impl CrawlerAdapter for AutoindexAdapter {
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let queue = Arc::new(crossbeam_queue::SegQueue::new());
         let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-        tx.send(current_url.to_string())?;
+        queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
+        
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Batched UI Backpressure Task
         let (ui_tx, mut ui_rx) = mpsc::channel::<FileEntry>(500000);
@@ -129,61 +132,69 @@ impl CrawlerAdapter for AutoindexAdapter {
             }
         });
 
-        let max_concurrent = 120;
-        let mut active_tasks = 0;
+        let max_concurrent = 120; // Massive worker-stealer parallel pool
         let mut workers = tokio::task::JoinSet::new();
 
         let _base_url = current_url.trim_end_matches('/').to_string();
 
-        loop {
-            // Check cancellation
-            if frontier.is_cancelled() {
-                app.emit("crawl_log", "[System] Crawl cancelled by user.".to_string()).unwrap_or_default();
-                break;
-            }
+        for _ in 0..max_concurrent {
+            let f = frontier.clone();
+            let q_clone = queue.clone();
+            let ui_tx_clone = ui_tx.clone();
+            let discovered_ref = all_discovered_entries.clone();
+            let pending_clone = pending.clone();
 
-            while active_tasks < max_concurrent {
-                if let Ok(next_url) = rx.try_recv() {
-                    let f = frontier.clone();
-                    let tx_clone = tx.clone();
-                    let ui_tx_clone = ui_tx.clone();
-                    let _ui_app_clone = app.clone();
-                    let discovered_ref = all_discovered_entries.clone();
+            workers.spawn(async move {
+                loop {
+                    // Check cancellation before doing any work
+                    if f.is_cancelled() { return; }
 
-                    active_tasks += 1;
-                    workers.spawn(async move {
-                        // Check cancellation before doing any work
-                        if f.is_cancelled() { return; }
-
-                        let _permit = f.politeness_semaphore.acquire().await.ok();
-                        let (cid, client) = f.get_client();
-
-                        // Enforce predictive yield delay from CircuitScorer
-                        let delay = f.scorer.yield_delay(cid);
-                        if delay > std::time::Duration::ZERO {
-                            tokio::time::sleep(delay).await;
+                    let next_url = match q_clone.pop() {
+                        Some(url) => url,
+                        None => {
+                            if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
                         }
+                    };
 
-                        let start_time = std::time::Instant::now();
-                        let mut bytes_downloaded = 0;
+                    let _permit = f.politeness_semaphore.acquire().await.ok();
+                    let (cid, client) = f.get_client();
 
-                        // Fetch the HTML page
-                        let (fetch_success, html) = match client.get(&next_url).send().await {
-                            Ok(resp) => {
-                                if resp.status().is_success() {
-                                    match resp.text().await {
-                                        Ok(body) => {
-                                            bytes_downloaded += body.len() as u64;
-                                            (true, Some(body))
-                                        },
-                                        Err(_) => (false, None),
+                    // Enforce predictive yield delay from CircuitScorer
+                    let delay = f.scorer.yield_delay(cid);
+                    if delay > std::time::Duration::ZERO {
+                        tokio::time::sleep(delay).await;
+                    }
+
+                    let start_time = std::time::Instant::now();
+                    let mut bytes_downloaded = 0;
+
+                    // Fetch the HTML page
+                    let (mut fetch_success, mut html) = (false, None);
+                    loop {
+                        match tokio::time::timeout(std::time::Duration::from_secs(45), client.get(&next_url).send()).await {
+                                Ok(Ok(resp)) => {
+                                    if resp.status().is_success() {
+                                        match resp.text().await {
+                                            Ok(body) => {
+                                                bytes_downloaded += body.len() as u64;
+                                                fetch_success = true;
+                                                html = Some(body);
+                                                break;
+                                            }
+                                            Err(_) => {}
+                                        }
+                                    } else if resp.status() == 404 {
+                                        break;
                                     }
-                                } else {
-                                    (false, None)
                                 }
-                            },
-                            Err(_) => (false, None),
-                        };
+                                _ => {}
+                            };
+                            break; // Break if timeout or reqwest error
+                        }
 
                         // Report to AIMD and CircuitScorer
                         let elapsed_ms = start_time.elapsed().as_millis() as u64;
@@ -191,12 +202,16 @@ impl CrawlerAdapter for AutoindexAdapter {
                             f.record_success(cid, bytes_downloaded, elapsed_ms);
                         } else {
                             f.record_failure(cid);
-                            return; // Early return correctly after recording failure
+                            pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            continue; // Move to next URL without aborting worker
                         }
                         
                         let html = html.unwrap(); // Safe due to fetch_success check
 
-                        if !f.active_options.listing { return; }
+                        if !f.active_options.listing { 
+                            pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            continue;
+                        }
 
                         // Parse all entries from the autoindex page
                         let parsed = parse_autoindex_html(&html);
@@ -219,7 +234,8 @@ impl CrawlerAdapter for AutoindexAdapter {
                                 // Enqueue subdirectory for recursive crawling
                                 let sub_url = format!("{}/", child_url);
                                 if f.mark_visited(&sub_url) {
-                                    let _ = tx_clone.send(sub_url);
+                                    pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    q_clone.push(sub_url);
                                 }
                             } else {
                                 // File entry
@@ -261,18 +277,13 @@ impl CrawlerAdapter for AutoindexAdapter {
                             let mut lock = discovered_ref.lock().await;
                             lock.extend(new_files);
                         }
-                    });
-                } else {
-                    break;
-                }
-            }
 
-            if let Some(_res) = workers.join_next().await {
-                active_tasks -= 1;
-            } else if rx.is_empty() {
-                break;
-            }
+                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+            });
         }
+
+        while let Some(_) = workers.join_next().await {}
 
         drop(ui_tx);
         let mut final_results = all_discovered_entries.lock().await;

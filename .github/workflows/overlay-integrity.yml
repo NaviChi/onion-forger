@@ -1,0 +1,42 @@
+name: Overlay Integrity
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  overlay-integrity:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run overlay integrity workflow
+        run: npm run overlay:integrity
+
+      - name: Upload overlay artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: overlay-integrity-artifacts
+          path: output/playwright/overlay-integrity/
+          if-no-files-found: ignore

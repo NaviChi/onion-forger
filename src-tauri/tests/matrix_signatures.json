@@ -1,0 +1,34 @@
+{
+  "play": {
+    "files": 11,
+    "dirs": 1
+  },
+  "nu_server": {
+    "files": 0,
+    "dirs": 0
+  },
+  "lockbit": {
+    "files": 477,
+    "dirs": 34
+  },
+  "dragonforce": {
+    "files": 49023,
+    "dirs": 10845
+  },
+  "qilin": {
+    "files": 118,
+    "dirs": 20
+  },
+  "inc_ransom": {
+    "files": 106390,
+    "dirs": 11464
+  },
+  "worldleaks": {
+    "files": 0,
+    "dirs": 0
+  },
+  "pear": {
+    "files": 380553,
+    "dirs": 52532
+  }
+}

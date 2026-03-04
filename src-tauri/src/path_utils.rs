@@ -1,5 +1,6 @@
 /// Path Utilities for OnionForge
 /// Handles URL decoding, filename sanitization, and path normalization
+use std::path::{Path, PathBuf};
 
 /// Decode URL-encoded strings: %20 → space, %2F → /, etc.
 /// Pure Rust implementation — no external crate needed.
@@ -10,10 +11,7 @@ pub fn url_decode(input: &str) -> String {
 
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (
-                hex_val(bytes[i + 1]),
-                hex_val(bytes[i + 2]),
-            ) {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
                 result.push(hi * 16 + lo);
                 i += 3;
                 continue;
@@ -47,10 +45,26 @@ pub fn url_encode(input: &str) -> String {
     for b in input.bytes() {
         match b {
             // Safe characters that don't need encoding
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~'
-            | b'/' | b':' | b'@' | b'!' | b'$' | b'&'
-            | b'\'' | b'(' | b')' | b'*' | b',' | b';' | b'=' => {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'/'
+            | b':'
+            | b'@'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b','
+            | b';'
+            | b'=' => {
                 result.push(b as char);
             }
             b' ' => result.push_str("%20"),
@@ -70,15 +84,18 @@ pub fn url_encode(input: &str) -> String {
 pub fn sanitize_path(raw_path: &str) -> String {
     // First decode any URL-encoded sequences
     let decoded = url_decode(raw_path);
+    // Normalize Windows separators into forward slashes
+    let normalized = decoded.replace('\\', "/");
 
     // Strip leading slash for relative path construction
-    let trimmed = decoded.trim_start_matches('/');
+    let trimmed = normalized.trim_start_matches('/');
 
     // Process each path component individually
     let components: Vec<String> = trimmed
         .split('/')
-        .filter(|c| !c.is_empty())
-        .map(|component| sanitize_component(component))
+        .filter(|component| !component.is_empty() && *component != "." && *component != "..")
+        .map(sanitize_component)
+        .filter(|component| !component.is_empty() && component != "." && component != "..")
         .collect();
 
     // Rejoin with forward slashes
@@ -104,9 +121,10 @@ fn sanitize_component(name: &str) -> String {
 
     // Handle Windows reserved names
     let upper = clean.to_uppercase();
-    let reserved = ["CON", "PRN", "AUX", "NUL",
-        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"];
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
     if reserved.contains(&upper.as_str()) {
         clean = format!("_{}", clean);
     }
@@ -120,6 +138,115 @@ fn sanitize_component(name: &str) -> String {
     }
 
     clean
+}
+
+pub fn canonicalize_output_root(output_dir: &str) -> std::io::Result<PathBuf> {
+    if output_dir.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Output directory cannot be empty",
+        ));
+    }
+
+    let raw = PathBuf::from(output_dir);
+    std::fs::create_dir_all(&raw)?;
+    let canonical = std::fs::canonicalize(&raw)?;
+    if !canonical.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Output root is not a directory",
+        ));
+    }
+    Ok(canonical)
+}
+
+pub fn resolve_path_within_root(
+    output_root: &Path,
+    raw_path: &str,
+    is_directory: bool,
+) -> std::io::Result<Option<PathBuf>> {
+    let sanitized = sanitize_path(raw_path);
+    if sanitized.is_empty() {
+        return Ok(None);
+    }
+
+    let joined = output_root.join(&sanitized);
+    if is_directory {
+        std::fs::create_dir_all(&joined)?;
+        let canonical = std::fs::canonicalize(&joined)?;
+        if !canonical.starts_with(output_root) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Resolved directory escaped output root",
+            ));
+        }
+        return Ok(Some(canonical));
+    }
+
+    let parent = joined.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Resolved file path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    if !canonical_parent.starts_with(output_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Resolved file parent escaped output root",
+        ));
+    }
+
+    let file_name = joined.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Resolved file path has no file name",
+        )
+    })?;
+    Ok(Some(canonical_parent.join(file_name)))
+}
+
+pub fn resolve_download_target_within_root(
+    output_root: &Path,
+    requested_path: &str,
+) -> std::io::Result<PathBuf> {
+    let requested = PathBuf::from(requested_path);
+    let candidate = if requested.is_absolute() {
+        requested
+    } else {
+        let sanitized = sanitize_path(requested_path);
+        if sanitized.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Requested download path is empty after sanitization",
+            ));
+        }
+        output_root.join(sanitized)
+    };
+
+    let parent = candidate.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Requested download target has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    if !canonical_parent.starts_with(output_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Download target escaped output root",
+        ));
+    }
+
+    let file_name = candidate.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Requested download target has no file name",
+        )
+    })?;
+    Ok(canonical_parent.join(file_name))
 }
 
 /// Extract a clean directory name from a URL for the output folder.
@@ -172,17 +299,33 @@ mod tests {
 
     #[test]
     fn test_sanitize_path() {
-        assert_eq!(sanitize_path("/FALOp/2%20Sally%20Personal.part01.rar"), "FALOp/2 Sally Personal.part01.rar");
-        assert_eq!(sanitize_path("/dir/file<with>bad:chars?.txt"), "dir/file_with_bad_chars_.txt");
-        assert_eq!(sanitize_path("///multiple///slashes///"), "multiple/slashes");
+        assert_eq!(
+            sanitize_path("/FALOp/2%20Sally%20Personal.part01.rar"),
+            "FALOp/2 Sally Personal.part01.rar"
+        );
+        assert_eq!(
+            sanitize_path("/dir/file<with>bad:chars?.txt"),
+            "dir/file_with_bad_chars_.txt"
+        );
+        assert_eq!(
+            sanitize_path("///multiple///slashes///"),
+            "multiple/slashes"
+        );
         assert_eq!(sanitize_path(""), "");
         assert_eq!(sanitize_path("/CON/test.txt"), "_CON/test.txt");
+        assert_eq!(
+            sanitize_path("..\\..\\Windows\\System32\\drivers\\etc\\hosts"),
+            "Windows/System32/drivers/etc/hosts"
+        );
+        assert_eq!(sanitize_path("././safe/./file.txt"), "safe/file.txt");
     }
 
     #[test]
     fn test_extract_target_dirname() {
         assert_eq!(
-            extract_target_dirname("http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp"),
+            extract_target_dirname(
+                "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp"
+            ),
             "FALOp"
         );
         assert_eq!(
@@ -190,8 +333,27 @@ mod tests {
             "698d5c538f1d14b7436dd63b"
         );
         assert_eq!(
-            extract_target_dirname("http://m3wwhkus4dxbnxbtihexlyd2cv63qrvex6jiebc4vqe22kg2z3udebid.onion/sdeb.org/"),
+            extract_target_dirname(
+                "http://m3wwhkus4dxbnxbtihexlyd2cv63qrvex6jiebc4vqe22kg2z3udebid.onion/sdeb.org/"
+            ),
             "sdeb.org"
         );
+    }
+
+    #[test]
+    fn test_resolve_download_target_within_root_blocks_escape() {
+        let temp = std::env::temp_dir().join("crawli_path_utils_test");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let root = std::fs::canonicalize(&temp).unwrap();
+
+        let ok = resolve_download_target_within_root(&root, "safe/file.bin").unwrap();
+        assert!(ok.starts_with(&root));
+
+        let escape = root.parent().unwrap().join("outside.bin");
+        let err = resolve_download_target_within_root(&root, escape.to_string_lossy().as_ref());
+        assert!(err.is_err());
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

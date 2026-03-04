@@ -12,10 +12,7 @@ async fn test_dragonforce_cli_crawl() {
     // Setup reqwest to route through local Tor proxy matching the one running in the CLI test env (9150 from Tor Browser, or 9051)
     // We'll use 9150 since `curl` worked on it above.
     let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:9150").unwrap();
-    let client = reqwest::Client::builder()
-        .proxy(proxy)
-        .build()
-        .unwrap();
+    let client = reqwest::Client::builder().proxy(proxy).build().unwrap();
 
     let resp = match client.get(url).send().await {
         Ok(resp) => resp,
@@ -27,7 +24,10 @@ async fn test_dragonforce_cli_crawl() {
     let html = match resp.text().await {
         Ok(html) => html,
         Err(err) => {
-            eprintln!("Skipping live DragonForce crawl test: failed reading response body: {}", err);
+            eprintln!(
+                "Skipping live DragonForce crawl test: failed reading response body: {}",
+                err
+            );
             return;
         }
     };
@@ -39,11 +39,20 @@ async fn test_dragonforce_cli_crawl() {
     println!("Crawled: {}", url);
     println!("Found {} entries.", entries.len());
     for e in &entries {
-        println!("{:?} | Size: {:?} | Path: {}", e.entry_type, e.size_bytes, e.path);
+        println!(
+            "{:?} | Size: {:?} | Path: {}",
+            e.entry_type, e.size_bytes, e.path
+        );
         println!("URL: {}", e.raw_url);
         println!("---------------------------------------------------------");
     }
 
-    assert!(!entries.is_empty(), "Failed to extract items from DragonForce SPA!");
-    assert!(entries.iter().any(|e| e.size_bytes.is_some()), "Failed to extract accurate byte sizes!");
+    assert!(
+        !entries.is_empty(),
+        "Failed to extract items from DragonForce SPA!"
+    );
+    assert!(
+        entries.iter().any(|e| e.size_bytes.is_some()),
+        "Failed to extract accurate byte sizes!"
+    );
 }

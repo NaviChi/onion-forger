@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::mpsc;
+
 use tokio::task::JoinSet;
 
 /// Log writer that writes timestamped entries to a file alongside the download
@@ -191,8 +191,7 @@ fn compute_piece_size(content_length: u64, circuits: usize) -> u64 {
 const MIN_SPEED_RATIO: f64 = 0.20; // 20% of median = too slow
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
 
-// Phase 3: UCB1 Multi-Armed Bandit tuning
-const UCB1_EXPLORATION_C: f64 = 1.5; // Exploration vs exploitation balance
+
 const UNCHOKE_INTERVAL_SECS: u64 = 30; // Test a fresh circuit every 30s
 
 /// UCB1 Multi-Armed Bandit circuit scorer.
@@ -283,8 +282,8 @@ impl CircuitScorer {
         (prediction + (deviation * 1.5)) > (baseline * 2.5)
     }
 
-    /// Compute UCB1 score for a circuit (higher = should get more pieces)
-    fn ucb1_score(&self, cid: usize) -> f64 {
+    /// Compute Thompson Sampling score for a circuit (higher = should get more pieces)
+    fn thompson_score(&self, cid: usize) -> f64 {
         if cid >= self.capacity { return 0.0; }
         let n = self.pieces_completed[cid].load(Ordering::Relaxed);
         if n == 0 {
@@ -294,10 +293,23 @@ impl CircuitScorer {
         let total_ms = self.total_elapsed_ms[cid].load(Ordering::Relaxed).max(1) as f64;
         let avg_speed = total_b / total_ms; // bytes per ms
 
-        let global = self.global_pieces.load(Ordering::Relaxed).max(1) as f64;
-        let exploration = UCB1_EXPLORATION_C * (global.ln() / n as f64).sqrt();
-
-        avg_speed + exploration
+        // The Kalman filter tracks latency. We use its covariance (uncertainty) to drive exploration.
+        let mut variance = {
+            let kf = self.latency_kalman[cid].lock().unwrap();
+            kf.p
+        };
+        if variance < 0.001 { variance = 0.001; }
+        
+        // Box-Muller transform for normal distribution N(mean, variance) Lock-Free
+        let std_dev = variance.sqrt();
+        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let u1 = (((time ^ (time >> 12)) % 10000) as f64 / 10000.0).max(0.0001);
+        let u2 = (((time ^ (time >> 20)) % 10000) as f64 / 10000.0).max(0.0001);
+        
+        let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+        let thompson_scaling_factor = 0.01;
+        
+        avg_speed + (z0 * std_dev * thompson_scaling_factor)
     }
 
     /// Compute average speed in MB/s for a circuit
@@ -313,13 +325,13 @@ impl CircuitScorer {
     /// This naturally gives more work to faster circuits.
     fn yield_delay(&self, cid: usize) -> Duration {
         if cid >= self.capacity { return Duration::ZERO; }
-        let my_score = self.ucb1_score(cid);
+        let my_score = self.thompson_score(cid);
         if my_score == f64::MAX { return Duration::ZERO; } // Untested, no delay
 
         // Collect scores of all active circuits
         let mut scores: Vec<f64> = (0..self.capacity)
             .filter(|&i| self.pieces_completed[i].load(Ordering::Relaxed) > 0)
-            .map(|i| self.ucb1_score(i))
+            .map(|i| self.thompson_score(i))
             .collect();
         if scores.is_empty() { return Duration::ZERO; }
 
@@ -351,61 +363,7 @@ impl CircuitScorer {
     }
 }
 
-/// Phase 4.4: AIMD (Additive Increase, Multiplicative Decrease) concurrency controller.
-/// Dynamically adjusts active circuit count based on server response.
-#[allow(dead_code)]
-struct AimdController {
-    active: AtomicUsize,
-    max: usize,
-    min: usize,
-    consec_success: AtomicUsize,
-}
-
-#[allow(dead_code)]
-impl AimdController {
-    fn new(initial: usize, max: usize) -> Self {
-        AimdController {
-            active: AtomicUsize::new(initial),
-            max,
-            min: 1,
-            consec_success: AtomicUsize::new(0),
-        }
-    }
-
-    /// Call on successful piece download
-    fn on_success(&self) {
-        let consec = self.consec_success.fetch_add(1, Ordering::Relaxed);
-        // Additive increase: +1 circuit every 20 consecutive successes
-        if consec > 0 && consec % 20 == 0 {
-            let current = self.active.load(Ordering::Relaxed);
-            if current < self.max {
-                self.active.store(current + 1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Call on server rejection (429, 503, connection refused)
-    fn on_reject(&self) {
-        self.consec_success.store(0, Ordering::Relaxed);
-        // Multiplicative decrease: halve active circuits
-        let current = self.active.load(Ordering::Relaxed);
-        let new_val = (current / 2).max(self.min);
-        self.active.store(new_val, Ordering::Relaxed);
-    }
-
-    /// Call on timeout (milder decrease)
-    fn on_timeout(&self) {
-        self.consec_success.store(0, Ordering::Relaxed);
-        let current = self.active.load(Ordering::Relaxed);
-        let new_val = (current * 3 / 4).max(self.min);
-        self.active.store(new_val, Ordering::Relaxed);
-    }
-
-    /// Check if this circuit should be active
-    fn should_be_active(&self, circuit_rank: usize) -> bool {
-        circuit_rank < self.active.load(Ordering::Relaxed)
-    }
-}
+use crate::bbr::BbrController;
 
 /// Exponential backoff: min(2^retries * 500ms, 30s)
 fn backoff_duration(retries: usize) -> Duration {
@@ -731,6 +689,7 @@ fn stream_download_client(is_onion: bool, port: u16) -> Result<Client> {
 pub struct BatchFileEntry {
     pub url: String,
     pub path: String,
+    pub size_hint: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -750,6 +709,7 @@ pub async fn start_batch_download(
     files: Vec<BatchFileEntry>,
     num_circuits: usize,
     force_tor: bool,
+    output_dir: Option<String>,
     control: DownloadControl,
 ) -> Result<()> {
     let requested_circuits = num_circuits.max(1);
@@ -758,7 +718,7 @@ pub async fn start_batch_download(
     let mut active_ports: Vec<u16> = Vec::new();
     let daemon_count;
     if is_onion {
-        for port in 9051..=9054 {
+        for port in 9051..=9070 {
             if !is_port_available(port) {
                 active_ports.push(port);
             }
@@ -780,6 +740,17 @@ pub async fn start_batch_download(
 
     for file in &files {
         if control.interruption_reason().is_some() { return Ok(()); }
+        
+        // Smart Skip Idempotency
+        if let Some(hint) = file.size_hint {
+            if let Ok(meta) = std::fs::metadata(&file.path) {
+                if meta.len() == hint && hint > 0 {
+                    let _ = app.emit("log", format!("[✓] Smart Skip: File exists and matches size ({} bytes): {}", hint, file.path));
+                    continue;
+                }
+            }
+        }
+        
         match probe_target(&sniff_client, &file.url, &app).await {
             Ok(probe) => {
                 if probe.content_length <= BATCH_LARGE_THRESHOLD {
@@ -846,7 +817,32 @@ pub async fn start_batch_download(
                             client.get(&entry.url).header("Connection", "close").send()
                         ).await {
                             Ok(Ok(r)) if r.status().is_success() => r,
-                            _ => { retries += 1; tokio::time::sleep(backoff_duration(retries)).await; continue; }
+                            Ok(Ok(r)) => {
+                                let status = r.status();
+                                if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                                {
+                                    let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} hit HTTP {}. Blasting NEWNYM to Daemon {}...", circuit_id, status, daemon_port));
+                                    let port = daemon_port as u16;
+                                    tokio::spawn(async move { let _ = crate::tor::request_newnym(port).await; });
+                                }
+                                retries += 1;
+                                tokio::time::sleep(backoff_duration(retries)).await;
+                                continue;
+                            }
+                            Ok(Err(err)) => {
+                                if err.is_connect() || err.is_request() {
+                                    let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} connection reset. Blasting NEWNYM to Daemon {}...", circuit_id, daemon_port));
+                                    let port = daemon_port as u16;
+                                    tokio::spawn(async move { let _ = crate::tor::request_newnym(port).await; });
+                                }
+                                retries += 1;
+                                tokio::time::sleep(backoff_duration(retries)).await;
+                                continue;
+                            }
+                            Err(_) => {
+                                retries += 1; tokio::time::sleep(backoff_duration(retries)).await; continue;
+                            }
                         };
 
                         match tokio::time::timeout(Duration::from_secs(300), resp.bytes()).await {
@@ -894,7 +890,7 @@ pub async fn start_batch_download(
         let inner_control = DownloadControl::new();
         let _ = start_download(
             app.clone(), file.url.clone(), file.path.clone(),
-            num_circuits, force_tor, inner_control,
+            num_circuits, force_tor, output_dir.clone(), inner_control,
         ).await;
     }
 
@@ -908,6 +904,7 @@ pub async fn start_download(
     output_target: String,
     num_circuits: usize,
     force_tor: bool,
+    _output_dir: Option<String>,
     control: DownloadControl,
 ) -> Result<()> {
     let requested_circuits = num_circuits.max(1);
@@ -937,8 +934,8 @@ pub async fn start_download(
     let mut _tor_guard: Option<crate::tor::TorProcessGuard> = None;
 
     if is_onion {
-        // Phase 1: Probe for already-running Crawli daemons on ports 9051-9054
-        let candidate_ports: Vec<u16> = (9051..=9054).collect();
+        // Phase 1: Probe for already-running Crawli daemons on ports 9051-9070
+        let candidate_ports: Vec<u16> = (9051..=9070).collect();
         for &port in &candidate_ports {
             if !is_port_available(port) {
                 // Port is in use — likely a running Tor daemon
@@ -995,6 +992,15 @@ pub async fn start_download(
     let sniff_client = stream_download_client(is_onion, primary_port)?;
     let probe = probe_target(&sniff_client, &url, &app).await?;
     let range_mode = probe.supports_ranges;
+
+    if probe.content_length > 0 {
+        if let Ok(meta) = std::fs::metadata(&output_target) {
+            if meta.len() == probe.content_length {
+                logger.log(&app, format!("[✓] Smart Skip: File already completes locally ({} bytes).", probe.content_length));
+                return Ok(());
+            }
+        }
+    }
 
     let effective_circuits = if range_mode {
         requested_circuits
@@ -1093,7 +1099,9 @@ pub async fn start_download(
         let _ = fs::remove_file(&state_file_path);
     }
 
-    let (tx, mut rx) = mpsc::channel::<WriteMsg>(10_000);  // 10K buffer prevents circuit back-pressure
+    let ring_buffer = Arc::new(crossbeam_queue::ArrayQueue::<WriteMsg>::new(10_000));
+    let tx = Arc::clone(&ring_buffer);
+    let rx = Arc::clone(&ring_buffer);
     let state_for_writer = if range_mode {
         Some((state.clone(), state_file_path.clone()))
     } else {
@@ -1103,30 +1111,75 @@ pub async fn start_download(
     let writer_handle = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut active_filepath = String::new();
         let mut active_file: Option<File> = None;
+        let mut active_mmap: Option<memmap2::MmapMut> = None;
         let mut local_state = state_for_writer;
         let mut last_flush = Instant::now();
         let mut pieces_since_flush = 0u32; // Throttle state saves
         let mut last_write_end: u64 = u64::MAX; // Phase 4.5: track for write coalescing
 
-        while let Some(msg) = rx.blocking_recv() {
+        loop {
+            let msg = match rx.pop() {
+                Some(m) => m,
+                None => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+            };
+            if msg.chunk_id == usize::MAX && msg.close_file {
+                if let Some(mmap) = active_mmap.as_mut() {
+                    let _ = mmap.flush();
+                }
+                break; // EOF signal stops lock-free background writer
+            }
             let mut should_flush = false;
 
             if !msg.data.is_empty() {
                 if active_filepath != msg.filepath || active_file.is_none() {
+                    if let Some(mmap) = active_mmap.as_mut() {
+                        let _ = mmap.flush();
+                    }
+                    active_mmap = None;
+
                     if let Some(dir) = Path::new(&msg.filepath).parent() {
                         fs::create_dir_all(dir)?;
                     }
                     let mut opts = OpenOptions::new();
-                    opts.write(true).create(true).truncate(false);
+                    // Maps require Read+Write
+                    opts.read(true).write(true).create(true).truncate(false);
                     crate::io_vanguard::apply_direct_io(&mut opts);
                     let file = opts.open(&msg.filepath)?;
                     crate::io_vanguard::post_open_config(&file);
+                    
+                    if let Some((st, _)) = &local_state {
+                        if st.content_length > 0 {
+                            // Phase 7: HFT Memory-Mapped Virtual Disk (HDD compatibility)
+                            let _ = file.set_len(st.content_length);
+                            if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(&file) } {
+                                active_mmap = Some(m);
+                            }
+                        }
+                    }
+
                     active_filepath = msg.filepath.clone();
                     active_file = Some(file);
                     last_write_end = u64::MAX; // Reset on new file
                 }
 
-                if let Some(file) = active_file.as_mut() {
+                if let Some(mmap) = active_mmap.as_mut() {
+                    let start = msg.offset as usize;
+                    let end = start + msg.data.len();
+                    if end <= mmap.len() {
+                        // Phase 7: Zero-Copy ram write!
+                        mmap[start..end].copy_from_slice(&msg.data);
+                    } else if let Some(file) = active_file.as_mut() {
+                        // Fallback if out-of-bounds mapping
+                        if msg.offset != last_write_end {
+                            file.seek(SeekFrom::Start(msg.offset))?;
+                        }
+                        file.write_all(&msg.data)?;
+                        last_write_end = msg.offset + msg.data.len() as u64;
+                    }
+                } else if let Some(file) = active_file.as_mut() {
                     // Phase 4.5: Write coalescing — skip seek if writes are sequential
                     if msg.offset != last_write_end {
                         file.seek(SeekFrom::Start(msg.offset))?;
@@ -1151,6 +1204,9 @@ pub async fn start_download(
             if last_flush.elapsed() >= Duration::from_secs(5) {
                 should_flush = true;
                 last_flush = Instant::now();
+                if let Some(mmap) = active_mmap.as_mut() {
+                    let _ = mmap.flush_async();
+                }
             }
 
             if msg.close_file {
@@ -1335,7 +1391,7 @@ pub async fn start_download(
         let circuit_scorer = Arc::new(CircuitScorer::new(tournament_pool));
 
         // Phase 4.4: AIMD concurrency controller
-        let aimd = Arc::new(AimdController::new(scaled_circuits, effective_circuits));
+        let aimd = Arc::new(BbrController::new(scaled_circuits, effective_circuits));
 
         let _ = app.emit(
             "log",
@@ -1764,13 +1820,20 @@ pub async fn start_download(
                             Ok(Ok(resp)) => {
                                 // Reset global fail counter on success
                                 task_server_fails.store(0, Ordering::Relaxed);
-                                task_aimd.on_success(); // Phase 4.4
+                                task_aimd.on_success_blind(); // Phase 4.4
                                 resp
                             }
-                            Ok(Err(_err)) => {
+                            Ok(Err(err)) => {
                                 stalls += 1;
                                 task_aimd.on_reject(); // Phase 4.4
                                 let fails = task_server_fails.fetch_add(1, Ordering::Relaxed);
+                                
+                                if err.is_connect() || err.is_request() {
+                                    let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Circuit {} connection reset. Blasting NEWNYM to Daemon {}...", circuit_id, task_daemon_port));
+                                    let port = task_daemon_port as u16;
+                                    tokio::spawn(async move { let _ = crate::tor::request_newnym(port).await; });
+                                }
+
                                 if stalls > MAX_STALL_RETRIES {
                                     let _ = task_app.emit("log", format!("[↻] Supervisor self-healing: Circuit {} rejected on piece {}. Rebuilding identity...", circuit_id, piece_idx));
                                     circuit_client = range_download_client(task_is_onion, task_daemon_port, circuit_id + 10000 + stalls).unwrap_or(circuit_client.clone());
@@ -1802,12 +1865,22 @@ pub async fn start_download(
                             }
                         };
 
-                        if response.status() != StatusCode::PARTIAL_CONTENT
-                            && response.status() != StatusCode::OK
+                        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+                            && response.status() != reqwest::StatusCode::OK
                         {
                             stalls += 1;
                             task_server_fails.fetch_add(1, Ordering::Relaxed);
                             task_aimd.on_reject(); // Phase 4.4: bad status = server pushback
+                            
+                            let status = response.status();
+                            if status == reqwest::StatusCode::TOO_MANY_REQUESTS 
+                                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE 
+                            {
+                                let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Circuit {} hit HTTP {}. Blasting NEWNYM to Daemon {}...", circuit_id, status, task_daemon_port));
+                                let port = task_daemon_port as u16;
+                                tokio::spawn(async move { let _ = crate::tor::request_newnym(port).await; });
+                            }
+
                             if stalls > MAX_STALL_RETRIES {
                                 let _ = task_app.emit("log", format!("[↻] Supervisor self-healing: Circuit {} bad status on piece {}. Rebuilding identity...", circuit_id, piece_idx));
                                 circuit_client = range_download_client(task_is_onion, task_daemon_port, circuit_id + 10000 + stalls).unwrap_or(circuit_client.clone());
@@ -1847,20 +1920,16 @@ pub async fn start_download(
                                     stalls = 0;
 
                                     let len = chunk.len() as u64;
-                                    if task_tx
-                                        .send(WriteMsg {
-                                            filepath: task_path.clone(),
-                                            offset: current_offset,
-                                            data: chunk,
-                                            close_file: false,
-                                            chunk_id: piece_idx,
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        return TaskOutcome::Failed(
-                                            "writer channel closed unexpectedly".to_string(),
-                                        );
+                                    let mut m = WriteMsg {
+                                        filepath: task_path.clone(),
+                                        offset: current_offset,
+                                        data: chunk,
+                                        close_file: false,
+                                        chunk_id: piece_idx,
+                                    };
+                                    while let Err(err) = task_tx.push(m) {
+                                        m = err;
+                                        tokio::task::yield_now().await;
                                     }
 
                                     current_offset = current_offset.saturating_add(len);
@@ -1935,20 +2004,16 @@ pub async fn start_download(
                             ));
                         }
 
-                        if task_tx
-                            .send(WriteMsg {
-                                filepath: task_path.clone(),
-                                offset: 0,
-                                data: bytes::Bytes::new(),
-                                close_file: true,
-                                chunk_id: piece_idx,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return TaskOutcome::Failed(
-                                "writer channel closed unexpectedly".to_string(),
-                            );
+                        let mut m = WriteMsg {
+                            filepath: task_path.clone(),
+                            offset: 0,
+                            data: bytes::Bytes::new(),
+                            close_file: true,
+                            chunk_id: piece_idx,
+                        };
+                        while let Err(err) = task_tx.push(m) {
+                            m = err;
+                            tokio::task::yield_now().await;
                         }
 
                         if stealing {
@@ -2080,20 +2145,16 @@ pub async fn start_download(
                             retries = 0;
 
                             let len = chunk.len() as u64;
-                            if task_tx
-                                .send(WriteMsg {
-                                    filepath: task_path.clone(),
-                                    offset: current_offset,
-                                    data: chunk,
-                                    close_file: false,
-                                    chunk_id: 0,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                return TaskOutcome::Failed(
-                                    "writer channel closed unexpectedly".to_string(),
-                                );
+                            let mut m = WriteMsg {
+                                filepath: task_path.clone(),
+                                offset: current_offset,
+                                data: chunk,
+                                close_file: false,
+                                chunk_id: 0,
+                            };
+                            while let Err(err) = task_tx.push(m) {
+                                m = err;
+                                tokio::task::yield_now().await;
                             }
 
                             current_offset = current_offset.saturating_add(len);
@@ -2128,20 +2189,16 @@ pub async fn start_download(
                         }
                         Ok(None) => {
                             if current_offset >= total_hint && total_hint > 0 {
-                                if task_tx
-                                    .send(WriteMsg {
-                                        filepath: task_path.clone(),
-                                        offset: 0,
-                                        data: bytes::Bytes::new(),
-                                        close_file: true,
-                                        chunk_id: 0,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    return TaskOutcome::Failed(
-                                        "writer channel closed unexpectedly".to_string(),
-                                    );
+                                let mut m = WriteMsg {
+                                    filepath: task_path.clone(),
+                                    offset: 0,
+                                    data: bytes::Bytes::new(),
+                                    close_file: true,
+                                    chunk_id: 0,
+                                };
+                                while let Err(err) = task_tx.push(m) {
+                                    m = err;
+                                    tokio::task::yield_now().await;
                                 }
 
                                 let elapsed = circuit_start.elapsed().as_secs_f64();
@@ -2203,7 +2260,7 @@ pub async fn start_download(
         });
     }
 
-    drop(tx);
+    // drop(tx); // Removed because ArrayQueue uses EOF poison pill
 
     let mut interruption: Option<&'static str> = None;
     let mut failure: Option<String> = None;
@@ -2234,6 +2291,19 @@ pub async fn start_download(
     }
 
     run_flag.store(false, Ordering::Relaxed);
+    
+    // Poison pill to shut down the lock-free background writer
+    let mut eof = WriteMsg {
+        filepath: String::new(),
+        offset: 0,
+        data: bytes::Bytes::new(),
+        close_file: true,
+        chunk_id: usize::MAX,
+    };
+    while let Err(err) = tx.push(eof) {
+        eof = err;
+        std::hint::spin_loop();
+    }
     let _ = speed_handle.await;
 
     match writer_handle.await {

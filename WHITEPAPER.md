@@ -104,6 +104,31 @@ To maximize reliability and minimize operating cost for distribution, we evaluat
 - Keep Playwright UI smoke checks as release gate candidates for future hardening.
 - Publish only tagged releases (`v*`) for immutable forensic tool provenance.
 
+## 7. Overlay Integrity Validation Tournament (UI Stability)
+
+To harden the desktop interface against accidental layout regressions during rapid iteration, we evaluated three options:
+
+1. **Playwright Overlay Integrity Harness with Geometry Assertions (Winner)**
+   - Click every rendered control, capture before/after screenshots, and assert content container geometry remains stable.
+   - Emits pass/fail matrix + root cause and stores run artifacts for forensic diffing.
+2. **Manual visual QA only**
+   - Fast for quick checks but too error-prone for full click-surface coverage.
+3. **Static lint-only UI checks**
+   - Useful for syntax but cannot detect runtime overlay shifts or interaction-induced drift.
+
+### Winner Rationale
+
+- Best signal-to-cost ratio for real UI integrity failures.
+- Deterministic fixture mode allows full click-surface coverage in CI without native backend dependencies.
+- Produces auditable visual artifacts for each control interaction.
+
+### Applied Hardening
+
+- Added fixture-driven VFS mode (`?fixture=vfs`) for deterministic browser-based UI coverage.
+- Added `data-testid` markers to interactive controls for stable automation targeting.
+- Added CI workflow (`.github/workflows/overlay-integrity.yml`) to continuously enforce overlay integrity.
+- Updated Cancel semantics to be always available and safe in idle/preview mode (no-op acknowledgement when no native workers exist).
+
 ---
 
 > *Crawli Engine 3.0 redefines dark web forensics. By leveraging the theoretical limits of modern computer science—from game engine architecture to aerospace telemetry—Crawli acts as an unstoppable, fault-oblivious force against the most hostile networks.*

@@ -17,7 +17,7 @@ impl KalmanFilter {
     pub fn new(q: f64, r: f64, initial_value: f64) -> Self {
         Self {
             x: initial_value,
-            p: 1.0,  // Initial uncertainty
+            p: 1.0, // Initial uncertainty
             q,
             r,
         }

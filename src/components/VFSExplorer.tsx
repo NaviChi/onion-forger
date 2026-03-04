@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronRight, ChevronDown, Folder, FileIcon, DownloadCloud, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, Folder, FileIcon, DownloadCloud } from 'lucide-react';
+import { VibeLoader } from './VibeLoader';
+import { VFS_FIXTURE_ENTRIES, fixtureParentPath, isVfsFixtureMode, normalizeVfsPath } from "../fixtures/vfsFixture";
 
 export type EntryType = 'File' | 'Folder';
 
@@ -58,8 +60,60 @@ export function VFSExplorer({
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [isInitialLoading, setIsInitialLoading] = useState(true);
     const isTauriRuntime = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
+    const isFixtureMode = !isTauriRuntime && isVfsFixtureMode();
 
     const loadChildren = async (parentPath: string, depth: number) => {
+        if (isFixtureMode) {
+            const parent = normalizeVfsPath(parentPath);
+            const children = VFS_FIXTURE_ENTRIES
+                .filter((entry) => fixtureParentPath(entry.path) === parent)
+                .map((entry) => ({ ...entry, path: normalizeVfsPath(entry.path) }))
+                .sort((a, b) => {
+                    if (a.entry_type !== b.entry_type) {
+                        return a.entry_type === "Folder" ? -1 : 1;
+                    }
+                    return a.path.localeCompare(b.path);
+                });
+
+            setNodes((prev) => {
+                const next = { ...prev };
+                const childIds: string[] = [];
+
+                children.forEach((child) => {
+                    const name = child.path.split('/').pop() || child.path;
+                    if (!next[child.path]) {
+                        next[child.path] = {
+                            id: child.path,
+                            name,
+                            type: child.entry_type,
+                            size: child.size_bytes,
+                            raw_url: child.raw_url,
+                            depth,
+                            isExpanded: false,
+                            childrenLoaded: false,
+                            isLoading: false,
+                            childrenPaths: []
+                        };
+                    }
+                    childIds.push(child.path);
+                });
+
+                if (parentPath === '') {
+                    setRootPaths(childIds);
+                } else if (next[parentPath]) {
+                    next[parentPath] = {
+                        ...next[parentPath],
+                        isLoading: false,
+                        childrenLoaded: true,
+                        childrenPaths: childIds
+                    };
+                }
+                return next;
+            });
+            setIsInitialLoading(false);
+            return;
+        }
+
         if (!isTauriRuntime) {
             if (parentPath === "") {
                 setRootPaths([]);
@@ -127,7 +181,7 @@ export function VFSExplorer({
     useEffect(() => {
         loadChildren('', 0);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [triggerRefresh, isTauriRuntime]);
+    }, [triggerRefresh, isTauriRuntime, isFixtureMode]);
 
     const toggleNode = useCallback(async (id: string) => {
         const node = nodes[id];
@@ -225,7 +279,7 @@ export function VFSExplorer({
     if (isInitialLoading) {
         return (
             <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', gap: '8px' }}>
-                <Loader2 size={18} className="aura-spin" /> Indexing Database Streams...
+                <VibeLoader size={18} /> Indexing Database Streams...
             </div>
         );
     }
@@ -256,6 +310,7 @@ export function VFSExplorer({
                         <div
                             key={node.id}
                             className={`vfs-row ${selectedIds.has(node.id) ? 'selected' : ''}`}
+                            data-testid={`vfs-row-${encodeURIComponent(node.id)}`}
                             style={{
                                 position: 'absolute',
                                 top: 0,
@@ -272,6 +327,7 @@ export function VFSExplorer({
                                     type="checkbox"
                                     checked={selectedIds.has(node.id)}
                                     onChange={() => toggleSelection(node.id)}
+                                    data-testid={`vfs-select-${encodeURIComponent(node.id)}`}
                                     style={{ accentColor: 'var(--accent-primary)', width: '14px', height: '14px', cursor: 'pointer' }}
                                 />
                             </div>
@@ -279,10 +335,11 @@ export function VFSExplorer({
                             <div
                                 className="vfs-toggle"
                                 onClick={() => node.type === 'Folder' && toggleNode(node.id)}
+                                data-testid={`vfs-toggle-${encodeURIComponent(node.id)}`}
                                 style={{ visibility: node.type === 'Folder' ? 'visible' : 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                             >
                                 {node.isLoading ? (
-                                    <Loader2 size={12} className="aura-spin" style={{ color: 'var(--accent-primary)' }} />
+                                    <VibeLoader size={12} variant="accent" />
                                 ) : node.isExpanded ? (
                                     <ChevronDown size={14} />
                                 ) : (
@@ -340,6 +397,7 @@ export function VFSExplorer({
                                             <button
                                                 className="vfs-download-btn"
                                                 onClick={() => onDownload(node.raw_url, node.id)}
+                                                data-testid={`vfs-download-${encodeURIComponent(node.id)}`}
                                                 style={{ display: 'flex', alignItems: 'center', gap: '4px', opacity: 0, transition: 'opacity 0.2s', padding: '4px 8px' }}
                                             >
                                                 <DownloadCloud size={14} /> DL

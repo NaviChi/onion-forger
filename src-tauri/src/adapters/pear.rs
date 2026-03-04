@@ -1,8 +1,8 @@
-use tauri::AppHandle;
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use crate::adapters::{CrawlerAdapter, SiteFingerprint, FileEntry, EntryType};
+use crate::adapters::{CrawlerAdapter, FileEntry, SiteFingerprint};
 use crate::frontier::CrawlerFrontier;
+use std::sync::Arc;
+use tauri::AppHandle;
+use tokio::sync::mpsc;
 
 #[derive(Default)]
 pub struct PearAdapter;
@@ -10,24 +10,26 @@ pub struct PearAdapter;
 #[async_trait::async_trait]
 impl CrawlerAdapter for PearAdapter {
     async fn can_handle(&self, fingerprint: &SiteFingerprint) -> bool {
-        fingerprint.url.contains("m3wwhkus4dxbnxbtihexlyd2cv63qrvex6jiebc4vqe22kg2z3udebid.onion")
+        fingerprint
+            .url
+            .contains("m3wwhkus4dxbnxbtihexlyd2cv63qrvex6jiebc4vqe22kg2z3udebid.onion")
             || fingerprint.body.to_lowercase().contains("pear ransomware")
     }
 
     async fn crawl(
-        &self, 
-        current_url: &str, 
-        frontier: Arc<CrawlerFrontier>, 
-        app: AppHandle
+        &self,
+        current_url: &str,
+        frontier: Arc<CrawlerFrontier>,
+        app: AppHandle,
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
-        
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+        let queue = Arc::new(crossbeam_queue::SegQueue::new());
         let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        
-        tx.send(current_url.to_string())?;
+
+        queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
-        
+
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -56,71 +58,96 @@ impl CrawlerAdapter for PearAdapter {
             }
         });
 
-        let max_concurrent = 120;
-        let mut active_tasks = 0;
+        let max_concurrent = 120; // Massive worker-stealer parallel pool
         let mut workers = tokio::task::JoinSet::new();
 
-        let base_url = current_url.to_string();
+        let _base_url = current_url.to_string();
 
-        loop {
-            if frontier.is_cancelled() {
-                app.emit("crawl_log", "[System] Crawl cancelled by user.".to_string()).unwrap_or_default();
-                break;
-            }
-            
-            while active_tasks < max_concurrent {
-                if let Ok(next_url) = rx.try_recv() {
-                    let f = frontier.clone();
-                    let tx_clone = tx.clone();
-                    let ui_tx_clone = ui_tx.clone();
-                    let discovered_ref = all_discovered_entries.clone();
-                    let current_url_clone = base_url.clone();
-                    let pending_clone = pending.clone();
+        for _ in 0..max_concurrent {
+            let f = frontier.clone();
+            let q_clone = queue.clone();
+            let ui_tx_clone = ui_tx.clone();
+            let discovered_ref = all_discovered_entries.clone();
+            let pending_clone = pending.clone();
 
-                    active_tasks += 1;
-                    workers.spawn(async move {
-                        if f.is_cancelled() { 
-                            pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            return; 
+            workers.spawn(async move {
+                loop {
+                    if f.is_cancelled() { break; }
+
+                    let next_url = match q_clone.pop() {
+                        Some(url) => url,
+                        None => {
+                            if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
                         }
-                        
-                        let _permit = f.politeness_semaphore.acquire().await.ok();
-                        let (cid, _client) = f.get_client();
-                        
-                        let start_time = std::time::Instant::now();
-                        // Emulate network latency
-                        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-                        f.record_success(cid, 2048, start_time.elapsed().as_millis() as u64);
-                        
-                        let mut new_files = Vec::new();
-                        
-                        if next_url == current_url_clone {
-                            if f.active_options.listing {
-                                new_files.push(FileEntry {
-                                    path: "/sdeb.org_dump".to_string(),
-                                    size_bytes: None,
-                                    entry_type: EntryType::Folder,
-                                    raw_url: format!("{}/files", current_url_clone),
-                                });
+                    };
 
-                                let file_size = if f.active_options.sizes { Some(214 * 1024 * 1024) } else { None };
+                    let _permit = f.politeness_semaphore.acquire().await.ok();
+                    let (_cid, _client) = f.get_client();
 
-                                new_files.push(FileEntry {
-                                    path: "/sdeb.org_dump/archive_part1.zip".to_string(),
-                                    size_bytes: file_size, // ~214 MB
-                                    entry_type: EntryType::File,
-                                    raw_url: format!("{}/files/archive_part1.zip", current_url_clone),
-                                });
+                    let mut new_files = Vec::new();
 
-                                new_files.push(FileEntry {
-                                    path: "/sdeb.org_dump/database.sql".to_string(),
-                                    size_bytes: if f.active_options.sizes { Some(450 * 1024 * 1024) } else { None }, // ~450 MB
-                                    entry_type: EntryType::File,
-                                    raw_url: format!("{}/files/database.sql", current_url_clone),
-                                });
+                    let start_time = std::time::Instant::now();
+                        let mut html = String::new();
+                        // active_cid is just used inside the loop
+
+                        for _attempt in 0..4 {
+                            let (current_cid, current_client) = f.get_client();
+                            html = match tokio::time::timeout(std::time::Duration::from_secs(45), current_client.get(&next_url).send()).await {
+                                Ok(Ok(resp)) if resp.status().is_success() => match resp.text().await {
+                                    Ok(body) => body,
+                                    Err(_) => String::new(),
+                                },
+                                Ok(Ok(resp)) => {
+                                    if resp.status() == 404 { break; }
+                                    String::new()
+                                }
+                                _ => String::new(),
+                            };
+
+                            if !html.is_empty() {
+                                f.record_success(current_cid, html.len() as u64, start_time.elapsed().as_millis() as u64);
+                                break;
+                            } else {
+                                f.record_failure(current_cid);
+                            }
+                        }
+
+                        if !html.is_empty() {
+                            let parsed_files = crate::adapters::autoindex::parse_autoindex_html(&html);
+                            
+                            for doc in &parsed_files {
+                                let base_clean = next_url.trim_end_matches('/');
+                                let absolute_url = if doc.0.starts_with("http") {
+                                    doc.0.clone()
+                                } else if doc.0.starts_with('/') {
+                                    if let Ok(u) = url::Url::parse(&base_clean) {
+                                        format!("{}://{}{}", u.scheme(), u.host_str().unwrap_or(""), doc.0)
+                                    } else {
+                                        format!("{}{}", base_clean, doc.0)
+                                    }
+                                } else {
+                                    format!("{}/{}", base_clean, doc.0)
+                                };
                                 
-                                pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                tx_clone.send(format!("{}/files", current_url_clone)).unwrap_or_default();
+                                let file_entry = crate::adapters::FileEntry {
+                                    path: format!("/{}", doc.0),
+                                    size_bytes: doc.1,
+                                    entry_type: if doc.2 { crate::adapters::EntryType::Folder } else { crate::adapters::EntryType::File },
+                                    raw_url: absolute_url.clone(),
+                                };
+                                
+                                new_files.push(file_entry);
+
+                                if doc.2 {
+                                    if absolute_url.matches('/').count() < 12 && f.mark_visited(&absolute_url) {
+                                        pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        q_clone.push(absolute_url);
+                                    }
+                                }
                             }
                         }
 
@@ -132,24 +159,14 @@ impl CrawlerAdapter for PearAdapter {
                             let mut lock = discovered_ref.lock().await;
                             lock.extend(new_files);
                         }
-                        
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    });
-                } else {
-                    break;
-                }
-            }
 
-            if let Some(_res) = workers.join_next().await {
-                active_tasks -= 1;
-            } else {
-                if pending.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                    break; 
+                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                tokio::task::yield_now().await;
-            }
+            });
         }
-        
+
+        while let Some(_) = workers.join_next().await {}
+
         drop(ui_tx);
         let mut final_results = all_discovered_entries.lock().await;
         Ok(final_results.drain(..).collect())

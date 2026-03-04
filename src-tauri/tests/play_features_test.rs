@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 /// Play Ransomware — 10-Minute Feature Validation Suite
 /// Tests every recommendation against the real Play URL structure:
 ///   http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp
@@ -13,13 +14,11 @@
 ///   8. Resume safety / no-overwrite
 ///   9. Sustained load simulation (concurrent workers x 120)
 ///  10. Edge cases: empty entries, deeply nested paths, unicode filenames
-
 use std::sync::Arc;
 use std::time::Instant;
-use std::path::PathBuf;
 
+use crawli_lib::adapters::{AdapterRegistry, EntryType, FileEntry, SiteFingerprint};
 use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
-use crawli_lib::adapters::{AdapterRegistry, SiteFingerprint, FileEntry, EntryType};
 use crawli_lib::path_utils;
 use reqwest::header::HeaderMap;
 
@@ -59,14 +58,22 @@ async fn feature1_dynamic_html_parsing() {
     // Use scraper-free line-based parser (same logic as play.rs)
     let parsed = parse_autoindex_entries(&html);
 
-    assert_eq!(parsed.len(), 11, "Should parse exactly 11 entries from Play HTML");
+    assert_eq!(
+        parsed.len(),
+        11,
+        "Should parse exactly 11 entries from Play HTML"
+    );
 
     for (i, (name, size)) in parsed.iter().enumerate() {
         let expected_name = format!("2 Sally Personal.part{:02}.rar", i + 1);
         assert_eq!(name, &expected_name, "Filename mismatch at index {}", i);
 
         if i < 10 {
-            assert_eq!(*size, Some(524288000), "Parts 1-10 should be 524288000 bytes");
+            assert_eq!(
+                *size,
+                Some(524288000),
+                "Parts 1-10 should be 524288000 bytes"
+            );
         } else {
             assert_eq!(*size, Some(60844542), "Part 11 should be 60844542 bytes");
         }
@@ -74,10 +81,16 @@ async fn feature1_dynamic_html_parsing() {
     }
 
     // Verify ../  was skipped
-    assert!(!parsed.iter().any(|(name, _)| name.contains("..")), "Parent dir link should be filtered");
+    assert!(
+        !parsed.iter().any(|(name, _)| name.contains("..")),
+        "Parent dir link should be filtered"
+    );
 
     let total: u64 = parsed.iter().filter_map(|(_, s)| *s).sum();
-    println!("  📊 Total parsed size: {:.2} GB", total as f64 / 1_073_741_824.0);
+    println!(
+        "  📊 Total parsed size: {:.2} GB",
+        total as f64 / 1_073_741_824.0
+    );
 }
 
 #[tokio::test]
@@ -136,7 +149,10 @@ async fn feature2_url_decoding() {
 
     // Play-specific filename decoding
     let cases = vec![
-        ("2%20Sally%20Personal.part01.rar", "2 Sally Personal.part01.rar"),
+        (
+            "2%20Sally%20Personal.part01.rar",
+            "2 Sally Personal.part01.rar",
+        ),
         ("file%20with%20spaces.zip", "file with spaces.zip"),
         ("normal-file.txt", "normal-file.txt"),
         ("%E2%9C%93%20verified.pdf", "✓ verified.pdf"),
@@ -144,7 +160,7 @@ async fn feature2_url_decoding() {
         ("100%25+complete.log", "100% complete.log"),
         ("unchanged", "unchanged"),
         ("", ""),
-        ("%00null%00byte", "\0null\0byte"),  // edge: null bytes
+        ("%00null%00byte", "\0null\0byte"), // edge: null bytes
     ];
 
     for (encoded, expected) in &cases {
@@ -176,8 +192,15 @@ async fn feature3_head_probing_simulation() {
     let frontier = CrawlerFrontier::new(
         None,
         "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp".to_string(),
-        4, true, vec![9051, 9052, 9053, 9054],
-        CrawlOptions { listing: true, sizes: true, download: false, circuits: None },
+        4,
+        true,
+        vec![9051, 9052, 9053, 9054],
+        CrawlOptions {
+            listing: true,
+            sizes: true,
+            download: false,
+            circuits: None,
+        },
     );
     let (_cid, client) = frontier.get_client();
 
@@ -185,12 +208,17 @@ async fn feature3_head_probing_simulation() {
     let start = Instant::now();
     match client.head("https://httpbin.org/bytes/1024").send().await {
         Ok(resp) => {
-            let content_length = resp.headers()
+            let content_length = resp
+                .headers()
                 .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            println!("  ✅ HEAD probe returned Content-Length: {:?} in {:?}", content_length, start.elapsed());
-        },
+            println!(
+                "  ✅ HEAD probe returned Content-Length: {:?} in {:?}",
+                content_length,
+                start.elapsed()
+            );
+        }
         Err(_) => {
             // Network not available — that's fine for a unit test
             println!("  ⚠️  HEAD probe unavailable (no network) — testing logic path only");
@@ -201,8 +229,15 @@ async fn feature3_head_probing_simulation() {
     let frontier_no_sizes = CrawlerFrontier::new(
         None,
         "http://test.onion".to_string(),
-        4, true, vec![9051, 9052, 9053, 9054],
-        CrawlOptions { listing: true, sizes: false, download: false, circuits: None },
+        4,
+        true,
+        vec![9051, 9052, 9053, 9054],
+        CrawlOptions {
+            listing: true,
+            sizes: false,
+            download: false,
+            circuits: None,
+        },
     );
     assert!(!frontier_no_sizes.active_options.sizes);
     println!("  ✅ sizes=false correctly propagated — HEAD probing will be skipped");
@@ -219,7 +254,7 @@ async fn feature4_folder_entry_emission() {
     println!("══════════════════════════════════════════");
 
     let dir = path_utils::extract_target_dirname(
-        "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp"
+        "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp",
     );
     assert_eq!(dir, "FALOp");
     println!("  ✅ extract_target_dirname → '{}'", dir);
@@ -232,7 +267,8 @@ async fn feature4_folder_entry_emission() {
         path: format!("/{}", dir),
         size_bytes: None,
         entry_type: EntryType::Folder,
-        raw_url: "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp".to_string(),
+        raw_url: "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp"
+            .to_string(),
     });
 
     // File entries
@@ -241,22 +277,37 @@ async fn feature4_folder_entry_emission() {
             path: format!("/{}/2 Sally Personal.part{:02}.rar", dir, i),
             size_bytes: Some(if i == 11 { 60844542 } else { 524288000 }),
             entry_type: EntryType::File,
-            raw_url: format!("http://play.onion/FALOp/2%20Sally%20Personal.part{:02}.rar", i),
+            raw_url: format!(
+                "http://play.onion/FALOp/2%20Sally%20Personal.part{:02}.rar",
+                i
+            ),
         });
     }
 
-    assert_eq!(entries.len(), 12, "Should have 1 folder + 11 files = 12 entries");
+    assert_eq!(
+        entries.len(),
+        12,
+        "Should have 1 folder + 11 files = 12 entries"
+    );
     assert_eq!(entries[0].entry_type, EntryType::Folder);
     assert_eq!(entries[0].path, "/FALOp");
-    println!("  ✅ Total entries: {} (1 folder + 11 files)", entries.len());
+    println!(
+        "  ✅ Total entries: {} (1 folder + 11 files)",
+        entries.len()
+    );
 
     // Scaffold to disk and verify folder exists
     let tmp_dir = std::env::temp_dir().join("onionforge_folder_test");
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-    let count = test_scaffold(&entries, tmp_dir.to_str().unwrap()).await.unwrap();
+    let count = test_scaffold(&entries, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     assert_eq!(count, 12);
     assert!(tmp_dir.join("FALOp").is_dir(), "FALOp folder should exist");
-    assert!(tmp_dir.join("FALOp/.gitkeep").exists(), "FALOp/.gitkeep should exist");
+    assert!(
+        tmp_dir.join("FALOp/.gitkeep").exists(),
+        "FALOp/.gitkeep should exist"
+    );
     println!("  ✅ FALOp/ folder created with .gitkeep marker");
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -274,8 +325,14 @@ async fn feature5_filename_sanitization() {
 
     let cases = vec![
         // (input, expected)
-        ("/FALOp/2%20Sally%20Personal.part01.rar", "FALOp/2 Sally Personal.part01.rar"),
-        ("/dir/file<with>bad:chars?.txt", "dir/file_with_bad_chars_.txt"),
+        (
+            "/FALOp/2%20Sally%20Personal.part01.rar",
+            "FALOp/2 Sally Personal.part01.rar",
+        ),
+        (
+            "/dir/file<with>bad:chars?.txt",
+            "dir/file_with_bad_chars_.txt",
+        ),
         ("/CON/NUL/test.txt", "_CON/_NUL/test.txt"),
         ("///multiple///slashes///", "multiple/slashes"),
         ("/path/trailing.dot.", "path/trailing.dot"),
@@ -287,7 +344,11 @@ async fn feature5_filename_sanitization() {
 
     for (input, expected) in &cases {
         let result = path_utils::sanitize_path(input);
-        assert_eq!(&result, expected, "Sanitize '{}' failed: got '{}'", input, result);
+        assert_eq!(
+            &result, expected,
+            "Sanitize '{}' failed: got '{}'",
+            input, result
+        );
         println!("  ✅ {} → {}", input, result);
     }
 }
@@ -333,12 +394,17 @@ async fn feature6_full_scaffold_sanitized() {
         },
     ];
 
-    let count = test_scaffold(&entries, tmp_dir.to_str().unwrap()).await.unwrap();
+    let count = test_scaffold(&entries, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     assert_eq!(count, 4);
 
     // URL-decoded filename on disk
     let decoded_file = tmp_dir.join("FALOp/2 Sally Personal.part01.rar");
-    assert!(decoded_file.exists(), "URL-decoded file should exist on disk");
+    assert!(
+        decoded_file.exists(),
+        "URL-decoded file should exist on disk"
+    );
     println!("  ✅ '%20' → space: {}", decoded_file.display());
 
     // Sanitized illegal chars: <with> becomes _with_, bad:chars? becomes bad_chars_
@@ -346,7 +412,11 @@ async fn feature6_full_scaffold_sanitized() {
     // But the trailing dot rule might strip the trailing period. Let's check what actually lands on disk:
     let sanitized_name = path_utils::sanitize_path("/FALOp/file<with>bad?chars.rar");
     let sanitized_file = tmp_dir.join(&sanitized_name);
-    assert!(sanitized_file.exists(), "Sanitized file should exist at: {}", sanitized_file.display());
+    assert!(
+        sanitized_file.exists(),
+        "Sanitized file should exist at: {}",
+        sanitized_file.display()
+    );
     println!("  ✅ Illegal chars sanitized: {}", sanitized_name);
 
     // Windows reserved name protection
@@ -357,8 +427,14 @@ async fn feature6_full_scaffold_sanitized() {
     // Verify meta sidecar includes original_path
     let meta = tmp_dir.join("FALOp/2 Sally Personal.part01.rar.onionforge.meta");
     let content = tokio::fs::read_to_string(&meta).await.unwrap();
-    assert!(content.contains("original_path="), "Meta should include original_path");
-    assert!(content.contains("size=524288000"), "Meta should include correct size");
+    assert!(
+        content.contains("original_path="),
+        "Meta should include original_path"
+    );
+    assert!(
+        content.contains("size=524288000"),
+        "Meta should include correct size"
+    );
     println!("  ✅ Meta sidecar verified with original_path + size");
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -377,21 +453,29 @@ async fn feature7_manifest_decoded_paths() {
     let tmp_dir = std::env::temp_dir().join("onionforge_manifest_test");
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 
-    let entries = vec![
-        FileEntry {
-            path: "/FALOp/2%20Sally%20Personal.part01.rar".to_string(),
-            size_bytes: Some(524288000),
-            entry_type: EntryType::File,
-            raw_url: "http://play.onion/FALOp/2%20Sally%20Personal.part01.rar".to_string(),
-        },
-    ];
+    let entries = vec![FileEntry {
+        path: "/FALOp/2%20Sally%20Personal.part01.rar".to_string(),
+        size_bytes: Some(524288000),
+        entry_type: EntryType::File,
+        raw_url: "http://play.onion/FALOp/2%20Sally%20Personal.part01.rar".to_string(),
+    }];
 
-    test_scaffold(&entries, tmp_dir.to_str().unwrap()).await.unwrap();
+    test_scaffold(&entries, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
 
-    let manifest = tokio::fs::read_to_string(tmp_dir.join("_onionforge_manifest.txt")).await.unwrap();
+    let manifest = tokio::fs::read_to_string(tmp_dir.join("_onionforge_manifest.txt"))
+        .await
+        .unwrap();
     // Manifest should show decoded paths for human readability
-    assert!(manifest.contains("2 Sally Personal.part01.rar"), "Manifest should show decoded filename");
-    assert!(manifest.contains("500.00 MB") || manifest.contains("524288000"), "Manifest should show size");
+    assert!(
+        manifest.contains("2 Sally Personal.part01.rar"),
+        "Manifest should show decoded filename"
+    );
+    assert!(
+        manifest.contains("500.00 MB") || manifest.contains("524288000"),
+        "Manifest should show size"
+    );
     println!("  ✅ Manifest shows decoded path: '2 Sally Personal.part01.rar'");
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -410,31 +494,41 @@ async fn feature8_resume_safety() {
     let tmp_dir = std::env::temp_dir().join("onionforge_resume_test2");
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 
-    let entries = vec![
-        FileEntry {
-            path: "/FALOp/test_resume.rar".to_string(),
-            size_bytes: Some(1000),
-            entry_type: EntryType::File,
-            raw_url: "http://play.onion/test_resume.rar".to_string(),
-        },
-    ];
+    let entries = vec![FileEntry {
+        path: "/FALOp/test_resume.rar".to_string(),
+        size_bytes: Some(1000),
+        entry_type: EntryType::File,
+        raw_url: "http://play.onion/test_resume.rar".to_string(),
+    }];
 
     // First scaffold — creates 0-byte placeholder
-    test_scaffold(&entries, tmp_dir.to_str().unwrap()).await.unwrap();
+    test_scaffold(&entries, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     let file_path = tmp_dir.join("FALOp/test_resume.rar");
     assert_eq!(tokio::fs::read(&file_path).await.unwrap().len(), 0);
     println!("  ✅ Step 1: Empty placeholder created");
 
     // Simulate partial download by writing real content
-    tokio::fs::write(&file_path, b"PARTIAL_DOWNLOAD_DATA_12345").await.unwrap();
+    tokio::fs::write(&file_path, b"PARTIAL_DOWNLOAD_DATA_12345")
+        .await
+        .unwrap();
     let size_before = tokio::fs::metadata(&file_path).await.unwrap().len();
-    println!("  ✅ Step 2: Wrote {} bytes of partial download", size_before);
+    println!(
+        "  ✅ Step 2: Wrote {} bytes of partial download",
+        size_before
+    );
 
     // Second scaffold — should NOT overwrite
-    test_scaffold(&entries, tmp_dir.to_str().unwrap()).await.unwrap();
+    test_scaffold(&entries, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     let content = tokio::fs::read(&file_path).await.unwrap();
     assert_eq!(content, b"PARTIAL_DOWNLOAD_DATA_12345");
-    println!("  ✅ Step 3: Re-scaffold preserved existing content ({} bytes)", content.len());
+    println!(
+        "  ✅ Step 3: Re-scaffold preserved existing content ({} bytes)",
+        content.len()
+    );
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
@@ -452,8 +546,15 @@ async fn feature9_sustained_load_120_workers() {
     let frontier = Arc::new(CrawlerFrontier::new(
         None,
         "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp".to_string(),
-        4, true, vec![9051, 9052, 9053, 9054],
-        CrawlOptions { listing: true, sizes: true, download: true, circuits: None },
+        4,
+        true,
+        vec![9051, 9052, 9053, 9054],
+        CrawlOptions {
+            listing: true,
+            sizes: true,
+            download: true,
+            circuits: None,
+        },
     ));
 
     let start = Instant::now();
@@ -466,9 +567,15 @@ async fn feature9_sustained_load_120_workers() {
             let mut discovered = 0u32;
             for i in 0..500u32 {
                 // Simulate URL-encoded filenames
-                let raw = format!("http://play.onion/FALOp/worker_{}/file%20{:04}.rar", worker_id, i);
+                let raw = format!(
+                    "http://play.onion/FALOp/worker_{}/file%20{:04}.rar",
+                    worker_id, i
+                );
                 let decoded = path_utils::url_decode(&raw);
-                let sanitized = path_utils::sanitize_path(&format!("/FALOp/worker_{}/file {:04}.rar", worker_id, i));
+                let sanitized = path_utils::sanitize_path(&format!(
+                    "/FALOp/worker_{}/file {:04}.rar",
+                    worker_id, i
+                ));
 
                 let _client = f.get_client();
                 if f.mark_visited(&raw) {
@@ -490,9 +597,18 @@ async fn feature9_sustained_load_120_workers() {
     let elapsed = start.elapsed();
 
     assert_eq!(total, 60_000, "120 × 500 = 60,000 unique URLs");
-    println!("  ✅ 120 workers × 500 URLs = {} discovered in {:?}", total, elapsed);
-    println!("  📊 Throughput: {:.0} URLs/sec", total as f64 / elapsed.as_secs_f64());
-    println!("  📊 Semaphore permits: {}", frontier.politeness_semaphore.available_permits());
+    println!(
+        "  ✅ 120 workers × 500 URLs = {} discovered in {:?}",
+        total, elapsed
+    );
+    println!(
+        "  📊 Throughput: {:.0} URLs/sec",
+        total as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "  📊 Semaphore permits: {}",
+        frontier.politeness_semaphore.available_permits()
+    );
     println!("  📊 Client pool size: {}", frontier.http_clients.len());
 }
 
@@ -561,7 +677,9 @@ async fn feature10_edge_cases_comprehensive() {
         },
     ];
 
-    let count = test_scaffold(&entries, tmp_dir.to_str().unwrap()).await.unwrap();
+    let count = test_scaffold(&entries, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     // 7 entries minus 1 empty path = 6 written
     assert_eq!(count, 6, "Empty path should be skipped");
     println!("  ✅ 6/7 entries written (1 empty path skipped)");
@@ -585,7 +703,10 @@ async fn feature10_edge_cases_comprehensive() {
 
     // Special-chars-only filename
     let sanitized_special = tmp_dir.join("______");
-    assert!(sanitized_special.exists(), "All-special-char file should exist as underscores");
+    assert!(
+        sanitized_special.exists(),
+        "All-special-char file should exist as underscores"
+    );
     println!("  ✅ All-special-char filename → underscores");
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -610,12 +731,14 @@ async fn full_pipeline_benchmark_all_features() {
     let fp_start = Instant::now();
     let registry = AdapterRegistry::new();
     let fp = SiteFingerprint {
-        url: "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp".to_string(),
+        url: "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp"
+            .to_string(),
         status: 200,
         headers: HeaderMap::new(),
         body: play_realistic_html(),
     };
-    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> = registry.determine_adapter(&fp).await;
+    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> =
+        registry.determine_adapter(&fp).await;
     assert!(adapter.is_some());
     let fp_time = fp_start.elapsed();
 
@@ -647,7 +770,9 @@ async fn full_pipeline_benchmark_all_features() {
 
     // Phase 4: Scaffold to disk
     let scaffold_start = Instant::now();
-    let count = test_scaffold(&entries, tmp_dir.to_str().unwrap()).await.unwrap();
+    let count = test_scaffold(&entries, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     let scaffold_time = scaffold_start.elapsed();
 
     let overall_time = overall_start.elapsed();
@@ -660,14 +785,26 @@ async fn full_pipeline_benchmark_all_features() {
     println!("║  Phase 1: Fingerprint match     {:>14?}   ║", fp_time);
     println!("║  Phase 2: HTML autoindex parse  {:>14?}   ║", parse_time);
     println!("║  Phase 3: URL encode/sanitize   {:>14?}   ║", build_time);
-    println!("║  Phase 4: Scaffold to disk      {:>14?}   ║", scaffold_time);
+    println!(
+        "║  Phase 4: Scaffold to disk      {:>14?}   ║",
+        scaffold_time
+    );
     println!("╠════════════════════════════════════════════════════╣");
-    println!("║  Total pipeline                 {:>14?}   ║", overall_time);
-    println!("║  Adapter matched             {:>17}   ║", adapter.unwrap().name());
+    println!(
+        "║  Total pipeline                 {:>14?}   ║",
+        overall_time
+    );
+    println!(
+        "║  Adapter matched             {:>17}   ║",
+        adapter.unwrap().name()
+    );
     println!("║  HTML entries parsed         {:>17}   ║", parsed.len());
     println!("║  Total entries (incl folder) {:>17}   ║", entries.len());
     println!("║  Items written to disk       {:>17}   ║", count);
-    println!("║  Total indexed size          {:>14.2} GB   ║", total_size as f64 / 1_073_741_824.0);
+    println!(
+        "║  Total indexed size          {:>14.2} GB   ║",
+        total_size as f64 / 1_073_741_824.0
+    );
     println!("╚════════════════════════════════════════════════════╝\n");
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -690,7 +827,9 @@ fn parse_autoindex_entries(html: &str) -> Vec<(String, Option<u64>)> {
                 }
                 let decoded = path_utils::url_decode(raw_href);
                 let clean = decoded.trim_end_matches('/').to_string();
-                if clean.is_empty() { continue; }
+                if clean.is_empty() {
+                    continue;
+                }
 
                 let size = if let Some(after_tag) = line.split("</a>").nth(1) {
                     let tokens: Vec<&str> = after_tag.split_whitespace().collect();
@@ -715,7 +854,9 @@ async fn test_scaffold(entries: &[FileEntry], output_dir: &str) -> anyhow::Resul
 
     for entry in entries.iter() {
         let sanitized = path_utils::sanitize_path(&entry.path);
-        if sanitized.is_empty() { continue; }
+        if sanitized.is_empty() {
+            continue;
+        }
 
         let full_path = base.join(&sanitized);
 
@@ -726,7 +867,7 @@ async fn test_scaffold(entries: &[FileEntry], output_dir: &str) -> anyhow::Resul
                 if !gitkeep.exists() {
                     tokio::fs::write(&gitkeep, b"").await?;
                 }
-            },
+            }
             EntryType::File => {
                 if let Some(parent) = full_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
@@ -735,8 +876,14 @@ async fn test_scaffold(entries: &[FileEntry], output_dir: &str) -> anyhow::Resul
                     tokio::fs::write(&full_path, b"").await?;
                 }
                 let meta_path = PathBuf::from(format!("{}.onionforge.meta", full_path.display()));
-                let size_str = entry.size_bytes.map(|s| s.to_string()).unwrap_or_else(|| "0".to_string());
-                let meta_content = format!("url={}\nsize={}\ntype=file\noriginal_path={}\n", entry.raw_url, size_str, entry.path);
+                let size_str = entry
+                    .size_bytes
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let meta_content = format!(
+                    "url={}\nsize={}\ntype=file\noriginal_path={}\n",
+                    entry.raw_url, size_str, entry.path
+                );
                 tokio::fs::write(&meta_path, meta_content.as_bytes()).await?;
             }
         }
@@ -749,10 +896,19 @@ async fn test_scaffold(entries: &[FileEntry], output_dir: &str) -> anyhow::Resul
     manifest.push_str("# OnionForge Download Manifest\n");
     manifest.push_str(&format!("# Total Entries: {}\n\n", entries.len()));
     for entry in entries {
-        let type_tag = match entry.entry_type { EntryType::Folder => "DIR ", EntryType::File => "FILE" };
-        let size_tag = entry.size_bytes.map(|s| format!("{:.2} MB", s as f64 / 1_048_576.0)).unwrap_or_else(|| "0 B".to_string());
+        let type_tag = match entry.entry_type {
+            EntryType::Folder => "DIR ",
+            EntryType::File => "FILE",
+        };
+        let size_tag = entry
+            .size_bytes
+            .map(|s| format!("{:.2} MB", s as f64 / 1_048_576.0))
+            .unwrap_or_else(|| "0 B".to_string());
         let decoded = path_utils::url_decode(&entry.path);
-        manifest.push_str(&format!("{} {:>12}  {}  {}\n", type_tag, size_tag, decoded, entry.raw_url));
+        manifest.push_str(&format!(
+            "{} {:>12}  {}  {}\n",
+            type_tag, size_tag, decoded, entry.raw_url
+        ));
     }
     tokio::fs::write(&manifest_path, manifest.as_bytes()).await?;
 

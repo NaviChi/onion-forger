@@ -11,12 +11,20 @@ impl super::CrawlerAdapter for NuServerAdapter {
     }
 
     async fn crawl(
-        &self, 
-        _current_url: &str, 
-        _frontier: std::sync::Arc<crate::frontier::CrawlerFrontier>, 
-        _app: AppHandle
+        &self,
+        current_url: &str,
+        frontier: std::sync::Arc<crate::frontier::CrawlerFrontier>,
+        app: AppHandle,
     ) -> anyhow::Result<Vec<super::FileEntry>> {
-        Ok(vec![])
+        // Nu servers often expose lightweight index structures compatible with the
+        // generic autoindex traversal strategy.
+        <crate::adapters::autoindex::AutoindexAdapter as super::CrawlerAdapter>::crawl(
+            &crate::adapters::autoindex::AutoindexAdapter,
+            current_url,
+            frontier,
+            app,
+        )
+        .await
     }
 
     fn name(&self) -> &'static str {

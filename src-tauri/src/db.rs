@@ -1,7 +1,7 @@
+use crate::adapters::FileEntry;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use anyhow::{Result, Context};
-use crate::adapters::FileEntry;
 
 #[derive(Clone)]
 pub struct SledVfs {
@@ -53,11 +53,9 @@ impl SledVfs {
         let guard = self.db.lock().await;
         let mut entries = Vec::new();
         if let Some(db) = guard.as_ref() {
-            for item in db.iter() {
-                if let Ok((_, value)) = item {
-                    if let Ok(entry) = serde_json::from_slice::<FileEntry>(&value) {
-                        entries.push(entry);
-                    }
+            for (_, value) in db.iter().flatten() {
+                if let Ok(entry) = serde_json::from_slice::<FileEntry>(&value) {
+                    entries.push(entry);
                 }
             }
         }
@@ -73,7 +71,7 @@ impl SledVfs {
             if !prefix.is_empty() && !prefix.ends_with('/') {
                 prefix.push('/');
             }
-            
+
             let mut seen_dirs = std::collections::HashSet::new();
 
             for item in db.scan_prefix(prefix.as_bytes()) {
@@ -82,19 +80,19 @@ impl SledVfs {
                         // Extract relative part after prefix
                         let relative_path = if prefix.is_empty() {
                             entry.path.clone()
+                        } else if entry.path.starts_with(&prefix) {
+                            entry.path[prefix.len()..].to_string()
                         } else {
-                            if entry.path.starts_with(&prefix) {
-                                entry.path[prefix.len()..].to_string()
-                            } else {
-                                continue;
-                            }
+                            continue;
                         };
-                        
+
                         let relative_path = relative_path.trim_start_matches('/');
                         let parts: Vec<&str> = relative_path.split('/').collect();
-                        
-                        if parts.is_empty() || parts[0].is_empty() { continue; }
-                        
+
+                        if parts.is_empty() || parts[0].is_empty() {
+                            continue;
+                        }
+
                         if parts.len() == 1 {
                             // Direct child file or empty dir
                             if entry.entry_type == crate::adapters::EntryType::Folder {
@@ -124,18 +122,22 @@ impl SledVfs {
                 }
             }
         }
-        
+
         // Sort folders first, then alphabetically
         entries.sort_by(|a, b| {
-            if a.entry_type == crate::adapters::EntryType::Folder && b.entry_type == crate::adapters::EntryType::File {
+            if a.entry_type == crate::adapters::EntryType::Folder
+                && b.entry_type == crate::adapters::EntryType::File
+            {
                 std::cmp::Ordering::Less
-            } else if a.entry_type == crate::adapters::EntryType::File && b.entry_type == crate::adapters::EntryType::Folder {
+            } else if a.entry_type == crate::adapters::EntryType::File
+                && b.entry_type == crate::adapters::EntryType::Folder
+            {
                 std::cmp::Ordering::Greater
             } else {
                 a.path.cmp(&b.path)
             }
         });
-        
+
         Ok(entries)
     }
 

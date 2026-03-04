@@ -20,6 +20,9 @@ cd src-tauri && cargo test
 
 # Playwright UI test
 cd .. && npx playwright test --project=chromium
+
+# Full overlay integrity workflow (geometry + screenshots + matrix)
+cd .. && npm run overlay:integrity
 ```
 
 ## Local macOS Package Build
@@ -54,3 +57,13 @@ git push origin v0.1.0
 ### Manual Trigger
 
 Run `Release` in GitHub Actions with input tag like `v0.1.0`.
+
+Windows releases also publish a portable asset:
+- `crawli_<tag>_windows_x64_portable.zip`
+- Contains `crawli.exe` + `bin/win_x64` Tor runtime resources (no installer required).
+
+## Browser Fixture Mode
+
+Use this URL for deterministic UI fixture data without Tauri backend IPC:
+
+`http://127.0.0.1:1420/?fixture=vfs`

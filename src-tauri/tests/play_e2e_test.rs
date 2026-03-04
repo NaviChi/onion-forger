@@ -1,24 +1,29 @@
+use std::path::PathBuf;
 /// Play Ransomware End-to-End Integration Test
 /// Tests: Adapter matching → Crawl simulation → Download scaffolding → Folder structure verification
 /// Simulates full pipeline without Tauri AppHandle dependency
-
 use std::sync::Arc;
 use std::time::Instant;
-use std::path::PathBuf;
 
+use crawli_lib::adapters::{AdapterRegistry, EntryType, FileEntry, SiteFingerprint};
 use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
-use crawli_lib::adapters::{AdapterRegistry, SiteFingerprint, FileEntry, EntryType};
 use reqwest::header::HeaderMap;
 
 /// Helper: Build a Play-style set of FileEntries exactly as the adapter would produce
 fn simulate_play_crawl(listing: bool, sizes: bool) -> Vec<FileEntry> {
     let mut files = Vec::new();
-    if !listing { return files; }
+    if !listing {
+        return files;
+    }
 
     for i in 1..=11 {
         let filename = format!("2 Sally Personal.part{:02}.rar", i);
         let size = if sizes {
-            if i == 11 { Some(60844542) } else { Some(524288000) }
+            if i == 11 {
+                Some(60844542)
+            } else {
+                Some(524288000)
+            }
         } else {
             None
         };
@@ -27,7 +32,10 @@ fn simulate_play_crawl(listing: bool, sizes: bool) -> Vec<FileEntry> {
             path: format!("/FALOp/{}", filename),
             size_bytes: size,
             entry_type: EntryType::File,
-            raw_url: format!("http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp/{}", filename),
+            raw_url: format!(
+                "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp/{}",
+                filename
+            ),
         });
     }
     files
@@ -42,7 +50,9 @@ async fn test_scaffold_download(entries: &[FileEntry], output_dir: &str) -> anyh
 
     for entry in entries.iter() {
         let relative = entry.path.trim_start_matches('/');
-        if relative.is_empty() { continue; }
+        if relative.is_empty() {
+            continue;
+        }
 
         let full_path = base.join(relative);
 
@@ -53,7 +63,7 @@ async fn test_scaffold_download(entries: &[FileEntry], output_dir: &str) -> anyh
                 if !gitkeep.exists() {
                     tokio::fs::write(&gitkeep, b"").await?;
                 }
-            },
+            }
             EntryType::File => {
                 if let Some(parent) = full_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
@@ -63,7 +73,10 @@ async fn test_scaffold_download(entries: &[FileEntry], output_dir: &str) -> anyh
                 }
                 // Sidecar meta
                 let meta_path = PathBuf::from(format!("{}.onionforge.meta", full_path.display()));
-                let size_str = entry.size_bytes.map(|s| s.to_string()).unwrap_or_else(|| "0".to_string());
+                let size_str = entry
+                    .size_bytes
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "0".to_string());
                 let meta_content = format!("url={}\nsize={}\ntype=file\n", entry.raw_url, size_str);
                 tokio::fs::write(&meta_path, meta_content.as_bytes()).await?;
             }
@@ -81,8 +94,14 @@ async fn test_scaffold_download(entries: &[FileEntry], output_dir: &str) -> anyh
             EntryType::Folder => "DIR ",
             EntryType::File => "FILE",
         };
-        let size_tag = entry.size_bytes.map(|s| format!("{} B", s)).unwrap_or_else(|| "0 B".to_string());
-        manifest.push_str(&format!("{} {:>12}  {}  {}\n", type_tag, size_tag, entry.path, entry.raw_url));
+        let size_tag = entry
+            .size_bytes
+            .map(|s| format!("{} B", s))
+            .unwrap_or_else(|| "0 B".to_string());
+        manifest.push_str(&format!(
+            "{} {:>12}  {}  {}\n",
+            type_tag, size_tag, entry.path, entry.raw_url
+        ));
     }
     tokio::fs::write(&manifest_path, manifest.as_bytes()).await?;
 
@@ -96,12 +115,14 @@ async fn test_scaffold_download(entries: &[FileEntry], output_dir: &str) -> anyh
 async fn test_play_fingerprint_by_onion_hash() {
     let registry = AdapterRegistry::new();
     let fp = SiteFingerprint {
-        url: "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp".to_string(),
+        url: "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp"
+            .to_string(),
         status: 200,
         headers: HeaderMap::new(),
         body: "<html>Some random content</html>".to_string(), // No "Index of /" in body
     };
-    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> = registry.determine_adapter(&fp).await;
+    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> =
+        registry.determine_adapter(&fp).await;
     assert!(adapter.is_some());
     assert_eq!(adapter.unwrap().name(), "Play Ransomware (Autoindex)");
     println!("✅ Play matched by onion hash (body irrelevant)");
@@ -116,7 +137,8 @@ async fn test_play_fingerprint_by_url_path() {
         headers: HeaderMap::new(),
         body: "".to_string(),
     };
-    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> = registry.determine_adapter(&fp).await;
+    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> =
+        registry.determine_adapter(&fp).await;
     assert!(adapter.is_some());
     assert_eq!(adapter.unwrap().name(), "Play Ransomware (Autoindex)");
     println!("✅ Play matched by /FALOp URL path");
@@ -131,7 +153,8 @@ async fn test_play_fingerprint_by_body() {
         headers: HeaderMap::new(),
         body: "Index of /FALOp/\n<a href=\"test.rar\">".to_string(),
     };
-    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> = registry.determine_adapter(&fp).await;
+    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> =
+        registry.determine_adapter(&fp).await;
     assert!(adapter.is_some());
     assert_eq!(adapter.unwrap().name(), "Play Ransomware (Autoindex)");
     println!("✅ Play matched by body content: 'Index of /FALOp/'");
@@ -163,7 +186,12 @@ async fn test_play_crawl_listing_and_sizes() {
     // Total size calculation
     let total_bytes: u64 = files.iter().filter_map(|f| f.size_bytes).sum();
     let total_gb = total_bytes as f64 / 1_073_741_824.0;
-    println!("✅ Play crawl (listing+sizes): {} files, {:.2} GB total, completed in {:?}", files.len(), total_gb, elapsed);
+    println!(
+        "✅ Play crawl (listing+sizes): {} files, {:.2} GB total, completed in {:?}",
+        files.len(),
+        total_gb,
+        elapsed
+    );
     assert!((total_gb - 4.93).abs() < 0.1, "Expected ~4.93 GB total");
 }
 
@@ -178,7 +206,10 @@ async fn test_play_crawl_listing_no_sizes() {
     for file in &files {
         assert_eq!(file.size_bytes, None, "Sizes should be None when disabled");
     }
-    println!("✅ Play crawl (listing only, no sizes): {} files, all sizes=None", files.len());
+    println!(
+        "✅ Play crawl (listing only, no sizes): {} files, all sizes=None",
+        files.len()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -202,11 +233,16 @@ async fn test_play_full_download_scaffold() {
 
     let files = simulate_play_crawl(true, true);
     let start = Instant::now();
-    let count = test_scaffold_download(&files, tmp_dir.to_str().unwrap()).await.unwrap();
+    let count = test_scaffold_download(&files, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     let elapsed = start.elapsed();
 
     assert_eq!(count, 11);
-    println!("✅ Scaffold download: {} files written in {:?}", count, elapsed);
+    println!(
+        "✅ Scaffold download: {} files written in {:?}",
+        count, elapsed
+    );
 
     // Verify directory structure
     let falop_dir = tmp_dir.join("FALOp");
@@ -225,18 +261,32 @@ async fn test_play_full_download_scaffold() {
 
         // Verify .onionforge.meta sidecar
         let meta_path = PathBuf::from(format!("{}.onionforge.meta", file_path.display()));
-        assert!(meta_path.exists(), "Meta sidecar should exist for: {}", filename);
+        assert!(
+            meta_path.exists(),
+            "Meta sidecar should exist for: {}",
+            filename
+        );
 
         let meta_content = tokio::fs::read_to_string(&meta_path).await.unwrap();
         assert!(meta_content.contains("url="), "Meta should contain url");
         assert!(meta_content.contains("size="), "Meta should contain size");
-        assert!(meta_content.contains("type=file"), "Meta should contain type=file");
+        assert!(
+            meta_content.contains("type=file"),
+            "Meta should contain type=file"
+        );
 
         // Verify sizes in meta match expected
         if i == 11 {
-            assert!(meta_content.contains("size=60844542"), "Part11 meta should have 60844542");
+            assert!(
+                meta_content.contains("size=60844542"),
+                "Part11 meta should have 60844542"
+            );
         } else {
-            assert!(meta_content.contains("size=524288000"), "Part{:02} meta should have 524288000", i);
+            assert!(
+                meta_content.contains("size=524288000"),
+                "Part{:02} meta should have 524288000",
+                i
+            );
         }
     }
     println!("✅ All 11 files + 11 meta sidecars verified on disk");
@@ -266,7 +316,9 @@ async fn test_play_download_zero_size_files() {
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 
     let files = simulate_play_crawl(true, false); // sizes=OFF → all None
-    let count = test_scaffold_download(&files, tmp_dir.to_str().unwrap()).await.unwrap();
+    let count = test_scaffold_download(&files, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     assert_eq!(count, 11);
 
     // Verify meta files say size=0
@@ -274,7 +326,10 @@ async fn test_play_download_zero_size_files() {
         let filename = format!("2 Sally Personal.part{:02}.rar", i);
         let meta_path = tmp_dir.join(format!("FALOp/{}.onionforge.meta", filename));
         let meta_content = tokio::fs::read_to_string(&meta_path).await.unwrap();
-        assert!(meta_content.contains("size=0"), "Size should be 0 when disabled");
+        assert!(
+            meta_content.contains("size=0"),
+            "Size should be 0 when disabled"
+        );
     }
     println!("✅ Zero-size edge case: All 11 meta sidecars correctly show size=0");
 
@@ -322,15 +377,23 @@ async fn test_play_download_mixed_entries_deep_nesting() {
         },
     ];
 
-    let count = test_scaffold_download(&entries, tmp_dir.to_str().unwrap()).await.unwrap();
+    let count = test_scaffold_download(&entries, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     assert_eq!(count, 4, "Empty path should be skipped, 4 items written");
 
     // Verify deep nesting
     assert!(tmp_dir.join("target_company").is_dir());
     assert!(tmp_dir.join("target_company/financials").is_dir());
-    assert!(tmp_dir.join("target_company/financials/2026/Q1/report.xlsx").exists());
-    assert!(tmp_dir.join("target_company/empty_evidence_folder").is_dir());
-    assert!(tmp_dir.join("target_company/empty_evidence_folder/.gitkeep").exists());
+    assert!(tmp_dir
+        .join("target_company/financials/2026/Q1/report.xlsx")
+        .exists());
+    assert!(tmp_dir
+        .join("target_company/empty_evidence_folder")
+        .is_dir());
+    assert!(tmp_dir
+        .join("target_company/empty_evidence_folder/.gitkeep")
+        .exists());
 
     println!("✅ Deep nesting: 4-level directory hierarchy + empty folder + .gitkeep verified");
 
@@ -347,17 +410,26 @@ async fn test_play_download_resume_no_overwrite() {
 
     // First scaffold
     let files = simulate_play_crawl(true, true);
-    test_scaffold_download(&files, tmp_dir.to_str().unwrap()).await.unwrap();
+    test_scaffold_download(&files, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
 
     // Write real content into part01 to simulate a partial download
     let part01_path = tmp_dir.join("FALOp/2 Sally Personal.part01.rar");
-    tokio::fs::write(&part01_path, b"REAL_PARTIAL_CONTENT").await.unwrap();
+    tokio::fs::write(&part01_path, b"REAL_PARTIAL_CONTENT")
+        .await
+        .unwrap();
 
     // Re-scaffold — should NOT overwrite the file with real content
-    test_scaffold_download(&files, tmp_dir.to_str().unwrap()).await.unwrap();
+    test_scaffold_download(&files, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
 
     let content = tokio::fs::read(&part01_path).await.unwrap();
-    assert_eq!(content, b"REAL_PARTIAL_CONTENT", "Existing file should NOT be overwritten");
+    assert_eq!(
+        content, b"REAL_PARTIAL_CONTENT",
+        "Existing file should NOT be overwritten"
+    );
     println!("✅ Resume safety: Existing files preserved during re-scaffold");
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -374,29 +446,41 @@ async fn test_politeness_semaphore_bottleneck() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
-        CrawlOptions { listing: true, sizes: true, download: true, circuits: None },
+        CrawlOptions {
+            listing: true,
+            sizes: true,
+            download: true,
+            circuits: None,
+        },
     ));
 
-    // The semaphore is set to 4 permits. With 120 workers, this means
-    // only 4 workers can be active at any time.
+    // For high-speed onion crawling, semaphore capacity should track circuit pool.
     let permits = frontier.politeness_semaphore.available_permits();
     let total_clients = frontier.http_clients.len();
+    let worker_target = frontier.worker_target();
 
-    println!("🔍 Bottleneck Analysis:");
+    println!("🔍 Worker Throughput Analysis:");
     println!("   Semaphore permits: {}", permits);
     println!("   Total HTTP clients: {}", total_clients);
-    println!("   Client utilization: {:.1}% ({}/{} active at any time)",
-             (permits as f64 / total_clients as f64) * 100.0, permits, total_clients);
+    println!("   Initial worker target: {}", worker_target);
+    println!(
+        "   Client utilization ceiling: {:.1}% ({}/{} active at any time)",
+        (permits as f64 / total_clients as f64) * 100.0,
+        permits,
+        total_clients
+    );
 
-    // With 4 permits and 120 clients, only 3.3% of connections are utilized
-    // This is a SIGNIFICANT bottleneck
     if permits < total_clients / 4 {
-        println!("   ⚠️  BOTTLENECK DETECTED: Semaphore ({}) is much smaller than client pool ({})", permits, total_clients);
+        println!(
+            "   ⚠️  BOTTLENECK DETECTED: Semaphore ({}) is much smaller than client pool ({})",
+            permits, total_clients
+        );
         println!("   💡 RECOMMENDATION: Increase politeness_semaphore to at least {} for full throughput", total_clients / 2);
     }
 
-    assert_eq!(permits, 60);
+    assert_eq!(permits, 120);
     assert_eq!(total_clients, 120);
+    assert_eq!(worker_target, 120);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -413,12 +497,14 @@ async fn test_play_full_pipeline_benchmark() {
     let fp_start = Instant::now();
     let registry = AdapterRegistry::new();
     let fp = SiteFingerprint {
-        url: "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp".to_string(),
+        url: "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp"
+            .to_string(),
         status: 200,
         headers: HeaderMap::new(),
         body: "Index of /FALOp/".to_string(),
     };
-    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> = registry.determine_adapter(&fp).await;
+    let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> =
+        registry.determine_adapter(&fp).await;
     assert!(adapter.is_some());
     let fp_elapsed = fp_start.elapsed();
 
@@ -429,7 +515,9 @@ async fn test_play_full_pipeline_benchmark() {
 
     // Phase 3: Download scaffold
     let dl_start = Instant::now();
-    let count = test_scaffold_download(&files, tmp_dir.to_str().unwrap()).await.unwrap();
+    let count = test_scaffold_download(&files, tmp_dir.to_str().unwrap())
+        .await
+        .unwrap();
     let dl_elapsed = dl_start.elapsed();
 
     let overall_elapsed = overall_start.elapsed();
@@ -441,11 +529,16 @@ async fn test_play_full_pipeline_benchmark() {
     println!("║  Phase 2: Crawl simulation   {:>12?}   ║", crawl_elapsed);
     println!("║  Phase 3: Download scaffold  {:>12?}   ║", dl_elapsed);
     println!("╠══════════════════════════════════════════════╣");
-    println!("║  Total pipeline              {:>12?}   ║", overall_elapsed);
+    println!(
+        "║  Total pipeline              {:>12?}   ║",
+        overall_elapsed
+    );
     println!("║  Files discovered            {:>12}   ║", files.len());
     println!("║  Files written to disk       {:>12}   ║", count);
-    println!("║  Total indexed size         {:>10.2} GB   ║",
-             files.iter().filter_map(|f| f.size_bytes).sum::<u64>() as f64 / 1_073_741_824.0);
+    println!(
+        "║  Total indexed size         {:>10.2} GB   ║",
+        files.iter().filter_map(|f| f.size_bytes).sum::<u64>() as f64 / 1_073_741_824.0
+    );
     println!("╚══════════════════════════════════════════════╝\n");
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;

@@ -15,7 +15,7 @@ fn apply_internal(opts: &mut OpenOptions) -> &mut OpenOptions {
 
 #[cfg(target_os = "macos")]
 fn apply_internal(opts: &mut OpenOptions) -> &mut OpenOptions {
-    // macOS doesn't support O_DIRECT in open(). 
+    // macOS doesn't support O_DIRECT in open().
     // We must open normally and then use fcntl to set F_NOCACHE.
     // So we don't modify the OpenOptions here, we use a separate function after opening.
     opts
