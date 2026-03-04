@@ -122,6 +122,17 @@ jobs:
         run: |
           gh release upload "${{ github.event.inputs.tag || github.ref_name }}" "$env:PORTABLE_ZIP" --clobber
 
+      - name: Remove Windows installer assets (portable-only policy)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.event.inputs.tag || github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          gh release delete-asset $tag "crawli_${version}_x64-setup.exe" --yes || $true
+          gh release delete-asset $tag "crawli_${version}_x64_en-US.msi" --yes || $true
+
       - name: Package portable Linux asset
         if: matrix.platform == 'ubuntu-24.04'
         shell: bash
