@@ -276,7 +276,7 @@ async fn start_crawl(
         )
         .unwrap();
 
-        let target_daemons = options.daemons.unwrap_or(12).max(1);
+        let target_daemons = options.daemons.unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 }).max(1);
         match tor::bootstrap_tor_cluster(app.clone(), target_daemons).await {
             Ok((guard, ports)) => {
                 swarm_guard = Some(guard);
@@ -289,7 +289,7 @@ async fn start_crawl(
     let daemon_count = if is_onion {
         active_ports.len().max(1)
     } else {
-        options.daemons.unwrap_or(12).max(1)
+        options.daemons.unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 }).max(1)
     };
 
     let mut frontier = frontier::CrawlerFrontier::new(

@@ -215,7 +215,10 @@ impl CrawlerAdapter for QilinAdapter {
                         
                         // PHASE 32: QData HTML V3 Parser (Discovered via headless probe)
                         // The backend returns a raw HTML table: <tr><td class="link"><a href="...">...</a></td><td class="size">...</td>
-                        let v3_row_re = regex::Regex::new(r#"<td class="link"><a href="([^"]+)"[^>]*>.*?</a></td><td class="size">([^<]*)</td>"#).unwrap();
+                        static V3_ROW_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                            regex::Regex::new(r#"<td class="link"><a href="([^"]+)"[^>]*>.*?</a></td><td class="size">([^<]*)</td>"#).unwrap()
+                        });
+                        let v3_row_re = &*V3_ROW_RE;
                         
                         for cap in v3_row_re.captures_iter(&html) {
                             found_any = true;

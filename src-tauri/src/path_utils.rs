@@ -157,7 +157,7 @@ pub fn parse_size(size_str: &str) -> Option<u64> {
     let mut multiplier: u64 = 1;
 
     for c in raw.chars() {
-        if c.is_digit(10) || c == '.' {
+        if c.is_ascii_digit() || c == '.' {
             num_str.push(c);
         } else if c == 'K' {
             multiplier = 1024;
@@ -237,7 +237,22 @@ pub fn canonicalize_output_root(output_dir: &str) -> std::io::Result<PathBuf> {
             "Output root is not a directory",
         ));
     }
-    Ok(canonical)
+    Ok(ensure_long_path(canonical))
+}
+
+/// On Windows, prepend `\\?\` to bypass the 260-character MAX_PATH limit.
+/// On other platforms, returns the path unchanged.
+/// This is critical for deeply nested Qilin paths like
+/// `HR/Active Employees/Gonzalez, Jander A 20 Term 1.31.2018/...`
+pub fn ensure_long_path(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        if !s.starts_with("\\\\?\\") {
+            return PathBuf::from(format!("\\\\?\\{}", s));
+        }
+    }
+    path
 }
 
 pub fn resolve_path_within_root(

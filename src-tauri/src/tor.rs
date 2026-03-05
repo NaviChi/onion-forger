@@ -438,7 +438,17 @@ pub fn detect_active_managed_tor_ports() -> Vec<u16> {
 
         #[cfg(not(unix))]
         {
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            // On Windows, use netstat to verify the port is held by tor.exe
+            let pids = windows_listening_pids_on_port(port);
+            let has_tor = pids.into_iter().any(|pid| {
+                if pid == std::process::id() {
+                    return false;
+                }
+                windows_process_name(pid)
+                    .map(|name| name.contains("tor"))
+                    .unwrap_or(false)
+            });
+            if has_tor {
                 active.push(port);
             }
         }
@@ -476,8 +486,79 @@ fn reclaim_tor_listener_ports(start: u16, end: u16) -> usize {
 }
 
 #[cfg(not(unix))]
-fn reclaim_tor_listener_ports(_start: u16, _end: u16) -> usize {
-    0
+fn reclaim_tor_listener_ports(start: u16, end: u16) -> usize {
+    // On Windows without admin: use netstat to find tor.exe PIDs on our ports,
+    // then taskkill them (user-level, no /F flag needed for our own child processes)
+    let mut reclaimed = 0usize;
+    let mut seen = std::collections::HashSet::new();
+
+    for port in start..=end {
+        if is_reserved(port) {
+            continue;
+        }
+        for pid in windows_listening_pids_on_port(port) {
+            if pid == std::process::id() || !seen.insert(pid) {
+                continue;
+            }
+            let is_tor = windows_process_name(pid)
+                .map(|name| name.contains("tor"))
+                .unwrap_or(false);
+            if is_tor {
+                terminate_pid(pid);
+                reclaimed += 1;
+            }
+        }
+    }
+    reclaimed
+}
+
+/// Parse `netstat -ano` output to find PIDs listening on a given port.
+/// Works without admin on Windows — only sees the current user's processes.
+#[cfg(not(unix))]
+fn windows_listening_pids_on_port(port: u16) -> Vec<u32> {
+    let mut cmd = Command::new("netstat");
+    cmd.args(["-ano", "-p", "TCP"]);
+    #[cfg(target_os = "windows")]
+    apply_windows_no_window(&mut cmd);
+
+    let output = match cmd.output() {
+        Ok(out) => out,
+        Err(_) => return vec![],
+    };
+
+    let needle = format!(":{} ", port);
+    let needle_alt = format!(":{}	", port);
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| {
+            let upper = line.to_uppercase();
+            upper.contains("LISTENING") && (line.contains(&needle) || line.contains(&needle_alt))
+        })
+        .filter_map(|line| {
+            // Last column in netstat -ano is the PID
+            line.split_whitespace().last()?.parse::<u32>().ok()
+        })
+        .collect()
+}
+
+/// Get process name by PID on Windows using `tasklist /FI "PID eq <pid>"` (no admin required).
+#[cfg(not(unix))]
+fn windows_process_name(pid: u32) -> Option<String> {
+    let mut cmd = Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"]);
+    #[cfg(target_os = "windows")]
+    apply_windows_no_window(&mut cmd);
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Output looks like: "tor.exe","1234","Console","1","42,000 K"
+    let text = String::from_utf8_lossy(&output.stdout);
+    let first_line = text.lines().find(|l| !l.trim().is_empty())?;
+    // Extract the process name (first CSV field, remove quotes)
+    let name = first_line.split(',').next()?.trim().trim_matches('"');
+    Some(name.to_lowercase())
 }
 
 pub fn cleanup_stale_tor_daemons() {
