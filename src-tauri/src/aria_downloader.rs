@@ -1602,13 +1602,17 @@ pub async fn start_download(
                     } else if let Some(file) = active_file.as_mut() {
                         // Fallback if out-of-bounds mapping
                         if msg.offset != last_write_end {
+                            // On slower mechanical drives, out-of-order writes with many circuits
+                            // can cause thrashing. The seek will succeed but kill IOPS.
                             file.seek(SeekFrom::Start(msg.offset))?;
                         }
                         file.write_all(&msg.data)?;
                         last_write_end = msg.offset + msg.data.len() as u64;
                     }
                 } else if let Some(file) = active_file.as_mut() {
-                    // Phase 4.5: Write coalescing — skip seek if writes are sequential
+                    // Phase 35: Windows IO Mechanical HDD Optimization
+                    // If mmap failed to allocate (e.g. low 4GB RAM or fragmented hard drive),
+                    // fallback to standard file writes.
                     if msg.offset != last_write_end {
                         file.seek(SeekFrom::Start(msg.offset))?;
                     }

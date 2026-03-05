@@ -660,7 +660,8 @@ async fn scaffold_download(
                 }
 
                 let safe_target = full_path.to_string_lossy().to_string();
-                if entry.raw_url.starts_with("http://") || entry.raw_url.starts_with("https://") {
+                let url_lower = entry.raw_url.to_lowercase();
+                if url_lower.starts_with("http://") || url_lower.starts_with("https://") {
                     batch_files.push(BatchFileEntry {
                         url: entry.raw_url.clone(),
                         path: safe_target,

@@ -1338,8 +1338,7 @@ function App() {
             <option value={120}>120 Circuits (Default)</option>
             <option value={150}>150 Circuits</option>
             <option value={200}>200 Circuits</option>
-            <option value={300}>300 Circuits (Fast)</option>
-            <option value={400}>400 Circuits (Extreme)</option>
+            <option value={240}>240 Circuits (Max)</option>
           </select>
         </div>
 
