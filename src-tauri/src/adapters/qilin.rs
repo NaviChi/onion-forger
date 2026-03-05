@@ -100,7 +100,7 @@ impl CrawlerAdapter for QilinAdapter {
         // worker loop monitors 429/timeout rates and adjusts dynamically.
         // Ceiling: 16 workers (avoids DDoS-triggering on QData storage nodes).
         // The 120-circuit aria2 downloader is used separately for file downloads.
-        let max_concurrent = 24; // Phase 32: Raised from 8→24 (safe on raw storage nodes)
+        let max_concurrent = 60; // Phase 35: Raised from 24→60 for massive concurrency speedup
         let _aimd_error_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let _aimd_success_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut workers = tokio::task::JoinSet::new();
@@ -116,6 +116,7 @@ impl CrawlerAdapter for QilinAdapter {
             let discovered_ref = all_discovered_entries.clone();
             let pending_clone = pending.clone();
             let domain_clone = base_domain.clone();
+            let seed_url_clone = actual_seed_url.clone();
 
             workers.spawn(async move {
                 loop {
@@ -209,6 +210,24 @@ impl CrawlerAdapter for QilinAdapter {
 
                     let mut new_files = Vec::new();
 
+                    // Extract the relative directory path from the base seed URL
+                    let mut nested_path = String::new();
+                    if next_url.starts_with(&seed_url_clone) {
+                        let relative = &next_url[seed_url_clone.len()..];
+                        if !relative.is_empty() {
+                            nested_path = path_utils::url_decode(relative);
+                            if !nested_path.starts_with('/') {
+                                nested_path.insert(0, '/');
+                            }
+                            if !nested_path.ends_with('/') {
+                                nested_path.push('/');
+                            }
+                        }
+                    }
+                    if nested_path.is_empty() {
+                        nested_path = "/".to_string();
+                    }
+
                     // Check if it's the old <table id="list"> Qilin or the new V3 HTML structure
                     if html.contains("<table id=\"list\">") || html.contains("Data browser") {
                         let mut found_any = false;
@@ -237,9 +256,10 @@ impl CrawlerAdapter for QilinAdapter {
                                 let child_url = format!("{}/{}", next_url.trim_end_matches('/'), encoded);
 
                                 if is_dir {
-                                    let sanitized_path = format!("/{}", path_utils::sanitize_path(&clean_name));
+                                    let sanitized_name = path_utils::sanitize_path(&clean_name);
+                                    let full_path = format!("{}{}", nested_path, sanitized_name);
                                     new_files.push(FileEntry {
-                                        path: sanitized_path,
+                                        path: full_path,
                                         size_bytes: None,
                                         entry_type: EntryType::Folder,
                                         raw_url: format!("{}/", child_url),
@@ -254,8 +274,10 @@ impl CrawlerAdapter for QilinAdapter {
                                     let raw_size = size_str.as_str().trim();
                                     let size_bytes = if raw_size == "-" { None } else { path_utils::parse_size(raw_size) };
                                     
+                                    let sanitized_name = path_utils::sanitize_path(&clean_name);
+                                    let full_path = format!("{}{}", nested_path, sanitized_name);
                                     new_files.push(FileEntry {
-                                        path: format!("/{}", path_utils::sanitize_path(&clean_name)),
+                                        path: full_path,
                                         size_bytes,
                                         entry_type: EntryType::File,
                                         raw_url: child_url,
@@ -272,9 +294,10 @@ impl CrawlerAdapter for QilinAdapter {
                                let child_url = format!("{}/{}", next_url.trim_end_matches('/'), encoded);
 
                                if is_dir {
-                                   let sanitized_path = format!("/{}", path_utils::sanitize_path(&filename));
+                                   let sanitized_name = path_utils::sanitize_path(&filename);
+                                   let full_path = format!("{}{}", nested_path, sanitized_name);
                                    new_files.push(FileEntry {
-                                       path: sanitized_path,
+                                       path: full_path,
                                        size_bytes: None,
                                        entry_type: EntryType::Folder,
                                        raw_url: format!("{}/", child_url),
@@ -286,8 +309,10 @@ impl CrawlerAdapter for QilinAdapter {
                                        q_clone.push(sub_url);
                                    }
                                } else {
+                                   let sanitized_name = path_utils::sanitize_path(&filename);
+                                   let full_path = format!("{}{}", nested_path, sanitized_name);
                                    new_files.push(FileEntry {
-                                       path: format!("/{}", path_utils::sanitize_path(&filename)),
+                                       path: full_path,
                                        size_bytes: parsed_size,
                                        entry_type: EntryType::File,
                                        raw_url: child_url,

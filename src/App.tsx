@@ -1338,6 +1338,8 @@ function App() {
             <option value={120}>120 Circuits (Default)</option>
             <option value={150}>150 Circuits</option>
             <option value={200}>200 Circuits</option>
+            <option value={300}>300 Circuits (Fast)</option>
+            <option value={400}>400 Circuits (Extreme)</option>
           </select>
         </div>
 
@@ -1361,8 +1363,9 @@ function App() {
           >
             <option value={0}>Auto (Balanced)</option>
             <option value={4}>4 Daemons</option>
+            <option value={6}>6 Daemons (Windows Optimal)</option>
             <option value={8}>8 Daemons</option>
-            <option value={12}>12 Daemons (HFT)</option>
+            <option value={12}>12 Daemons (Mac Optimal)</option>
             <option value={16}>16 Daemons (Max)</option>
           </select>
         </div>
@@ -1467,24 +1470,40 @@ function App() {
       </div>
 
       <div className="network-monitor">
-        {daemonPorts.map((port, idx) => (
-          <div key={port} className="daemon-box">
+        {daemonPorts.length > 6 ? (
+          <div className="daemon-box" style={{ flex: 1, justifyContent: "center" }}>
             <div className="daemon-icon">
               {isCrawling ? <VibeLoader size={18} variant="secondary" /> : <Zap size={18} />}
             </div>
-            <div className="daemon-info">
-              <div className="daemon-header">NODE {idx}: PORT {port}</div>
+            <div className="daemon-info" style={{ flex: "none" }}>
+              <div className="daemon-header">SWARM ACTIVE ({daemonPorts.length} NODES)</div>
               <div className="daemon-body">
-                <span style={{ color: isCrawling ? 'var(--accent-primary)' : 'var(--text-muted)' }}>
-                  {isCrawling ? 'ACTIVE' : 'STANDBY'}
-                </span>
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', fontFamily: 'JetBrains Mono' }}>
-                  {isCrawling ? Math.floor(Math.random() * 50 + 150) + 'ms' : '---'}
+                <span style={{ fontSize: '0.85rem', color: 'var(--accent-secondary)', fontFamily: 'JetBrains Mono', wordBreak: 'break-all' }}>
+                  PORTS: {daemonPorts.join(", ")}
                 </span>
               </div>
             </div>
           </div>
-        ))}
+        ) : (
+          daemonPorts.map((port, idx) => (
+            <div key={port} className="daemon-box">
+              <div className="daemon-icon">
+                {isCrawling ? <VibeLoader size={18} variant="secondary" /> : <Zap size={18} />}
+              </div>
+              <div className="daemon-info">
+                <div className="daemon-header">NODE {idx}: PORT {port}</div>
+                <div className="daemon-body">
+                  <span style={{ color: isCrawling ? 'var(--accent-primary)' : 'var(--text-muted)' }}>
+                    {isCrawling ? 'ACTIVE' : 'STANDBY'}
+                  </span>
+                  <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', fontFamily: 'JetBrains Mono' }}>
+                    {isCrawling ? Math.floor(Math.random() * 50 + 150) + 'ms' : '---'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          ))
+        )}
       </div>
     </div >
   );

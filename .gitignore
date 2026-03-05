@@ -30,3 +30,6 @@ dist-ssr
 /playwright/.cache/
 /playwright/.auth/
 /output/playwright/
+
+# Generated crawl indices
+src-tauri/crawl_index_*.txt

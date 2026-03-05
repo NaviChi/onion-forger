@@ -1,6 +1,6 @@
 [package]
 name = "crawli"
-version = "0.2.2"
+version = "0.2.3"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -42,6 +42,7 @@ crossbeam-queue = "0.3.12"
 memmap2 = "0.9.10"
 regex = "1.12.3"
 headless_chrome = "1.0.21"
+chrono = "0.4.44"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

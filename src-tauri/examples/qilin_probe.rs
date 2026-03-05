@@ -4,6 +4,8 @@ use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
 
 #[tokio::main]
 async fn main() {
+    println!("=== CLI Qilin Test (Export Text Validation) ===");
+    
     let app = tauri::Builder::default()
         .build(tauri::generate_context!())
         .expect("build tauri app");
@@ -14,75 +16,60 @@ async fn main() {
         .await
         .unwrap();
 
-    let targets = vec![
-        "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed",
-    ];
+    let target = "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed";
 
-    println!("\n=======================================================");
-    println!("🔍 INITIATING QILIN MULTI-TARGET METHODOLOGY PROBE 🔍");
-    println!("Targets to test: {}", targets.len());
-    println!("=======================================================\n");
+    println!("Probing Target: {}", target);
 
-    let mut success_found = false;
+    let opts = CrawlOptions {
+        listing: true,
+        circuits: Some(24),
+        daemons: Some(12),
+        ..Default::default()
+    };
 
-    for (i, target) in targets.iter().enumerate() {
-        println!("\n[Attempt {}/{}] Probing Target: {}", i + 1, targets.len(), target);
-
-        let opts = CrawlOptions {
-            listing: true,
-            circuits: Some(24),
-            daemons: Some(12),
-            ..Default::default()
-        };
-
-        // Leverage the fast proxy swarm to extract optimally
-        let frontier = std::sync::Arc::new(CrawlerFrontier::new(
-            Some(app.handle().clone()),
-            target.to_string(),
-            12,
-            true,
-            ports.clone(),
-            opts,
-        ));
-        let qilin_adapter = QilinAdapter::default();
-
-        let start_time = std::time::Instant::now();
-        
-        match qilin_adapter.crawl(target, frontier, app.handle().clone()).await {
-            Ok(entries) => {
-                if entries.is_empty() {
-                    println!("  [❌] Target {} offline or unreachable (0 entries parsed). Proceeding to fallback target...", target);
-                } else {
-                    let mut files = 0;
-                    let mut dirs = 0;
-                    for e in &entries {
-                        if matches!(e.entry_type, crawli_lib::adapters::EntryType::Folder) {
-                            dirs += 1;
-                        } else {
-                            files += 1;
-                        }
-                    }
-                    println!("  [✅ SUCCESS] Target online! Crawl completed successfully in {}ms.", start_time.elapsed().as_millis());
-                    println!("  [✅] Extracted {} total entries ({} files, {} directories).", entries.len(), files, dirs);
-                    success_found = true;
-                }
+    let frontier = std::sync::Arc::new(CrawlerFrontier::new(
+        Some(app.handle().clone()),
+        target.to_string(),
+        12,
+        true,
+        ports.clone(),
+        opts,
+    ));
+    
+    let qilin_adapter = QilinAdapter::default();
+    let start_time = std::time::Instant::now();
+    
+    match qilin_adapter.crawl(target, frontier, app.handle().clone()).await {
+        Ok(entries) => {
+            println!("  [✅ SUCCESS] Target online! Crawl completed successfully in {}ms.", start_time.elapsed().as_millis());
+            println!("  [✅] Extracted {} total entries.", entries.len());
+            
+            // Generate Text File
+            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let log_filename = format!("crawl_index_{}.txt", timestamp);
+            let log_path = std::path::PathBuf::from(&log_filename);
+            
+            let mut content = String::with_capacity(entries.len() * 128);
+            content.push_str(&format!("CRAWL INDEX COMPLETED AT: {}\n", chrono::Local::now().to_rfc2822()));
+            content.push_str(&format!("TARGET URL: {}\n", target));
+            content.push_str(&format!("TOTAL ENTRIES: {}\n", entries.len()));
+            content.push_str("========================================================================\n\n");
+            
+            for file in &entries {
+                let type_str = if matches!(file.entry_type, crawli_lib::adapters::EntryType::Folder) { "[DIR]" } else { "[FILE]" };
+                let size_str = file.size_bytes.map(|s| format!("{} bytes", s)).unwrap_or_else(|| "Unknown size".to_string());
+                content.push_str(&format!("{:<7} {} ({})\n", type_str, file.path, size_str));
             }
-            Err(e) => {
-                println!("  [❌ ERROR] Crawl disconnected or failed: {}", e);
+            
+            if let Ok(_) = std::fs::write(&log_path, content) {
+                println!("  [📝] Text File Generated: {}", log_path.display());
+                let output = std::fs::read_to_string(&log_path).unwrap();
+                println!("\n--- File Snippet ---\n{}...\n--------------------", &output.chars().take(500).collect::<String>());
             }
         }
-    }
-
-    if !success_found {
-        println!("\n=======================================================");
-        println!("🚨 MULTI-TARGET FATAL FAILURE 🚨");
-        println!("All three Qilin URLs are definitively OFFLINE or blocking Tor nodes.");
-        println!("=======================================================\n");
-    } else {
-        println!("\n=======================================================");
-        println!("🏁 ONLINE PROBE SUCCESSFUL 🏁");
-        println!("We have successfully identified an online Qilin Mirror.");
-        println!("=======================================================\n");
+        Err(e) => {
+            println!("  [❌ ERROR] Crawl disconnected or failed: {}", e);
+        }
     }
 
     drop(swarm_guard);

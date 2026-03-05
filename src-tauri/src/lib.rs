@@ -501,6 +501,34 @@ async fn start_crawl(
             Ok(files) => {
                 // We keep the active_frontier alive here so that the UI can manually trigger
                 // "Download All" later and still have access to the warm Tor circuits!
+                
+                // Immediately generate definitive crawl index log
+                if !files.is_empty() {
+                    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                    let log_filename = format!("crawl_index_{}.txt", timestamp);
+                    let log_path = output_root.join(&log_filename);
+                    
+                    // Fire-and-forget write of all discovered paths
+                    let files_clone = files.clone();
+                    let log_path_clone = log_path.clone();
+                    let app_clone = app.clone();
+                    tokio::spawn(async move {
+                        let mut content = String::with_capacity(files_clone.len() * 128);
+                        content.push_str(&format!("CRAWL INDEX COMPLETED AT: {}\n", chrono::Local::now().to_rfc2822()));
+                        content.push_str(&format!("TOTAL ENTRIES: {}\n", files_clone.len()));
+                        content.push_str("========================================================================\n\n");
+                        
+                        for file in files_clone {
+                            let type_str = if matches!(file.entry_type, adapters::EntryType::Folder) { "[DIR]" } else { "[FILE]" };
+                            let size_str = file.size_bytes.map(|s| format!("{} bytes", s)).unwrap_or_else(|| "Unknown size".to_string());
+                            content.push_str(&format!("{:<7} {} ({})\n", type_str, file.path, size_str));
+                        }
+                        
+                        if let Ok(_) = tokio::fs::write(&log_path_clone, content).await {
+                            let _ = app_clone.emit("crawl_log", format!("[SYSTEM] Crawl index exported to {}", log_path_clone.display()));
+                        }
+                    });
+                }
 
                 // Auto-download if enabled
                 if auto_download {
