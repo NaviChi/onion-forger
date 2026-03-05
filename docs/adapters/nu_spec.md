@@ -1,4 +1,4 @@
-> **Last Updated:** 2026-03-04T13:30 CST
+> **Last Updated:** 2026-03-04T15:08 CST
 
 # Nu Server Adapter Flight Manual
 *Adapter ID: `nu_server`*

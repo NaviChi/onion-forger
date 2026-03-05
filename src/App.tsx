@@ -330,7 +330,9 @@ function App() {
     sizes: true,
     download: false,
     circuits: 120,
-    daemons: 0
+    daemons: 0,
+    agnosticState: false,
+    resume: false
   });
 
   const showToast = (type: "success" | "error", title: string, message: string) => {
@@ -679,8 +681,8 @@ function App() {
             const smoothedSpeedMbps =
               instant > 0
                 ? (prev.smoothedSpeedMbps > 0
-                    ? prev.smoothedSpeedMbps * 0.72 + instant * 0.28
-                    : instant)
+                  ? prev.smoothedSpeedMbps * 0.72 + instant * 0.28
+                  : instant)
                 : prev.smoothedSpeedMbps;
             const speedStability =
               smoothedSpeedMbps > 0
@@ -783,7 +785,7 @@ function App() {
     return () => document.removeEventListener("mousedown", handleOutsideClick);
   }, [showSupportPopover]);
 
-  const handleCrawl = useCallback(async () => {
+  const handleCrawl = useCallback(async (resumeMode: boolean = false) => {
     if (!url) return;
     const preserveFixtureState = isFixtureMode;
     setIsCrawling(true);
@@ -820,6 +822,7 @@ function App() {
       const payloadOptions = {
         ...crawlOptions,
         daemons: crawlOptions.daemons > 0 ? crawlOptions.daemons : null,
+        resume: resumeMode,
       };
 
       const files = await invoke<FileEntry[]>("start_crawl", { url, options: payloadOptions, outputDir });
@@ -1106,7 +1109,7 @@ function App() {
             </div>
           )}
           <div className={`status-badge ${torStatus?.state === 'ready' || torStatus?.state === 'active' ? 'ready' : torStatus ? 'warn' : ''}`}>
-            {isCrawling ? <VibeLoader size={12} variant="accent" /> : <Activity size={14} />} SYS: {torStatus ? torStatus.state.toUpperCase() : "IDLE"}
+            {isCrawling ? <VibeLoader size={14} variant="accent" style={{ marginRight: "4px" }} /> : <Activity size={14} />} SYS: {torStatus ? torStatus.state.toUpperCase() : "IDLE"}
           </div>
         </div>
       </header>
@@ -1115,8 +1118,8 @@ function App() {
         <button className="tool-btn" data-testid="btn-load-target" onClick={() => setUrl("http://worldleaks.onion/api/")}>
           <FolderSearch size={22} className={url.includes("worldleaks") ? "pulse-line text-accent-primary" : ""} /> Load Target
         </button>
-        <button className="tool-btn" data-testid="btn-resume" onClick={handleCrawl} disabled={isCrawling}>
-          <Play size={22} /> Resume
+        <button className="tool-btn" data-testid="btn-resume" onClick={() => handleCrawl(true)} disabled={isCrawling || vfsStats.totalNodes === 0}>
+          <Play size={22} /> Retry / Resume
         </button>
         <button
           className="tool-btn danger"
@@ -1228,7 +1231,7 @@ function App() {
         <button
           className="action-btn popup-hover"
           data-testid="btn-start-queue"
-          onClick={handleCrawl}
+          onClick={() => handleCrawl(false)}
           disabled={isCrawling}
         >
           {isCrawling ? (
@@ -1299,6 +1302,18 @@ function App() {
             disabled={isCrawling}
           />
           <span style={{ fontSize: '0.85rem', color: crawlOptions.download ? 'var(--text-main)' : 'var(--text-muted)' }}>Auto-Download During Crawl</span>
+        </label>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Ignore the server domain when caching to dynamically resume aborted downloads even if the host changes.">
+          <input
+            data-testid="chk-agnostic-state"
+            type="checkbox"
+            checked={crawlOptions.agnosticState}
+            onChange={(e) => setCrawlOptions({ ...crawlOptions, agnosticState: e.target.checked })}
+            style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
+            disabled={isCrawling}
+          />
+          <span style={{ fontSize: '0.85rem', color: crawlOptions.agnosticState ? 'var(--text-main)' : 'var(--text-muted)' }}>URI-Agnostic State</span>
         </label>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: 'auto' }}>

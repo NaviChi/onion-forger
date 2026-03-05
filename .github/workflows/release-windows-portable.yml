@@ -1,0 +1,94 @@
+name: Release Windows Portable
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (for example: v0.2.1)"
+        required: true
+        type: string
+      ref:
+        description: "Git ref/sha to build"
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows-portable:
+    name: Build windows-x64 portable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri binary (no installer bundles)
+        run: npm run tauri -- build --bundles none
+
+      - name: Package portable Windows executable
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag }}"
+          $portableRoot = "portable-assets/crawli-windows-x64-portable"
+          $portableBin = Join-Path $portableRoot "bin"
+          New-Item -ItemType Directory -Force -Path $portableBin | Out-Null
+
+          $exe = Get-ChildItem -Path "src-tauri/target" -Recurse -Filter "crawli.exe" |
+            Where-Object { $_.FullName -match "\\release\\crawli\.exe$" -and $_.FullName -notmatch "\\deps\\" } |
+            Select-Object -First 1
+          if (-not $exe) {
+            throw "Portable build failed: crawli.exe was not found in src-tauri/target/**/release/"
+          }
+
+          Copy-Item -Path $exe.FullName -Destination (Join-Path $portableRoot "crawli.exe") -Force
+          Copy-Item -Path "src-tauri/bin/win_x64" -Destination $portableBin -Recurse -Force
+
+          $zipPath = "portable-assets/crawli_${tag}_windows_x64_portable.zip"
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+          Compress-Archive -Path "$portableRoot/*" -DestinationPath $zipPath
+          "PORTABLE_ZIP=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create or update release with Windows portable asset only
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.event.inputs.tag }}"
+          $keepAsset = "crawli_${tag}_windows_x64_portable.zip"
+
+          gh release view "$tag" --json tagName > $null 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "$tag" `
+              --title "Onion Forger $tag" `
+              --notes "Windows portable-only release package."
+          }
+
+          gh release upload "$tag" "$env:PORTABLE_ZIP" --clobber
+
+          $assets = gh release view "$tag" --json assets --jq '.assets[].name'
+          foreach ($asset in $assets) {
+            if ($asset -ne $keepAsset) {
+              gh release delete-asset "$tag" "$asset" --yes
+            }
+          }
+
+          gh release edit "$tag" --latest

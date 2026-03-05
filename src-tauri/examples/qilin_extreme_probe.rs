@@ -21,7 +21,7 @@ async fn main() {
 
     let proxy_port = ports[0];
     // The control port is historically mapped as SOCKS + 1 in this infrastructure
-    let control_port = proxy_port + 1; 
+    let _control_port = proxy_port + 1; 
 
     // Target the specific failing Root Qilin URL
     let target_url = "http://a7r2n577n6jqzqexu5an3j2aej3ezb4klm7pkbp44243cqbwi43brjid.onion/72a4c05f-f711-498a-a038-758efa78aa09/";

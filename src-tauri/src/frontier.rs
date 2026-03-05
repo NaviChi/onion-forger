@@ -20,6 +20,10 @@ pub struct CrawlOptions {
     pub download: bool,
     pub circuits: Option<usize>,
     pub daemons: Option<usize>,
+    #[serde(default)]
+    pub agnostic_state: bool,
+    #[serde(default)]
+    pub resume: bool,
 }
 
 impl Default for CrawlOptions {
@@ -30,6 +34,8 @@ impl Default for CrawlOptions {
             download: false,
             circuits: Some(120),
             daemons: Some(4),
+            agnostic_state: false,
+            resume: false,
         }
     }
 }
@@ -168,7 +174,7 @@ impl CrawlerFrontier {
 
         let safe_name = sanitize_filename(&target_url);
         let wal_path = std::env::temp_dir().join(format!("crawli_{}.wal", safe_name));
-        let allow_wal_resume = wal_resume_enabled();
+        let allow_wal_resume = wal_resume_enabled() || options.resume;
 
         // Default to fresh crawls so stale WAL state never suppresses new traversal.
         if !allow_wal_resume {
@@ -272,20 +278,25 @@ impl CrawlerFrontier {
 
     /// Mark URL as visited, returns true if newly added, false if already visited
     pub fn mark_visited(&self, url: &str) -> bool {
+        let state_key = if self.active_options.agnostic_state {
+            crate::path_utils::extract_agnostic_path(url)
+        } else {
+            url.to_string()
+        };
+
         let mut hasher = DefaultHasher::new();
-        url.hash(&mut hasher);
+        state_key.hash(&mut hasher);
         let hash = hasher.finish();
 
         let mut bloom = self.visited_bloom.lock().unwrap();
-        let url_string = url.to_string();
-        if bloom.check(&url_string) {
+        if bloom.check(&state_key) {
             // Might be visited. Determine definitively:
             self.visited_hashes.insert(hash)
         } else {
             // Definitely not visited.
-            bloom.set(&url_string);
+            bloom.set(&state_key);
             self.visited_hashes.insert(hash);
-            let _ = self.wal_tx.send(url_string);
+            let _ = self.wal_tx.send(state_key);
             true
         }
     }

@@ -10,13 +10,12 @@ async fn main() {
 
     crawli_lib::tor::cleanup_stale_tor_daemons();
 
-    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 2)
+    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 8)
         .await
         .unwrap();
 
     let targets = vec![
-        "http://ef4p3qn56susyjy56vym4gawjzaoc52e52w545e7mu6qhbmfut5iwxqd.onion/0fd57037-2a80-46ab-b662-bc3f21dd1a1c/",
-        "http://6esfx73oxphqeh2lpgporkw72uj2xqm5bbb6pfl24mt27hlll7jdswyd.onion/b06ff1c5-0f44-4d7f-b184-9e587d1977aa/",
+        "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed",
     ];
 
     println!("\n=======================================================");
@@ -31,6 +30,8 @@ async fn main() {
 
         let opts = CrawlOptions {
             listing: true,
+            circuits: Some(8),
+            daemons: Some(8),
             ..Default::default()
         };
 
@@ -38,7 +39,7 @@ async fn main() {
         let frontier = std::sync::Arc::new(CrawlerFrontier::new(
             Some(app.handle().clone()),
             target.to_string(),
-            2,
+            8,
             true,
             ports.clone(),
             opts,
@@ -52,10 +53,18 @@ async fn main() {
                 if entries.is_empty() {
                     println!("  [❌] Target {} offline or unreachable (0 entries parsed). Proceeding to fallback target...", target);
                 } else {
+                    let mut files = 0;
+                    let mut dirs = 0;
+                    for e in &entries {
+                        if matches!(e.entry_type, crawli_lib::adapters::EntryType::Folder) {
+                            dirs += 1;
+                        } else {
+                            files += 1;
+                        }
+                    }
                     println!("  [✅ SUCCESS] Target online! Crawl completed successfully in {}ms.", start_time.elapsed().as_millis());
-                    println!("  [✅] Extracted {} entries.", entries.len());
+                    println!("  [✅] Extracted {} total entries ({} files, {} directories).", entries.len(), files, dirs);
                     success_found = true;
-                    break;
                 }
             }
             Err(e) => {

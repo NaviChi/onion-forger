@@ -1,4 +1,4 @@
-> **Last Updated:** 2026-03-04T13:30 CST
+> **Last Updated:** 2026-03-04T15:08 CST
 
 Version: 1.0.7
 Updated: 2026-03-04
@@ -107,6 +107,7 @@ Implemented behavior:
   - **Animated WebP Aesthetics:** Frontend UI spinners natively render 60fps 8-bit true-alpha Animated WebP sequence components (`<VibeLoader />`) that gracefully degrade to CSS if asset loading delays, perfecting the "SnoozeSlayer" visual identity.
   - **DragonForce Adaptive JWT Parsing:** Rewrote `parse_dragonforce_fsguest` in `dragonforce.rs` to bypass obfuscated Next.js JSON API layers. The scraper intercepts the `fsguest` HTTP response body, scans for an `<iframe>` node using `scraper::Html`, extracts the inner `token=([A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+)` variable from the `src` attribute, and injects a virtual `/_bridge` Folder payload directly back into the `CrawlerFrontier`. This guarantees automatic deep recursion of the JWT endpoint naturally without relying on volatile HTTP header replication.
   - **Qilin QData UI Obfuscation and Precompile Delegation:** During Phase 12, analysis revealed the Qilin target utilized a custom graphical template ("QData") that hid the default `Index of /` fingerprints. However, the underlying nested payload still relied on a standard un-obfuscated HTML table (`<table id="list">`). To prevent adapter code bloat across dozens of darkweb networks, the `qilin.rs` adapter detects the `QData` signature but directly proxies runtime mapping back into the robust `AutoindexAdapter::crawl` trait logic without duplicating DOM scrapers.
+  - **Phase 30 — Qilin Multi-Node Storage Discovery + AIMD Concurrency Governor:** Created `qilin_nodes.rs` with a persistent `QilinNodeCache` backed by sled DB (`~/.crawli/qilin_nodes.sled`). Implements a 4-stage discovery pipeline: (A) Follow 302 redirect from `/site/data`, (B) Scrape `/site/view` for QData `value="<onion>"` input fields, (C) Load cached nodes from sled + pre-seed known QData storage hosts, (D) Probe all discovered nodes concurrently and return fastest alive (EMA latency α=0.3). Replaced hardcoded `max_concurrent = 2` with AIMD-governed 4-worker baseline (ceiling 16). The 120-circuit aria2 downloader is reserved for single-file range-request downloads only — directory crawling at 120 connections constitutes DDoS behavior on low-bandwidth Tor hidden services.
 
 ## 14. Adapter Isolation and Anti-Contamination Strategy
 *   **Context:** As the suite of Deepweb adapters grows (Dragonforce, Lockbit, Qilin, etc.), shared base functions (such as generic Autoindex parsers or generic HTTP handlers) become bottlenecks. The user noted a severe regression risk: fixing a DOM selector for one adapter inherently risks breaking another adapter that relied on the previous generic struct.

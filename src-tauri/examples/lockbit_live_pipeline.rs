@@ -199,6 +199,7 @@ fn main() {
             download: false,
             circuits: Some(120),
             daemons: None,
+            agnostic_state: false,
         };
 
         let daemon_count = active_ports.len().max(1);

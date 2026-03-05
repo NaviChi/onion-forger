@@ -260,6 +260,7 @@ async fn run_single_adapter(
         download: false,
         circuits: Some(250),
         daemons: Some(8),
+        agnostic_state: false,
     };
     let daemon_count = if is_onion {
         active_ports.len().max(1)

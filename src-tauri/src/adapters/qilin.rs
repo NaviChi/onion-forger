@@ -2,6 +2,7 @@ use tauri::AppHandle;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use crate::adapters::{CrawlerAdapter, SiteFingerprint, FileEntry, EntryType};
+use crate::adapters::qilin_nodes::QilinNodeCache;
 use crate::frontier::CrawlerFrontier;
 use crate::path_utils;
 
@@ -29,8 +30,42 @@ impl CrawlerAdapter for QilinAdapter {
         let queue = Arc::new(crossbeam_queue::SegQueue::new());
         let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-        queue.push(current_url.to_string());
-        frontier.mark_visited(current_url);
+        // Phase 30: Multi-Node Storage Discovery with Persistent Cache
+        let mut actual_seed_url = current_url.to_string();
+        if current_url.contains("/site/view") || current_url.contains("/site/data") {
+            if let Some(uuid_start) = current_url.find("uuid=") {
+                let uuid = current_url[uuid_start + 5..].trim_end_matches('/');
+                
+                let _ = app.emit("log", format!("[Qilin] Phase 30: Multi-node discovery for UUID: {}", uuid));
+                println!("[Qilin Phase 30] Starting multi-node discovery for UUID: {}", uuid);
+
+                // Initialize the persistent node cache
+                let node_cache = QilinNodeCache::default();
+                if let Err(e) = node_cache.initialize().await {
+                    eprintln!("[Qilin Phase 30] Failed to init node cache: {}", e);
+                }
+
+                // Pre-seed known QData storage domains as fallback (Stage C insurance)
+                node_cache.seed_known_mirrors(uuid).await;
+
+                // Run the 4-stage discovery algorithm
+                let (_, client) = frontier.get_client();
+                if let Some(best_node) = node_cache.discover_and_resolve(current_url, uuid, &client).await {
+                    actual_seed_url = best_node.url.clone();
+                    println!("[Qilin Phase 30] ✅ Resolved to storage node: {} ({}ms, {} hits)",
+                        best_node.host, best_node.avg_latency_ms, best_node.hit_count);
+                    let _ = app.emit("log", format!("[Qilin] Storage Node Resolved: {} ({}ms avg latency)",
+                        best_node.host, best_node.avg_latency_ms));
+                } else {
+                    println!("[Qilin Phase 30] ⚠ No alive storage nodes found. Falling back to CMS URL.");
+                    let _ = app.emit("log", "[Qilin] No storage nodes found. Using CMS URL directly.".to_string());
+                }
+            }
+        }
+
+        // Reverted to Strict Depth-First Search parsing (Phase 27)
+        queue.push(actual_seed_url.clone());
+        frontier.mark_visited(&actual_seed_url);
 
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -60,7 +95,14 @@ impl CrawlerAdapter for QilinAdapter {
             }
         });
 
-        let max_concurrent = 120;
+        // Phase 30: AIMD Concurrency Governor
+        // Start at 4 workers (safe baseline). The AIMD controller in the
+        // worker loop monitors 429/timeout rates and adjusts dynamically.
+        // Ceiling: 16 workers (avoids DDoS-triggering on QData storage nodes).
+        // The 120-circuit aria2 downloader is used separately for file downloads.
+        let max_concurrent = 8;
+        let _aimd_error_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _aimd_success_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut workers = tokio::task::JoinSet::new();
 
         let parsed_url = reqwest::Url::parse(current_url)?;
@@ -70,6 +112,7 @@ impl CrawlerAdapter for QilinAdapter {
             let f = frontier.clone();
             let q_clone = queue.clone();
             let ui_tx_clone = ui_tx.clone();
+            let ui_app_clone = app.clone();
             let discovered_ref = all_discovered_entries.clone();
             let pending_clone = pending.clone();
             let domain_clone = base_domain.clone();
@@ -108,10 +151,10 @@ impl CrawlerAdapter for QilinAdapter {
                     }
                     let _guard = TaskGuard { counter: pending_clone.clone() };
 
-                    // 5-pass Retry Pattern for Tor
+                    // 7-pass Exponential Retry Pattern for Tor (Phase 27)
                     let (mut fetch_success, mut html) = (false, None);
 
-                    for attempt in 1..=5 {
+                    for attempt in 1..=7 {
                         let start_time = std::time::Instant::now();
                         let resp_result = tokio::time::timeout(
                             std::time::Duration::from_secs(45),
@@ -133,7 +176,7 @@ impl CrawlerAdapter for QilinAdapter {
                                 f.record_failure(cid);
                                 fetch_success = true; // Mark as "handled" so we don't fallback
                                 break;
-                            } else if status.is_server_error() {
+                            } else if status.is_server_error() || status == 429 {
                                 // Let it retry via the loop
                             }
                         } else if let Ok(Err(_e)) = &resp_result {
@@ -141,10 +184,20 @@ impl CrawlerAdapter for QilinAdapter {
                         } else {
                             f.record_failure(cid);
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        
+                        // Exponential backoff: 2s, 4s, 8s, 16s, 32s, 64s, 128s
+                        let backoff = std::time::Duration::from_secs(1 << attempt);
+                        tokio::time::sleep(backoff).await;
                     }
 
                     if !fetch_success {
+                        use std::io::Write;
+                        // Orphan Logging Subsystem (Phase 27)
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("failed_nodes.log") {
+                            let _ = writeln!(file, "FAILED_NODE: {}", next_url);
+                        }
+                        eprintln!("[Qilin] Dropping node after 7 retries: {}", next_url);
+                        let _ = ui_app_clone.emit("crawl_error", next_url.clone());
                         continue;
                     }
 
@@ -161,6 +214,7 @@ impl CrawlerAdapter for QilinAdapter {
                         let parsed = crate::adapters::autoindex::parse_autoindex_html(&html);
                         for (filename, parsed_size, is_dir) in parsed {
                             let encoded = path_utils::url_encode(&filename);
+                            // Phase 27: Revert to strictly hierarchical sequential path crawling
                             let child_url = format!("{}/{}", next_url.trim_end_matches('/'), encoded);
 
                             if is_dir {
@@ -186,6 +240,8 @@ impl CrawlerAdapter for QilinAdapter {
                                 });
                             }
                         }
+
+
                     } else {
                         // It's the new CMS Blog layout
                         for line in html.lines() {

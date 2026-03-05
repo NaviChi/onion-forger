@@ -306,7 +306,9 @@ async fn start_crawl(
     let vfs_path = support_dir.join(".crawli_vtdb");
     let vfs_path_str = vfs_path.to_string_lossy().to_string();
     let _ = state.vfs.initialize(&vfs_path_str).await;
-    let _ = state.vfs.clear().await;
+    if !options.resume {
+        let _ = state.vfs.clear().await;
+    }
 
     let client = frontier.get_client().1;
     app.emit(

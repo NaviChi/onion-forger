@@ -94,6 +94,7 @@ fn main() -> anyhow::Result<()> {
                 download: false,
                 circuits: Some(5),
                 daemons: Some(5),
+                agnostic_state: false,
             };
             let frontier = Arc::new(CrawlerFrontier::new(
                 None,

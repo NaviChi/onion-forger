@@ -76,6 +76,7 @@ pub mod nu;
 pub mod pear;
 pub mod play;
 pub mod qilin;
+pub mod qilin_nodes;
 pub mod worldleaks;
 
 pub fn support_catalog() -> Vec<AdapterSupportInfo> {

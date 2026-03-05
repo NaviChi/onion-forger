@@ -140,6 +140,45 @@ fn sanitize_component(name: &str) -> String {
     clean
 }
 
+/// Extracts a structural, URL-agnostic logical path footprint from dynamic frontend requests.
+/// This prevents cross-domain or UUID-rotation amnesia in the crawler.
+pub fn extract_agnostic_path(url: &str) -> String {
+    // 1. DragonForce / Next.js SPA routing (extracts `path` query param)
+    if url.contains("?path=") || url.contains("&path=") {
+        if let Ok(parsed) = reqwest::Url::parse(url) {
+            for (k, v) in parsed.query_pairs() {
+                if k == "path" {
+                    let sanitized = sanitize_path(&v);
+                    return if sanitized.is_empty() { "_root".to_string() } else { sanitized };
+                }
+            }
+        }
+    }
+
+    // 2. Qilin / QData CMS internal router mapping
+    // Matches patterns like `/site/data?uuid=xyz/Finance/Q3/file.txt` -> `/Finance/Q3/file.txt`
+    if let Some(uuid_idx) = url.find("uuid=") {
+        let after_uuid = &url[uuid_idx + 5..];
+        // The UUID string ends at the first slash or ampersand
+        if let Some(slash_idx) = after_uuid.find('/') {
+            let amp_idx = after_uuid.find('&').unwrap_or(usize::MAX);
+            if slash_idx < amp_idx {
+                let logical_path = &after_uuid[slash_idx..];
+                let sanitized = sanitize_path(logical_path);
+                return if sanitized.is_empty() { "_root".to_string() } else { sanitized };
+            }
+        }
+    }
+
+    // 3. Fallback: Standard Traversal (Play, LockBit, Autoindex)
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        let sanitized = sanitize_path(parsed.path());
+        return if sanitized.is_empty() { "_root".to_string() } else { sanitized };
+    }
+
+    url.to_string()
+}
+
 pub fn canonicalize_output_root(output_dir: &str) -> std::io::Result<PathBuf> {
     if output_dir.trim().is_empty() {
         return Err(std::io::Error::new(
