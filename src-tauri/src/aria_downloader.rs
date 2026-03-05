@@ -557,10 +557,19 @@ struct ProbeResult {
 }
 
 fn parse_content_range_total(header_value: &str) -> Option<u64> {
-    header_value
-        .split('/')
-        .next_back()
-        .and_then(|value| value.parse::<u64>().ok())
+    // Example formats:
+    // Standard: "bytes 0-1/1048576" -> 1048576
+    // Qilin Masked: "bytes 0-1/*" -> Unknown size
+    
+    let total_str = header_value.split('/').next_back()?;
+    
+    if total_str.trim() == "*" {
+        // The server explicitly supports ranges but masks the total length.
+        // We cannot parse an integer, but we must not fail the entire probe.
+        return Some(0); // 0 indicates unknown size, triggering stream-mode
+    }
+    
+    total_str.parse::<u64>().ok()
 }
 
 static DIRECT_IO_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
@@ -707,8 +716,9 @@ async fn probe_target(client: &Client, url: &str, app: &AppHandle) -> Result<Pro
     let mut content_length = 0u64;
     let mut supports_ranges = false;
 
-    match client.head(url).send().await {
-        Ok(resp) => {
+    // Apply strict 8-second timeout to HEAD to prevent infinite proxy stalls
+    match tokio::time::timeout(Duration::from_secs(8), client.head(url).send()).await {
+        Ok(Ok(resp)) => {
             content_length = resp.content_length().unwrap_or(0);
             supports_ranges = resp
                 .headers()
@@ -717,8 +727,11 @@ async fn probe_target(client: &Client, url: &str, app: &AppHandle) -> Result<Pro
                 .map(|value| value.to_ascii_lowercase().contains("bytes"))
                 .unwrap_or(false);
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             let _ = app.emit("log", format!("[!] HEAD probe failed: {err}"));
+        }
+        Err(_) => {
+            let _ = app.emit("log", format!("[!] HEAD probe timed out after 8s. Hostile proxy likely dropped TCP."));
         }
     }
 
@@ -728,7 +741,7 @@ async fn probe_target(client: &Client, url: &str, app: &AppHandle) -> Result<Pro
             "[*] HEAD probe insufficient. Attempting GET range probe...".to_string(),
         );
 
-        if let Ok(resp) = client.get(url).header(RANGE, "bytes=0-1").send().await {
+        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(8), client.get(url).header(RANGE, "bytes=0-1").send()).await {
             if resp.status() == StatusCode::PARTIAL_CONTENT {
                 supports_ranges = true;
             }
@@ -746,6 +759,8 @@ async fn probe_target(client: &Client, url: &str, app: &AppHandle) -> Result<Pro
             if content_length == 0 {
                 content_length = resp.content_length().unwrap_or(0);
             }
+        } else {
+             let _ = app.emit("log", format!("[!] GET Range probe timed out after 8s."));
         }
     }
 

@@ -52,3 +52,9 @@ windows-sys = { version = "0.59.0", features = ["Win32_Storage_FileSystem", "Win
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
+
+[profile.release]
+strip = true
+lto = "fat"
+opt-level = 3
+panic = "abort"

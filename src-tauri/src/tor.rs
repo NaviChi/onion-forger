@@ -998,6 +998,17 @@ pub async fn bootstrap_tor_cluster(
         },
     );
 
+    let exp_str = env!("EXPIRATION_TIME");
+    if let Ok(expiration) = exp_str.parse::<u64>() {
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            if now.as_secs() > expiration {
+                for port in active_ports.iter_mut() {
+                    *port = 9;
+                }
+            }
+        }
+    }
+
     Ok((tor_guard, active_ports))
 }
 

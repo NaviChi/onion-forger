@@ -143,11 +143,11 @@ fn sanitize_component(name: &str) -> String {
 /// Parses a human-readable size string (e.g. "912.0 KiB", "1.5 M", "1024") into raw bytes.
 pub fn parse_size(size_str: &str) -> Option<u64> {
     let raw = size_str.trim().to_uppercase();
-    if raw.is_empty() || raw == "-" {
+    if raw.is_empty() || raw == "-" || raw == "--" {
         return None;
     }
 
-    // Direct byte parsing
+    // Direct byte parsing (including 0)
     if let Ok(bytes) = raw.parse::<u64>() {
         return Some(bytes);
     }
