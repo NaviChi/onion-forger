@@ -1,85 +1,85 @@
-> **Last Updated:** 2026-03-04T15:08 CST
+# OnionForge: AI Engineering & Context Reference
+> **Last Updated:** 2026-03-05
+> **Version:** 2.0.0
+> **Authors:** Navi (User), Antigravity (AI)
 
-Version: 1.0.1
-Updated: 2026-03-03
-Authors: Navi (User), Codex (GPT-5)
-Related Rules: [MANDATORY-L1] Living Documents, [MANDATORY-L1] Workflow, [MANDATORY-L1] Testing & Validation
+This document serves as the master blueprint for any AI agent tasked with maintaining, extending, or recreating the OnionForge intelligence gathering application. It contains all critical architectural decisions, environment constraints, GUI styling instructions, and API behavioral knowledge required to build this system from scratch without guessing.
 
-# Summary
-Recreation guide for AI and engineers to rebuild the current `crawli` behavior, including backend flow, UI state, and telemetry contracts.
+---
 
-# Context
-This file is a technical “rebuild bible” for deterministic reimplementation.
+## 1. System Identity and Objectives
+OnionForge (codenamed `crawli`) is a cross-platform Tauri (Rust + React/TypeScript) desktop application. Its primary function is to securely bootstrap an embedded Tor daemon swarm, route high-concurrency HTTP/S requests through isolated SOCKS5 proxies using TLS fingerprint spoofing, and systematically export massive deep-web `.onion` directories (specifically targeting complex single-page apps like Qilin and Play Ransomware) via `aria2` protocol scaffolding.
 
-# Analysis
-System architecture:
-- Frontend: React + TypeScript (`src/*`).
-- Native shell/backend: Tauri + Rust (`src-tauri/*`).
-- Core crawl loop: adapter-driven recursion over `CrawlerFrontier`.
-- Download path: Aria-backed mirror/download pipeline.
+*   **Primary Constraint:** The system must run flawlessly on Mac, Linux, and Windows 10/11.
+*   **Secondary Constraint:** The system must gracefully degrade and protect OS resources (e.g., Ephemeral Port Exhaustion, Mechanical HDD IOPS lockouts, RAM limitations).
+*   **Visual Identity:** The React UI uses a hyper-modern "Cyber/Military" dark-mode aesthetic. 
 
-# Details
-Rebuild checklist:
-1. Initialize frontend shell and dashboard.
-2. Implement Tauri commands:
-   - `start_crawl`, `cancel_crawl`, `download_files`, `download_all`, `initiate_download`, `get_vfs_children`, `get_adapter_support_catalog`.
-3. Implement adapter registry and fingerprint matching.
-4. Implement `CrawlerFrontier`:
-   - URL dedupe, client pool, semaphore, AIMD, cancellation flags, metrics.
-5. Implement recursive autoindex crawler:
-   - URL join-based recursion, subtree scope checks, queue accounting guard.
-6. Emit events:
-   - `crawl_log`, `crawl_progress`, `crawl_status_update`, download events.
-7. Implement dashboard progress UI:
-   - Consume `crawl_status_update` and render 0–100 progress bar plus metrics.
-8. Validate with:
-   - `cargo test`
-   - `npm run build`
+---
 
-Current event contract (`crawl_status_update`):
-- `phase: string`
-- `progressPercent: number`
-- `visitedNodes: number`
-- `processedNodes: number`
-- `queuedNodes: number`
-- `activeWorkers: number`
-- `workerTarget: number`
-- `etaSeconds: number | null`
-- `estimation: string`
+## 2. Core Architecture Stack
 
-## Advanced Rebuild Instructions (HFT / Lock-Free Paradigm)
-This architecture actively enforces a high-throughput, lock-free paradigm. Any future engineering or rebuilding MUST strictly implement these patterns:
-1. **Concurrency Control:** Prefer BBR (Bottleneck Bandwidth and RTT) models over simplistic AIMD routines.
-2. **Predictive Latency:** Use Extended Kalman Filters (EKF) to continuously model network jitter.
-3. **Data Integrity:** Implement Merkle-Tree BFT consensus for chunking. Large downloads must never drop entirely due to localized Byzantine failures.
-4. **I/O Subsystem:** Treat disk writes as a unified sequential stream fed by an LMAX Disruptor Ring Buffer. A single dedicated I/O worker consumes the buffer, removing Mutex bottlenecks across Tor workers.
-5. **Memory-Mapped (mmap) Writes:** To achieve maximum Mechanical HDD compatibility during massive concurrent Tor downloads, the I/O consumer MUST implement `memmap2` zero-copy allocations in `aria_downloader.rs`. Native OS Page Catching prevents hardware IOPS limits from cracking the pipeline.
-6. **Adaptive Circuit Evasion:** Hardcoded `--ExitNodes` are obsolete. Rebuilds must utilize `--ControlPort` bindings combined with `CookieAuthentication 1`. Upon detecting HTTP 429 penalties or TCP Resets, the engine MUST fire a Hex-authenticated TCP `SIGNAL NEWNYM` to force an immediate, zero-downtime routing rotate without sacrificing the existing listener sockets.
-7. **Adaptive JWT Iframe Parsing:** When extracting endpoints from SPA frameworks like Next.js that utilize volatile JWT-authentic### Adaptive JWT Iframe Parsing (DragonForce)
-Do not attempt bare-metal API calls against Deepweb architectures protected by tokenized Next.js wrappers. Use standard `scraper::Selector` tools to capture the `<iframe>` bridging URLs and inject them back into `CrawlerFrontier`. This offloads authentication logic back to Tor.
+### Backend Container (Tauri/Rust)
+*   **Framework:** Tauri v2 configured with `tauri.conf.json`. 
+*   **Asynchronous Engine:** `tokio` multi-threaded runtime (`tokio::spawn`, `Arc<Mutex>`).
+*   **Networking:** `reqwest` initialized inside Tor environments using `Socks5Stream` bindings via `tokio-socks`.
+*   **Data Scaffolding Engine:** 
+    *   For HTML/API Parsing: High-concurrency `crossbeam-queue` URL frontiers.
+    *   For Downloading: Out-of-process RPC to a dynamically spawned `aria2c` multi-connection daemon.
+*   **In-Memory DB:** `sled` embedded KV store for recording Visited URLs and VFS arrays securely.
 
-### Adapter Polyfill Delegation (Qilin)
-When encountering ransomware sites utilizing custom CSS template frameworks ("QData") masking standard HTML tables, create an adapter isolated purely to the fingerprint detection step (e.g. `body.contains("QData")`). Do not build a custom scraper. In `crawl()`, delegate execution immediately back to the master `<AutoindexAdapter as CrawlerAdapter>::crawl` generic framework. Every custom scraper logic tree requires rigorous unit testing boundaries, avoid code sprawl.
-8. **Testing & Integrity:** Any Lock-Free transition must maintain strictly identical Cancellation and Tor lifecycle teardowns.
+### Frontend Container (React/TypeScript)
+*   **Build Tool:** Vite.
+*   **Styling:** Pure CSS (`App.css`, `Dashboard.css`). NO Tailwind. Explicit emphasis on glassmorphism, glowing accents (`box-shadow`), dark grays (`#0a0a0a`), neon cyan/purple combinations (`#00e5ff`/`#8b5cf6`), and monospace system fonts (`JetBrains Mono`).
+*   **State Management:** Standard React hooks (`useState`, `useEffect`) layered with Tauri IPC event listeners (`listen<T>`).
+*   **Components:** Modularized structure (e.g., `VFSExplorer.tsx`, `Dashboard.tsx`). 
 
-# Prevention Rules
-**1. Keep event payload schemas versioned and synchronized across Rust + TS.**
-**2. Never implement native process/circuit behaviors in frontend-only code.**
-**3. Preserve cancellation semantics across crawl workers, download workers, and Tor cleanup.**
-**4. Require test pass + frontend build pass before claiming parity.**
-**5. Update this file whenever core flow, IPC, or state contracts change.**
+---
 
-# Risk
-- Unsynced event contracts cause silent UI regressions.
-- Missing cancellation propagation can leak background resources.
+## 3. The 4-Pillar Pipeline Strategy
+To recreate or modify this app, you must understand how data traverses the 4 pillars of the crawler:
 
-# History
-- 2026-03-03: Initial recreation baseline authored.
+#### Pillar 1: Bootstrapping & The Swarm (`tor.rs`)
+The host OS spawns exactly `N` lightweight, headless `tor` proxy daemons (e.g., ports 9051 to 9056). Each daemon runs from a dynamically generated, isolated `torrc` config in the `temp_onionforge_forger` output directory. 
+*   **Prevention Rule:** Never assign more than 20 simultaneous `aria2` download circuits to a single Tor daemon to prevent Windows CPU context-switching crashes. 
 
-# Appendices
-- Core files:
-  - `src-tauri/src/lib.rs`
-  - `src-tauri/src/frontier.rs`
-  - `src-tauri/src/adapters/*`
-  - `src/App.tsx`
-  - `src/components/Dashboard.tsx`
+#### Pillar 2: The Frontier Scanner (`frontier.rs` & `adapters/`)
+The user inputs a `.onion` URL. The `AdapterRegistry` hits the endpoint to read the HTTP Header and HTML Body (the `SiteFingerprint`). It matches this fingerprint to a specialized adapter (e.g., `qilin.rs`, `play.rs`, `autoindex.rs`).
+The Adapter utilizes `tokio` workers to crawl the site, extracting `FileEntry` objects.
+*   **Prevention Rule:** Some nodes capitalize protocols (`HTTP://`). ALWAYS use `.to_lowercase()` when parsing URLs so the router doesn't accidentally discard safe links.
+
+#### Pillar 3: The Virtual File System (`vfs.rs` & `VFSExplorer.tsx`)
+Extracted paths are blasted over Tauri IPC to the React frontend, where they are mapped onto a TanStack generic virtualizer (`useVirtualizer`) to ensure the DOM doesn't lock up when 50,000 files are rendered.
+*   **Prevention Rule:** Do not trust size headers perfectly. UI progress bars must rely on definitive `0 bps` backend completion signals instead of assuming a file is 100% finished just because bytes stream in without a `Content-Length`.
+
+#### Pillar 4: The Storage Scaffolder (`aria_downloader.rs`)
+When the user clicks "Download", the Rust backend intercepts the file array. It generates 0-byte structural placeholders for folders. For physical files, it passes the URLs using an RPC XML payload to a background `aria2c` process.
+*   **Prevention Rule:** The backend MUST fallback to sequential byte writes (instead of zero-copy `mmap`) if memory mapping fails. This protects users with 5400 RPM Mechanical HDDs from 100% disk usage lockouts.
+
+---
+
+## 4. UI / UX Design Guidelines
+
+If generating new frontend React code, strictly adhere to these rules:
+
+1.  **Colors:** 
+    *   Primary Background: `#0f1014`
+    *   Panel Background: `rgba(20, 22, 28, 0.7)` with `backdrop-filter: blur(12px)`
+    *   Accent Primary: `#a200ff` (Deep Purple)
+    *   Accent Secondary: `#00e5ff` (Neon Cyan)
+    *   Text: `#e2e8f0` (Main), `#94a3b8` (Muted)
+2.  **Typography:** Use sans-serif for UI elements (`Inter`, `system-ui`) and heavily utilize `JetBrains Mono` for ALL numbers, logs, paths, and statuses.
+3.  **Components:** Use `lucide-react` for iconography. Build custom animated loaders (e.g., `VibeLoader.tsx`), relying on `@keyframes` rather than static SVGs for scanning indiciators.
+4.  **No Placeholders:** If you must simulate data in the UI without a backend, construct a static fixture file (like `vfsFixture.ts`) and inject it gracefully. Do not write generic "Hello World" placeholder blocks. Everything must look premium and dense.
+
+---
+
+## 5. Development Rituals & Edge Cases
+
+When editing Rust logic, remember these historical constraints:
+*   **Windows Process Limits:** Windows has a strict TCP `MaxUserPort` limit (~16,000). Uncapped HTTP requests will blue-screen the network adapter. Keep async workers clamped (e.g., max 60 workers per adapter).
+*   **Tor TLS Fingerprinting:** Cloudflare and Nginx will drop connections if the `reqwest` TLS client acts like a bot. You must bind `rustls` instead of `native-tls` inside the `cargo` build and mimic standard browser headers.
+*   **Deadlocks:** You must release `Mutex` guards *before* triggering `await` in `tokio`, otherwise the async runtime thread will permanently freeze waiting for data chunks.
+*   **Adaptive JWT Iframe Parsing (DragonForce):** Do not attempt bare-metal API calls against Deepweb architectures protected by tokenized Next.js wrappers. Use standard `scraper::Selector` tools to capture the `<iframe>` bridging URLs and inject them back into `CrawlerFrontier`. This offloads authentication logic back to Tor.
+*   **Adapter Polyfill Delegation (Qilin):** When encountering ransomware sites utilizing custom CSS template frameworks ("QData") masking standard HTML tables, create an adapter isolated purely to the fingerprint detection step (e.g. `body.contains("QData")`). Do not build a custom scraper. In `crawl()`, delegate execution immediately back to the master `<AutoindexAdapter as CrawlerAdapter>::crawl` generic framework. Every custom scraper logic tree requires rigorous unit testing boundaries, avoid code sprawl.
+
+By internalizing this document, you possess the context necessary to forge new adapters and structural improvements without compromising the system's foundational stability.

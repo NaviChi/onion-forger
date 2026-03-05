@@ -153,6 +153,7 @@ impl CrawlerAdapter for AutoindexAdapter {
             let pending_clone = pending.clone();
 
             workers.spawn(async move {
+                let mut idle_sleep_ms: u64 = 50;
                 loop {
                     // Check cancellation before doing any work
                     if f.is_cancelled() {
@@ -160,12 +161,16 @@ impl CrawlerAdapter for AutoindexAdapter {
                     }
 
                     let next_url = match q_clone.pop() {
-                        Some(url) => url,
+                        Some(url) => {
+                            idle_sleep_ms = 50;
+                            url
+                        },
                         None => {
                             if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                                 break;
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
                             continue;
                         }
                     };
@@ -223,59 +228,63 @@ impl CrawlerAdapter for AutoindexAdapter {
                         continue;
                     }
 
-                    // Parse all entries from the autoindex page
-                    let parsed = parse_autoindex_html(&html);
-                    let mut new_files = Vec::new();
+                    // Parse all entries from the autoindex page off-thread
+                    let (spawned_files, spawned_folders) = tokio::task::spawn_blocking({
+                        let html = html.clone();
+                        let next_url = next_url.clone();
+                        move || {
+                            let mut local_files = Vec::new();
+                            let mut local_folders = Vec::new();
+                            let parsed = parse_autoindex_html(&html);
 
-                    for (filename, parsed_size, is_dir) in parsed {
-                        let encoded = path_utils::url_encode(&filename);
-                        let child_url = format!("{}/{}", next_url.trim_end_matches('/'), encoded);
+                            for (filename, parsed_size, is_dir) in parsed {
+                                let encoded = path_utils::url_encode(&filename);
+                                let child_url = format!("{}/{}", next_url.trim_end_matches('/'), encoded);
 
-                        if is_dir {
-                            // Emit folder entry
-                            let sanitized_path =
-                                format!("/{}", path_utils::sanitize_path(&filename));
-                            new_files.push(FileEntry {
-                                path: sanitized_path.clone(),
-                                size_bytes: None,
-                                entry_type: EntryType::Folder,
-                                raw_url: format!("{}/", child_url),
-                            });
-
-                            // Enqueue subdirectory for recursive crawling
-                            let sub_url = format!("{}/", child_url);
-                            if f.mark_visited(&sub_url) {
-                                pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                q_clone.push(sub_url);
-                            }
-                        } else {
-                            // File entry
-                            let size = if f.active_options.sizes {
-                                if let Some(s) = parsed_size {
-                                    Some(s)
+                                if is_dir {
+                                    let sanitized_path = format!("/{}", path_utils::sanitize_path(&filename));
+                                    local_files.push(FileEntry {
+                                        path: sanitized_path,
+                                        size_bytes: None,
+                                        entry_type: EntryType::Folder,
+                                        raw_url: format!("{}/", child_url),
+                                    });
+                                    local_folders.push(format!("{}/", child_url));
                                 } else {
-                                    // Try HEAD request for Content-Length
-                                    match client.head(&child_url).send().await {
-                                        Ok(head_resp) => head_resp
-                                            .headers()
-                                            .get("content-length")
-                                            .and_then(|v| v.to_str().ok())
-                                            .and_then(|s| s.parse::<u64>().ok()),
-                                        Err(_) => None,
-                                    }
+                                    let sanitized_path = format!("/{}", path_utils::sanitize_path(&filename));
+                                    local_files.push(FileEntry {
+                                        path: sanitized_path,
+                                        size_bytes: parsed_size,
+                                        entry_type: EntryType::File,
+                                        raw_url: child_url,
+                                    });
                                 }
-                            } else {
-                                None
-                            };
+                            }
+                            (local_files, local_folders)
+                        }
+                    }).await.unwrap_or_default();
 
-                            let sanitized_path =
-                                format!("/{}", path_utils::sanitize_path(&filename));
-                            new_files.push(FileEntry {
-                                path: sanitized_path,
-                                size_bytes: size,
-                                entry_type: EntryType::File,
-                                raw_url: child_url,
-                            });
+                    let mut new_files = spawned_files;
+                    for sub_url in spawned_folders {
+                        if f.mark_visited(&sub_url) {
+                            pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            q_clone.push(sub_url);
+                        }
+                    }
+
+                    // Async HEAD requests for Content-Length if required
+                    if f.active_options.sizes {
+                        for nf in new_files.iter_mut() {
+                            if nf.entry_type == EntryType::File && nf.size_bytes.is_none() {
+                                if let Ok(Ok(head_resp)) = tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    client.head(&nf.raw_url).send()
+                                ).await {
+                                    nf.size_bytes = head_resp.headers().get("content-length")
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|s| s.parse::<u64>().ok());
+                                }
+                            }
                         }
                     }
 

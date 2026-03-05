@@ -362,11 +362,12 @@ export function VFSExplorer({
                                     {downloadProgress && downloadProgress[node.id] ? (
                                         (() => {
                                             const dl = downloadProgress[node.id];
-                                            const activePercent = dl.total_bytes && dl.total_bytes > 0
-                                                ? Math.min(100, Math.floor((dl.bytes_downloaded / dl.total_bytes) * 100))
-                                                : (dl.bytes_downloaded > 0 ? 100 : 0);
+                                            const sizeKnown = dl.total_bytes !== null && dl.total_bytes > 0;
+                                            const activePercent = sizeKnown
+                                                ? Math.min(100, Math.floor((dl.bytes_downloaded / dl.total_bytes!) * 100))
+                                                : 100;
 
-                                            const isDone = activePercent === 100 || (dl.total_bytes && dl.bytes_downloaded >= dl.total_bytes);
+                                            const isDone = (sizeKnown && dl.bytes_downloaded >= dl.total_bytes!) || (dl.speed_bps === 0 && dl.bytes_downloaded > 0);
 
                                             return (
                                                 <div style={{ flex: 1, position: 'relative', height: '100%', display: 'flex', alignItems: 'center', marginLeft: '12px', paddingRight: '24px' }}>
