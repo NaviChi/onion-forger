@@ -741,29 +741,40 @@ async fn probe_target(client: &Client, url: &str, app: &AppHandle) -> Result<Pro
             "[*] HEAD probe insufficient. Attempting GET range probe...".to_string(),
         );
 
-        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(8), client.get(url).header(RANGE, "bytes=0-1").send()).await {
-            if resp.status() == StatusCode::PARTIAL_CONTENT {
-                supports_ranges = true;
-            }
+        match tokio::time::timeout(Duration::from_secs(8), client.get(url).header(RANGE, "bytes=0-1").send()).await {
+            Ok(Ok(resp)) => {
+                if resp.status() == StatusCode::PARTIAL_CONTENT {
+                    supports_ranges = true;
+                }
 
-            if let Some(value) = resp
-                .headers()
-                .get(CONTENT_RANGE)
-                .and_then(|value| value.to_str().ok())
-            {
-                if let Some(total) = parse_content_range_total(value) {
-                    content_length = total;
+                if let Some(value) = resp
+                    .headers()
+                    .get(CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    if let Some(total) = parse_content_range_total(value) {
+                        content_length = total;
+                    }
+                }
+
+                if content_length == 0 {
+                    content_length = resp.content_length().unwrap_or(0);
                 }
             }
-
-            if content_length == 0 {
-                content_length = resp.content_length().unwrap_or(0);
+            Ok(Err(err)) => {
+                let _ = app.emit("log", format!("[!] GET Range probe failed: {err}"));
+                supports_ranges = false;
+                content_length = 0;
             }
-        } else {
-             let _ = app.emit("log", format!("[!] GET Range probe timed out after 8s."));
+            Err(_) => {
+                let _ = app.emit("log", "[!] GET Range probe timed out after 8s. Forcing fallback stream mode...".to_string());
+                supports_ranges = false;
+                content_length = 0;
+            }
         }
     }
 
+    // Always succeed. If content_length remains 0, the caller falls back to 1-circuit stream mode.
     Ok(ProbeResult {
         content_length,
         supports_ranges: supports_ranges && content_length > 0,

@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     
     println!("✅ Chrome Sandboxed Engine Online (Proxy: 127.0.0.1:9051)");
 
-    let test_url = "http://qjupqf5xbmc76jzne7xu7y2ddmwtfxbbzzeax6gs4lezg3dyr5bfu2qd.onion/d7789467-8d06-4778-895c-4b81c203881f/";
+    let test_url = "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed";
     println!("🎯 Navigating to Qilin Storage Node...");
     println!("URL: {}", test_url);
 

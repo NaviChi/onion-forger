@@ -27,7 +27,14 @@ impl CrawlerAdapter for QilinAdapter {
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
+        struct RetryPayload {
+            url: String,
+            attempt: u8,
+            unlock_timestamp: std::time::Instant,
+        }
+
         let queue = Arc::new(crossbeam_queue::SegQueue::new());
+        let retry_queue = Arc::new(crossbeam_queue::SegQueue::<RetryPayload>::new());
         let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
         // Phase 30: Multi-Node Storage Discovery with Persistent Cache
@@ -111,6 +118,7 @@ impl CrawlerAdapter for QilinAdapter {
         for _ in 0..max_concurrent {
             let f = frontier.clone();
             let q_clone = queue.clone();
+            let retry_q_clone = retry_queue.clone();
             let ui_tx_clone = ui_tx.clone();
             let ui_app_clone = app.clone();
             let discovered_ref = all_discovered_entries.clone();
@@ -125,18 +133,36 @@ impl CrawlerAdapter for QilinAdapter {
                         break;
                     }
 
-                    let next_url = match q_clone.pop() {
+                    let (next_url, current_attempt) = match q_clone.pop() {
                         Some(url) => {
                             idle_sleep_ms = 50;
-                            url
+                            (url, 1)
                         },
                         None => {
-                            if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                                break;
+                            let mut found_retry = None;
+                            let len = retry_q_clone.len();
+                            for _ in 0..len {
+                                if let Some(payload) = retry_q_clone.pop() {
+                                    if std::time::Instant::now() >= payload.unlock_timestamp {
+                                        found_retry = Some(payload);
+                                        break;
+                                    } else {
+                                        retry_q_clone.push(payload);
+                                    }
+                                }
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
-                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
-                            continue;
+                            
+                            if let Some(payload) = found_retry {
+                                idle_sleep_ms = 50;
+                                (payload.url, payload.attempt)
+                            } else {
+                                if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 && retry_q_clone.is_empty() {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                                idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
+                                continue;
+                            }
                         }
                     };
 
@@ -157,53 +183,63 @@ impl CrawlerAdapter for QilinAdapter {
                     }
                     let _guard = TaskGuard { counter: pending_clone.clone() };
 
-                    // 7-pass Exponential Retry Pattern for Tor (Phase 27)
-                    let (mut fetch_success, mut html) = (false, None);
+                    // 7-pass Exponential Retry Pattern (Inverted Worker-Stealing)
+                    let start_time = std::time::Instant::now();
+                    let resp_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(45),
+                        client.get(&next_url).send()
+                    ).await;
 
-                    for attempt in 1..=7 {
-                        let start_time = std::time::Instant::now();
-                        let resp_result = tokio::time::timeout(
-                            std::time::Duration::from_secs(45),
-                            client.get(&next_url).send()
-                        ).await;
+                    let mut html = None;
+                    let mut should_retry = false;
 
-                        if let Ok(Ok(resp)) = resp_result {
-                            f.record_success(cid, 4096, start_time.elapsed().as_millis() as u64);
-                            let status = resp.status();
-                            
-                            if status.is_success() {
-                                if let Ok(body) = resp.text().await {
-                                    fetch_success = true;
-                                    html = Some(body);
-                                    break;
-                                }
-                            } else if status == 404 {
-                                // Real 404: skip fallback, it's definitively gone
-                                f.record_failure(cid);
-                                fetch_success = true; // Mark as "handled" so we don't fallback
-                                break;
-                            } else if status.is_server_error() || status == 429 {
-                                // Let it retry via the loop
+                    if let Ok(Ok(resp)) = resp_result {
+                        f.record_success(cid, 4096, start_time.elapsed().as_millis() as u64);
+                        let status = resp.status();
+                        
+                        if status.is_success() {
+                            if let Ok(body) = resp.text().await {
+                                html = Some(body);
+                            } else {
+                                should_retry = true;
                             }
-                        } else if let Ok(Err(_e)) = &resp_result {
+                        } else if status == 404 {
                             f.record_failure(cid);
                         } else {
                             f.record_failure(cid);
+                            should_retry = true;
                         }
-                        
-                        // Exponential backoff: 2s, 4s, 8s, 16s, 32s, 64s, 128s
-                        let backoff = std::time::Duration::from_secs(1 << attempt);
-                        tokio::time::sleep(backoff).await;
+                    } else {
+                        f.record_failure(cid);
+                        should_retry = true;
                     }
-
-                    if !fetch_success {
-                        use std::io::Write;
-                        // Orphan Logging Subsystem (Phase 27)
-                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("failed_nodes.log") {
-                            let _ = writeln!(file, "FAILED_NODE: {}", next_url);
+                    
+                    if should_retry {
+                        if current_attempt < 15 {
+                            // Phase 38: 8-second clamp & 15-pass attempts
+                            let mut backoff_secs = 1 << current_attempt;
+                            if backoff_secs > 8 {
+                                backoff_secs = 8;
+                            }
+                            let backoff = std::time::Duration::from_secs(backoff_secs);
+                            
+                            retry_q_clone.push(RetryPayload {
+                                url: next_url,
+                                attempt: current_attempt + 1,
+                                unlock_timestamp: std::time::Instant::now() + backoff,
+                            });
+                            pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            
+                            // Phase 38: Worker Breathers (DDoS Relief)
+                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        } else {
+                            use std::io::Write;
+                            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("failed_nodes.log") {
+                                let _ = writeln!(file, "FAILED_NODE: {}", next_url);
+                            }
+                            eprintln!("[Qilin] Dropping node after 15 retries: {}", next_url);
+                            let _ = ui_app_clone.emit("crawl_error", next_url.clone());
                         }
-                        eprintln!("[Qilin] Dropping node after 7 retries: {}", next_url);
-                        let _ = ui_app_clone.emit("crawl_error", next_url.clone());
                         continue;
                     }
 

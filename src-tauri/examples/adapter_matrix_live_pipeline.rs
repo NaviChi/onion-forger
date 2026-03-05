@@ -257,9 +257,10 @@ async fn run_single_adapter(
     let options = CrawlOptions {
         listing: true,
         sizes: true,
-        download: false,
+        download: true,
         circuits: Some(250),
-        daemons: Some(8),
+        daemons: Some(16),
+        resume: false,
         agnostic_state: false,
     };
     let daemon_count = if is_onion {
@@ -485,6 +486,11 @@ async fn run_single_adapter(
             Ordering::Relaxed,
         );
         // Ignore the BBR / EKF fields in the CLI matrix output for now since we just check disk.
+    });
+
+    let log_listener_id = app.listen_any("log", move |evt: Event| {
+        let text = evt.payload().trim_matches('"').replace("\\\"", "\"");
+        println!("[Tauri::Log] {}", text);
     });
 
     let download_start = Instant::now();
