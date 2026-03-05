@@ -1,7 +1,30 @@
-> **Last Updated:** 2026-03-04T15:08 CST
+> **Last Updated:** 2026-03-05T17:12 CST
 
-Version: 1.0.9
-Updated: 2026-03-04
+## Phase 42: Qilin Crawl & Download Pipeline Critical Fixes (2026-03-05)
+
+### Issues Found (Live Test)
+1. **Stage D Serial Node Probing** — 15 dead nodes × 30s timeout = 450s wasted before crawl even starts
+2. **No Sled Cache TTL** — Dead/seized nodes persisted forever, poisoning every future run
+3. **Stage B Regex Too Narrow** — Only matched `value="<onion>"`, missed `href=`, `data-url=`, `iframe src=` patterns
+4. **CMS Fallback = 12 Files** — When all storage nodes die, crawler fell back to CMS blog page (no file index)
+5. **Serial Probe Bottleneck** — `probe_target()` called sequentially for every file even when `size_hint` existed
+
+### Fixes Implemented
+1. **Concurrent `JoinSet` Probing** in `qilin_nodes.rs` — All nodes probed simultaneously with 15s timeout (was 30s serial)
+2. **7-Day TTL Eviction** — `get_nodes()` auto-purges nodes with `last_seen > 604800s ago` from sled DB
+3. **Hardened Stage B Regex** — Now captures `href="http://<onion>/..."`, `data-url="..."`, `src="..."` patterns
+4. **Direct UUID Retry with NEWNYM** in `qilin.rs` — When `discover_and_resolve()` returns `None`, blasts fresh Tor circuits and attempts direct URL construction against 3 known mirrors, validating autoindex HTML presence before use
+5. **Size-Hint Probe Skip** in `aria_downloader.rs` — Files with valid `size_hint > 0` bypass `probe_target()` entirely
+
+### Prevention Rules
+- **P42-1:** Node discovery probes MUST be concurrent, never serial. Use `JoinSet` with hard wall-clock timeouts.
+- **P42-2:** Any persistent cache for volatile darkweb infrastructure MUST have TTL eviction (≤7 days).
+- **P42-3:** Regex patterns for DOM scraping MUST account for multiple attribute citation styles (`value=`, `href=`, `data-url=`, `src=`).
+- **P42-4:** CMS fallback crawling MUST be treated as absolute last resort with explicit user warning.
+- **P42-5:** File probing MUST be skipped when reliable metadata (size_hint) already exists from the crawl phase.
+
+Version: 1.0.10
+Updated: 2026-03-05
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [MANDATORY-L1] Prevention Discipline, [MANDATORY-L1] Testing & Validation, [MANDATORY-L1] Performance/Cost/Quality
 
@@ -197,6 +220,7 @@ Issue-to-fix mapping:
 - 2026-03-03: Unified batch progress counters/bytes across phases and moved frontier WAL path to platform temp directory.
 - 2026-03-03: Re-registered LockBit adapter in runtime registry and fixed `engine_test` `CrawlOptions` fixtures for `daemons` field parity.
 - 2026-03-04: Added adaptive Direct I/O fallback policy, adaptive tournament telemetry/sizing, SRPT+aging batch scheduling controls, and strict quality workflow/toolchain pinning.
+- 2026-03-05: Added Phase 42 Qilin crawl/download pipeline fixes and synchronized release validation for `v0.2.6`.
 
 # Appendices
 - Validation:

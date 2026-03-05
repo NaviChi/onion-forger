@@ -64,8 +64,59 @@ impl CrawlerAdapter for QilinAdapter {
                     let _ = app.emit("log", format!("[Qilin] Storage Node Resolved: {} ({}ms avg latency)",
                         best_node.host, best_node.avg_latency_ms));
                 } else {
-                    println!("[Qilin Phase 30] ⚠ No alive storage nodes found. Falling back to CMS URL.");
-                    let _ = app.emit("log", "[Qilin] No storage nodes found. Using CMS URL directly.".to_string());
+                    // Phase 42 Fix 4: Direct UUID retry with NEWNYM rotation
+                    println!("[Qilin Phase 42] ⚠ All storage nodes dead. Attempting direct UUID retry with NEWNYM...");
+                    let _ = app.emit("log", "[Qilin] All storage nodes dead. Trying direct UUID construction with fresh circuits...".to_string());
+
+                    // Blast NEWNYM to all active Tor daemons to get fresh circuits
+                    for port in 9051u16..=9058 {
+                        let _ = crate::tor::request_newnym(port).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                    let known_mirrors = vec![
+                        "7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion",
+                        "25mjg55vcbjzwykz2uqsvaw7hcevm4pqxl42o324zr6qf5zgddmghkqd.onion",
+                        "arrfcpipltlfgxc6hvjylixc6c5hrummwctz4wqysk3h56ntqz5scnad.onion",
+                    ];
+
+                    let mut found_alive = false;
+                    for mirror in &known_mirrors {
+                        let test_url = format!("http://{}/{}/", mirror, uuid);
+                        println!("[Qilin Phase 42] Probing direct mirror: {}", test_url);
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            client.get(&test_url).send()
+                        ).await {
+                            Ok(Ok(resp)) if resp.status().is_success() || resp.status().as_u16() == 301 || resp.status().as_u16() == 302 => {
+                                // Check if response body looks like an autoindex
+                                let final_url = resp.url().as_str().to_string();
+                                if let Ok(body) = resp.text().await {
+                                    if body.contains("<table id=\"list\">") || body.contains("Index of") || body.contains("<td class=\"link\">") {
+                                        println!("[Qilin Phase 42] ✅ Direct mirror alive with file index: {}", mirror);
+                                        let _ = app.emit("log", format!("[Qilin] ✅ Direct mirror alive: {}", mirror));
+                                        actual_seed_url = if final_url != test_url { final_url } else { test_url };
+                                        found_alive = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(Ok(resp)) => {
+                                println!("[Qilin Phase 42] Mirror {} responded with {}", mirror, resp.status());
+                            }
+                            Ok(Err(e)) => {
+                                println!("[Qilin Phase 42] Mirror {} unreachable: {}", mirror, e);
+                            }
+                            Err(_) => {
+                                println!("[Qilin Phase 42] Mirror {} timed out", mirror);
+                            }
+                        }
+                    }
+
+                    if !found_alive {
+                        println!("[Qilin Phase 42] ⚠ No alive mirrors found. Falling back to CMS URL.");
+                        let _ = app.emit("log", "[Qilin] No alive storage nodes. Using CMS URL directly (limited results expected).".to_string());
+                    }
                 }
             }
         }
@@ -422,10 +473,16 @@ impl CrawlerAdapter for QilinAdapter {
 
     fn known_domains(&self) -> Vec<&'static str> {
         vec![
+            // CMS frontends
             "iv6lrjrd5ioyanvvemnkhturmyfpfbdcy442e22oqd2izkwnjw23m3id.onion",
             "ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion",
             "ef4p3qn56susyjy56vym4gawjzaoc52e52w545e7mu6qhbmfut5iwxqd.onion",
             "6esfx73oxphqeh2lpgporkw72uj2xqm5bbb6pfl24mt27hlll7jdswyd.onion",
+            // Phase 42: Storage nodes (auto-detected via Stage A/B/D)
+            "szgkpzhcrnshftjb5mtvd6bc5oep5yabmgfmwt7u3tiqzfikoew27hqd.onion",
+            "7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion",
+            "25mjg55vcbjzwykz2uqsvaw7hcevm4pqxl42o324zr6qf5zgddmghkqd.onion",
+            "arrfcpipltlfgxc6hvjylixc6c5hrummwctz4wqysk3h56ntqz5scnad.onion",
         ]
     }
 

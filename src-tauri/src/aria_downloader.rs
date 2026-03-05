@@ -986,6 +986,27 @@ pub async fn start_batch_download(
             }
         }
 
+        // Phase 42 Fix 5: Skip probe for files that already have size_hint from crawler metadata
+        if let Some(hint) = file.size_hint {
+            if hint > 0 {
+                if hint <= BATCH_LARGE_THRESHOLD {
+                    small_candidates.push(ScheduledBatchFile {
+                        entry: file.clone(),
+                        estimated_size: hint,
+                        enqueue_order,
+                    });
+                } else {
+                    large_candidates.push(ScheduledBatchFile {
+                        entry: file.clone(),
+                        estimated_size: hint,
+                        enqueue_order,
+                    });
+                }
+                enqueue_order = enqueue_order.saturating_add(1);
+                continue;
+            }
+        }
+
         match probe_target(&sniff_client, &file.url, &app).await {
             Ok(probe) => {
                 let estimated_size = file.size_hint.unwrap_or(probe.content_length);

@@ -64,15 +64,30 @@ impl QilinNodeCache {
     }
 
     /// Retrieve all cached storage nodes for a given UUID.
+    /// Phase 42 Fix 2: Automatically evicts nodes older than 7 days (604800s).
     pub async fn get_nodes(&self, uuid: &str) -> Vec<StorageNode> {
         let guard = self.db.lock().await;
         let mut nodes = Vec::new();
+        let now = now_unix();
+        const TTL_SECS: u64 = 604800; // 7 days
         if let Some(db) = guard.as_ref() {
             let prefix = format!("node:{}:", uuid);
+            let mut stale_keys = Vec::new();
             for item in db.scan_prefix(prefix.as_bytes()).flatten() {
                 if let Ok(node) = serde_json::from_slice::<StorageNode>(&item.1) {
-                    nodes.push(node);
+                    if now.saturating_sub(node.last_seen) > TTL_SECS {
+                        stale_keys.push(item.0.to_vec());
+                        println!("[QilinNodeCache] TTL eviction: {} (last seen {}s ago)", node.host, now - node.last_seen);
+                    } else {
+                        nodes.push(node);
+                    }
                 }
+            }
+            for key in stale_keys {
+                let _ = db.remove(key);
+            }
+            if !nodes.is_empty() {
+                let _ = db.flush_async().await;
             }
         }
         // Sort by hit_count descending, then by latency ascending (prefer reliable + fast nodes)
@@ -101,11 +116,29 @@ impl QilinNodeCache {
     /// Pre-seed the cache with all known Qilin QData storage domains.
     /// These are the storage hosts that host the actual file data.
     /// Each gets paired with the UUID to form a probable URL.
+    /// Phase 42: Expanded with all historically discovered nodes so they
+    /// are always checked as fallback candidates during Stage D probing.
     pub async fn seed_known_mirrors(&self, uuid: &str) {
         let known_storage_hosts = vec![
+            // === Active (confirmed alive 2026-03-05) ===
+            "szgkpzhcrnshftjb5mtvd6bc5oep5yabmgfmwt7u3tiqzfikoew27hqd.onion",
+            // === Previously active QData storage nodes ===
             "7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion",
             "25mjg55vcbjzwykz2uqsvaw7hcevm4pqxl42o324zr6qf5zgddmghkqd.onion",
             "arrfcpipltlfgxc6hvjylixc6c5hrummwctz4wqysk3h56ntqz5scnad.onion",
+            // === Discovered via sled cache (prior runs) ===
+            "qjupqf5xbmc76jzne7xu7y2ddmwtfxbbzzeax6gs4lezg3dyr5bfu2qd.onion",
+            "sbedmjsyphfctagwoxuspblefvzjvb7yig4gsq5ddwjhnyq4rqcqg3ad.onion",
+            "xy6pysqr5myuau4aq6uszwdgdmjx4ypjlvngupxfjdtzfsq6jugcadyd.onion",
+            "amkryua4xdnbvk4urxleuxkcdgiirmus7m2wnqj3o4uh2xcgbkpcjoyd.onion",
+            "astvjnzh4ftvnp37n47zgr3qhbyftlmjdocjnwjb5xlua5xgdckew6yd.onion",
+            "bmwlkiljav3aqxbgyrqgcmotasrnnolqfivzorpn7snrmprj2sqqlbqd.onion",
+            "cw2kf4ieepslxvydi7qgb5vc2itst4b6roah5rc3ozeu4ulbqz4v3rqd.onion",
+            "ghnqjhi7usidnrnktsctb5do26m4xbaprenpy3fzkfatvf536w5drrid.onion",
+            "vzgsc7keieq52csmskmmhop2yc2tys32jpj7wdgzhsoctpi4wx4hx3ad.onion",
+            "n2bpey4k45pkwjfsuqpuagm2rjyaefako4hqz2pgwqaew3rs4iy7brid.onion",
+            "ckj4f6jmx7rwvr6qcc7bkx3ziluf6s2kas2xua47ze7jcjvrh6bvihyd.onion",
+            "7zffbbkye7c7m4676sqfxhcwtjcuslhlmxmeg7yhf3a24xl7ppm36tid.onion",
         ];
 
         for host in known_storage_hosts {
@@ -177,9 +210,11 @@ impl QilinNodeCache {
 
         if let Ok(resp) = client.get(&view_url).send().await {
             if let Ok(body) = resp.text().await {
-                // Look for the QData input field: value="<onion>.onion"
-                // This contains the actual storage domain, distinct from the CMS
-                let value_re = regex::Regex::new(r#"value="([a-z2-7]{56}\.onion)""|>([a-z2-7]{56}\.onion)<"#).unwrap();
+                // Phase 42 Fix 3: Hardened regex patterns for QData storage node discovery
+                // Captures: value="<onion>", >onion<, href="http://onion/...", data-url="...", iframe src="..."
+                let value_re = regex::Regex::new(
+                    r#"(?:value="|href="http://|data-url="http://|src="http://)([a-z2-7]{56}\.onion)[/"\s]|>([a-z2-7]{56}\.onion)<"#
+                ).unwrap();
                 for cap in value_re.captures_iter(&body) {
                     let onion_host = cap.get(1).or(cap.get(2)).map(|m| m.as_str().to_string());
                     if let Some(onion_host) = onion_host {
@@ -218,61 +253,72 @@ impl QilinNodeCache {
             return None;
         }
 
-        // Stage D: Probe all nodes concurrently, return fastest alive
-        println!("[QilinNodeCache] Stage D — Probing {} nodes...", cached_nodes.len());
+        // Stage D: Phase 42 Fix 1 — Probe ALL nodes CONCURRENTLY, return fastest alive
+        println!("[QilinNodeCache] Stage D — Probing {} nodes concurrently...", cached_nodes.len());
 
-        let mut best: Option<StorageNode> = None;
-        let mut best_latency = u128::MAX;
+        let best: Arc<Mutex<Option<(StorageNode, u128)>>> = Arc::new(Mutex::new(None));
+        let mut probe_tasks = tokio::task::JoinSet::new();
+        let cache_ref = self.clone();
+        let uuid_owned = uuid.to_string();
 
-        for node in &cached_nodes {
-            let start = std::time::Instant::now();
-            let probe_timeout = Duration::from_secs(30);
+        for node in cached_nodes.clone() {
+            let client = client.clone();
+            let best_ref = best.clone();
+            let cache = cache_ref.clone();
+            let uuid_str = uuid_owned.clone();
 
-            match tokio::time::timeout(probe_timeout, client.get(&node.url).send()).await {
-                Ok(Ok(resp)) => {
-                    let latency = start.elapsed().as_millis();
-                    let status = resp.status();
-                    println!(
-                        "[QilinNodeCache] Stage D — {} responded in {}ms (status={})",
-                        node.host, latency, status
-                    );
+            probe_tasks.spawn(async move {
+                let start = std::time::Instant::now();
+                let probe_timeout = Duration::from_secs(15); // Phase 42: reduced from 30s → 15s
 
-                    if status.is_success() || status.as_u16() == 301 || status.as_u16() == 302 {
-                        // Update the cached node with fresh latency data
-                        let mut updated = node.clone();
-                        updated.last_seen = now_unix();
-                        updated.hit_count += 1;
-                        updated.avg_latency_ms = if updated.avg_latency_ms == 0 {
-                            latency as u64
-                        } else {
-                            // Exponential moving average (α=0.3)
-                            ((updated.avg_latency_ms as f64 * 0.7) + (latency as f64 * 0.3)) as u64
-                        };
-                        let _ = self.save_node(uuid, &updated).await;
+                match tokio::time::timeout(probe_timeout, client.get(&node.url).send()).await {
+                    Ok(Ok(resp)) => {
+                        let latency = start.elapsed().as_millis();
+                        let status = resp.status();
+                        println!(
+                            "[QilinNodeCache] Stage D — {} responded in {}ms (status={})",
+                            node.host, latency, status
+                        );
 
-                        if latency < best_latency {
-                            best_latency = latency;
-                            best = Some(updated);
+                        if status.is_success() || status.as_u16() == 301 || status.as_u16() == 302 {
+                            let mut updated = node.clone();
+                            updated.last_seen = now_unix();
+                            updated.hit_count += 1;
+                            updated.avg_latency_ms = if updated.avg_latency_ms == 0 {
+                                latency as u64
+                            } else {
+                                ((updated.avg_latency_ms as f64 * 0.7) + (latency as f64 * 0.3)) as u64
+                            };
+                            let _ = cache.save_node(&uuid_str, &updated).await;
+
+                            let mut guard = best_ref.lock().await;
+                            if guard.as_ref().map_or(true, |(_, best_lat)| latency < *best_lat) {
+                                *guard = Some((updated, latency));
+                            }
                         }
                     }
+                    Ok(Err(e)) => {
+                        println!("[QilinNodeCache] Stage D — {} unreachable: {}", node.host, e);
+                    }
+                    Err(_) => {
+                        println!("[QilinNodeCache] Stage D — {} timed out", node.host);
+                    }
                 }
-                Ok(Err(e)) => {
-                    println!("[QilinNodeCache] Stage D — {} unreachable: {}", node.host, e);
-                }
-                Err(_) => {
-                    println!("[QilinNodeCache] Stage D — {} timed out", node.host);
-                }
-            }
+            });
         }
 
-        if let Some(ref winner) = best {
+        // Wait for all probes to complete (max 15s wall-clock)
+        while probe_tasks.join_next().await.is_some() {}
+
+        let result = best.lock().await.clone().map(|(node, _)| node);
+        if let Some(ref winner) = result {
             println!(
                 "[QilinNodeCache] ✅ Best node: {} ({}ms, {} hits)",
                 winner.host, winner.avg_latency_ms, winner.hit_count
             );
         }
 
-        best
+        result
     }
 }
 

@@ -1,7 +1,7 @@
-> **Last Updated:** 2026-03-04T15:08 CST
+> **Last Updated:** 2026-03-05T17:12 CST
 
-Version: 1.0.7
-Updated: 2026-03-04
+Version: 1.0.8
+Updated: 2026-03-05
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [CRITICAL-L0] Framework Boundaries, [MANDATORY-L1] Docs Management, [MANDATORY-L1] Living Documents, [MANDATORY-L1] Whitepaper Template, [MANDATORY-L1] Workflow
 
@@ -159,6 +159,7 @@ Based on the final regression matrix yielding 0 files for WorldLeaks, INC Ransom
 - 2026-03-03: v1.0.5 updated for Windows-safe progress path rendering, byte-accurate batch progress, and circuit/throughput ceiling telemetry.
 - 2026-03-03: v1.0.6 updated for LockBit registry wiring restoration and engine test schema parity (`daemons`).
 - 2026-03-04: v1.0.7 updated for adaptive Direct I/O fallback, adaptive tournament telemetry, SRPT+aging batch scheduling, EWMA/ETA confidence UI, and quality workflow/toolchain pinning.
+- 2026-03-05: v1.0.8 synchronized Phase 42 Qilin fixes and the `v0.2.6` release packaging baseline.
 
 # Appendices
 - Files touched:
