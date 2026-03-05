@@ -201,6 +201,8 @@ fn live_lockbit_pipeline_default_ui_settings() {
             download: false,
             circuits: Some(120),
             daemons: Some(4),
+            agnostic_state: false,
+            resume: false,
         };
 
         let daemon_count = active_ports.len().max(1);

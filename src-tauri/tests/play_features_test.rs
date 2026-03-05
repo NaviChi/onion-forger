@@ -201,6 +201,8 @@ async fn feature3_head_probing_simulation() {
             download: false,
             circuits: None,
             daemons: None,
+            agnostic_state: false,
+            resume: false,
         },
     );
     let (_cid, client) = frontier.get_client();
@@ -239,6 +241,8 @@ async fn feature3_head_probing_simulation() {
             download: false,
             circuits: None,
             daemons: None,
+            agnostic_state: false,
+            resume: false,
         },
     );
     assert!(!frontier_no_sizes.active_options.sizes);
@@ -557,6 +561,8 @@ async fn feature9_sustained_load_120_workers() {
             download: true,
             circuits: None,
             daemons: None,
+            agnostic_state: false,
+            resume: false,
         },
     ));
 

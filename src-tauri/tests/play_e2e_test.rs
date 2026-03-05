@@ -452,6 +452,8 @@ async fn test_politeness_semaphore_bottleneck() {
             download: true,
             circuits: None,
             daemons: None,
+            agnostic_state: false,
+            resume: false,
         },
     ));
 

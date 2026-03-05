@@ -152,10 +152,14 @@ impl QilinNodeCache {
                                 host: host.clone(),
                                 last_seen: now_unix(),
                                 avg_latency_ms: 0,
-                                hit_count: 1,
+                                hit_count: 5, // Artificially boost hit_count
                             };
                             let _ = self.save_node(uuid, &node).await;
                             println!("[QilinNodeCache] Stage A — Discovered & cached: {}", host);
+                            // Immediate Return: The authoritative 302 redirect contains the 
+                            // actual backend UUID (which may differ from the input CMS UUID).
+                            // Short-circuit to prevent Stage C/D from guessing the wrong UUID.
+                            return Some(node);
                         }
                     }
                     break;

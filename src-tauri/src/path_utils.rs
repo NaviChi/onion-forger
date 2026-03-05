@@ -140,6 +140,47 @@ fn sanitize_component(name: &str) -> String {
     clean
 }
 
+/// Parses a human-readable size string (e.g. "912.0 KiB", "1.5 M", "1024") into raw bytes.
+pub fn parse_size(size_str: &str) -> Option<u64> {
+    let raw = size_str.trim().to_uppercase();
+    if raw.is_empty() || raw == "-" {
+        return None;
+    }
+
+    // Direct byte parsing
+    if let Ok(bytes) = raw.parse::<u64>() {
+        return Some(bytes);
+    }
+
+    // Human readable parsing
+    let mut num_str = String::new();
+    let mut multiplier: u64 = 1;
+
+    for c in raw.chars() {
+        if c.is_digit(10) || c == '.' {
+            num_str.push(c);
+        } else if c == 'K' {
+            multiplier = 1024;
+            break;
+        } else if c == 'M' {
+            multiplier = 1024 * 1024;
+            break;
+        } else if c == 'G' {
+            multiplier = 1024 * 1024 * 1024;
+            break;
+        } else if c == 'T' {
+            multiplier = 1024 * 1024 * 1024 * 1024;
+            break;
+        }
+    }
+
+    if let Ok(num) = num_str.parse::<f64>() {
+        return Some((num * multiplier as f64) as u64);
+    }
+
+    None
+}
+
 /// Extracts a structural, URL-agnostic logical path footprint from dynamic frontend requests.
 /// This prevents cross-domain or UUID-rotation amnesia in the crawler.
 pub fn extract_agnostic_path(url: &str) -> String {

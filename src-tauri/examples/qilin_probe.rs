@@ -10,7 +10,7 @@ async fn main() {
 
     crawli_lib::tor::cleanup_stale_tor_daemons();
 
-    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 8)
+    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 12)
         .await
         .unwrap();
 
@@ -30,8 +30,8 @@ async fn main() {
 
         let opts = CrawlOptions {
             listing: true,
-            circuits: Some(8),
-            daemons: Some(8),
+            circuits: Some(24),
+            daemons: Some(12),
             ..Default::default()
         };
 
@@ -39,7 +39,7 @@ async fn main() {
         let frontier = std::sync::Arc::new(CrawlerFrontier::new(
             Some(app.handle().clone()),
             target.to_string(),
-            8,
+            12,
             true,
             ports.clone(),
             opts,

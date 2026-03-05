@@ -128,6 +128,8 @@ async fn test_onion_listing_worker_target_stays_pinned_after_failures() {
         download: false,
         circuits: Some(120),
         daemons: Some(4),
+        agnostic_state: false,
+        resume: false,
     };
     let frontier = CrawlerFrontier::new(
         None,
@@ -370,6 +372,8 @@ async fn test_crawl_options_propagation() {
             download: false,
             circuits: None,
             daemons: None,
+            agnostic_state: false,
+            resume: false,
         },
     );
     assert!(!frontier.active_options.listing);
@@ -389,6 +393,8 @@ async fn test_crawl_options_propagation() {
             download: true,
             circuits: None,
             daemons: None,
+            agnostic_state: false,
+            resume: false,
         },
     );
     assert!(frontier2.active_options.listing);

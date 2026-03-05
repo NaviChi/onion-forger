@@ -100,7 +100,7 @@ impl CrawlerAdapter for QilinAdapter {
         // worker loop monitors 429/timeout rates and adjusts dynamically.
         // Ceiling: 16 workers (avoids DDoS-triggering on QData storage nodes).
         // The 120-circuit aria2 downloader is used separately for file downloads.
-        let max_concurrent = 8;
+        let max_concurrent = 24; // Phase 32: Raised from 8→24 (safe on raw storage nodes)
         let _aimd_error_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let _aimd_success_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut workers = tokio::task::JoinSet::new();
@@ -209,40 +209,89 @@ impl CrawlerAdapter for QilinAdapter {
 
                     let mut new_files = Vec::new();
 
-                    // Check if it's the old <table id="list"> Qilin
+                    // Check if it's the old <table id="list"> Qilin or the new V3 HTML structure
                     if html.contains("<table id=\"list\">") || html.contains("Data browser") {
-                        let parsed = crate::adapters::autoindex::parse_autoindex_html(&html);
-                        for (filename, parsed_size, is_dir) in parsed {
-                            let encoded = path_utils::url_encode(&filename);
-                            // Phase 27: Revert to strictly hierarchical sequential path crawling
-                            let child_url = format!("{}/{}", next_url.trim_end_matches('/'), encoded);
-
-                            if is_dir {
-                                let sanitized_path = format!("/{}", path_utils::sanitize_path(&filename));
-                                new_files.push(FileEntry {
-                                    path: sanitized_path,
-                                    size_bytes: None,
-                                    entry_type: EntryType::Folder,
-                                    raw_url: format!("{}/", child_url),
-                                });
-
-                                let sub_url = format!("{}/", child_url);
-                                if f.mark_visited(&sub_url) {
-                                    pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                    q_clone.push(sub_url);
+                        let mut found_any = false;
+                        
+                        // PHASE 32: QData HTML V3 Parser (Discovered via headless probe)
+                        // The backend returns a raw HTML table: <tr><td class="link"><a href="...">...</a></td><td class="size">...</td>
+                        let v3_row_re = regex::Regex::new(r#"<td class="link"><a href="([^"]+)"[^>]*>.*?</a></td><td class="size">([^<]*)</td>"#).unwrap();
+                        
+                        for cap in v3_row_re.captures_iter(&html) {
+                            found_any = true;
+                            if let (Some(href), Some(size_str)) = (cap.get(1), cap.get(2)) {
+                                let href_str = href.as_str();
+                                // Skip parent directory links
+                                if href_str == "../" || href_str == "/" || href_str.starts_with("?") {
+                                    continue;
                                 }
-                            } else {
-                                new_files.push(FileEntry {
-                                    path: format!("/{}", path_utils::sanitize_path(&filename)),
-                                    size_bytes: parsed_size,
-                                    entry_type: EntryType::File,
-                                    raw_url: child_url,
-                                });
+                                
+                                let decoded_name = path_utils::url_decode(href_str);
+                                let is_dir = href_str.ends_with('/');
+                                let clean_name = decoded_name.trim_end_matches('/').to_string();
+                                
+                                let encoded = path_utils::url_encode(&clean_name);
+                                let child_url = format!("{}/{}", next_url.trim_end_matches('/'), encoded);
+
+                                if is_dir {
+                                    let sanitized_path = format!("/{}", path_utils::sanitize_path(&clean_name));
+                                    new_files.push(FileEntry {
+                                        path: sanitized_path,
+                                        size_bytes: None,
+                                        entry_type: EntryType::Folder,
+                                        raw_url: format!("{}/", child_url),
+                                    });
+
+                                    let sub_url = format!("{}/", child_url);
+                                    if f.mark_visited(&sub_url) {
+                                        pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        q_clone.push(sub_url);
+                                    }
+                                } else {
+                                    let raw_size = size_str.as_str().trim();
+                                    let size_bytes = if raw_size == "-" { None } else { path_utils::parse_size(raw_size) };
+                                    
+                                    new_files.push(FileEntry {
+                                        path: format!("/{}", path_utils::sanitize_path(&clean_name)),
+                                        size_bytes,
+                                        entry_type: EntryType::File,
+                                        raw_url: child_url,
+                                    });
+                                }
                             }
                         }
+                        
+                        // Fallback to legacy autoindex parser if the strict V3 regex failed but it's still a table
+                        if !found_any {
+                           let parsed = crate::adapters::autoindex::parse_autoindex_html(&html);
+                           for (filename, parsed_size, is_dir) in parsed {
+                               let encoded = path_utils::url_encode(&filename);
+                               let child_url = format!("{}/{}", next_url.trim_end_matches('/'), encoded);
 
+                               if is_dir {
+                                   let sanitized_path = format!("/{}", path_utils::sanitize_path(&filename));
+                                   new_files.push(FileEntry {
+                                       path: sanitized_path,
+                                       size_bytes: None,
+                                       entry_type: EntryType::Folder,
+                                       raw_url: format!("{}/", child_url),
+                                   });
 
-                    } else {
+                                   let sub_url = format!("{}/", child_url);
+                                   if f.mark_visited(&sub_url) {
+                                       pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                       q_clone.push(sub_url);
+                                   }
+                               } else {
+                                   new_files.push(FileEntry {
+                                       path: format!("/{}", path_utils::sanitize_path(&filename)),
+                                       size_bytes: parsed_size,
+                                       entry_type: EntryType::File,
+                                       raw_url: child_url,
+                                   });
+                               }
+                           }
+                        }
                         // It's the new CMS Blog layout
                         for line in html.lines() {
                             if let Some(href_start) = line.find("href=\"") {
