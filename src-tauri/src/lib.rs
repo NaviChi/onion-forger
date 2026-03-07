@@ -2,14 +2,24 @@ pub mod adapters;
 pub mod aria_downloader;
 pub mod bbr;
 pub mod bft_quorum;
+pub mod binary_telemetry;
 pub mod db;
-pub mod ghost_browser;
 pub mod frontier;
+pub mod ghost_browser;
 pub mod io_vanguard;
 pub mod kalman;
+#[allow(dead_code)]
+pub mod multipath; // Experimental lab engine; production downloads use aria_downloader.
 pub mod path_utils;
+pub mod resource_governor;
+pub mod runtime_metrics;
 pub mod scorer;
+pub mod subtree_heatmap;
+pub mod target_state;
+pub mod telemetry_bridge;
 pub mod tor;
+pub mod tor_native;
+pub mod tor_runtime; // Phase 45: Parallel chunk downloading
 
 use std::sync::Arc;
 use tauri::Emitter;
@@ -17,14 +27,33 @@ use tauri::Manager;
 use tokio::sync::Mutex;
 
 /// Global shared frontier for cancellation support
-struct AppState {
+pub struct AppState {
     active_frontier: Mutex<Option<Arc<frontier::CrawlerFrontier>>>,
-    vfs: db::SledVfs,
+    pub(crate) current_target_dir: Mutex<Option<std::path::PathBuf>>,
+    pub(crate) current_target_key: Mutex<Option<String>>,
+    pub vfs: db::SledVfs,
+    pub telemetry: runtime_metrics::RuntimeTelemetry,
+    pub telemetry_bridge: telemetry_bridge::TelemetryBridge,
+    pub swarm_guard: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            active_frontier: Mutex::new(None),
+            current_target_dir: Mutex::new(None),
+            current_target_key: Mutex::new(None),
+            vfs: db::SledVfs::default(),
+            telemetry: runtime_metrics::RuntimeTelemetry::default(),
+            telemetry_bridge: telemetry_bridge::TelemetryBridge::default(),
+            swarm_guard: tokio::sync::Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CrawlStatusUpdate {
+pub(crate) struct CrawlStatusUpdate {
     phase: String,
     progress_percent: f64,
     visited_nodes: usize,
@@ -34,14 +63,35 @@ struct CrawlStatusUpdate {
     worker_target: usize,
     eta_seconds: Option<u64>,
     estimation: String,
+    delta_new_files: usize,
 }
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DownloadBatchStartedEvent {
+pub(crate) struct DownloadBatchStartedEvent {
     total_files: usize,
     total_bytes_hint: u64,
     unknown_size_files: usize,
+    output_dir: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrawlSessionResult {
+    target_key: String,
+    discovered_count: usize,
+    file_count: usize,
+    folder_count: usize,
+    best_prior_count: usize,
+    raw_this_run_count: usize,
+    merged_effective_count: usize,
+    crawl_outcome: String,
+    retry_count_used: usize,
+    stable_current_listing_path: String,
+    stable_current_dirs_listing_path: String,
+    stable_best_listing_path: String,
+    stable_best_dirs_listing_path: String,
+    auto_download_started: bool,
     output_dir: String,
 }
 
@@ -86,6 +136,9 @@ fn crawl_status_snapshot(
         worker_target: frontier.worker_target(),
         eta_seconds,
         estimation: "adaptive-frontier".to_string(),
+        delta_new_files: frontier
+            .delta_new_files
+            .load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 
@@ -147,7 +200,7 @@ fn spawn_crawl_status_emitter(
 
             let payload =
                 crawl_status_snapshot(frontier.as_ref(), phase, monotonic_percent, eta_seconds);
-            let _ = app.emit("crawl_status_update", payload);
+            telemetry_bridge::publish_crawl_status(&app, payload);
 
             if frontier.is_cancelled() {
                 break;
@@ -202,30 +255,715 @@ fn looks_like_direct_artifact(url: &str, is_binary: bool) -> Option<String> {
     }
 }
 
-async fn start_aria_single_download(
-    app: &tauri::AppHandle,
-    url: String,
-    safe_target: String,
-    circuits: usize,
-    force_tor: bool,
-) -> Result<(), String> {
-    let control = aria_downloader::activate_download_control()
-        .ok_or_else(|| "Auto-download skipped: another download is already active.".to_string())?;
+fn summarize_entry_slice(entries: &[adapters::FileEntry]) -> db::VfsSummary {
+    let mut summary = db::VfsSummary::default();
+    for entry in entries {
+        summary.discovered_count += 1;
+        match entry.entry_type {
+            adapters::EntryType::File => {
+                summary.file_count += 1;
+                summary.total_size_bytes = summary
+                    .total_size_bytes
+                    .saturating_add(entry.size_bytes.unwrap_or(0));
+            }
+            adapters::EntryType::Folder => {
+                summary.folder_count += 1;
+            }
+        }
+    }
+    summary
+}
 
-    let result = aria_downloader::start_download(
-        app.clone(),
-        url,
-        safe_target.clone(),
-        circuits.max(1),
-        force_tor,
-        std::path::Path::new(&safe_target)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string()),
-        control,
+struct CrawlAttemptResult {
+    summary: db::VfsSummary,
+    was_cancelled: bool,
+}
+
+async fn execute_crawl_attempt(
+    url: &str,
+    options: &frontier::CrawlOptions,
+    output_root: &std::path::Path,
+    target_paths: &target_state::TargetPaths,
+    app: &tauri::AppHandle,
+    vfs: &db::SledVfs,
+) -> Result<CrawlAttemptResult, String> {
+    let is_onion = url.contains(".onion");
+    let support_dir = output_root.join("temp_onionforge_forger");
+    tokio::fs::create_dir_all(&support_dir)
+        .await
+        .map_err(|e| format!("Failed to create support directory: {e}"))?;
+
+    let mut swarm_guard = None;
+    let mut active_ports = Vec::new();
+    let mut arti_clients = Vec::new();
+
+    if is_onion {
+        let mut pre_warmed = false;
+        if let Some(guard_arc) = app.state::<AppState>().swarm_guard.lock().await.as_ref() {
+            let guard = guard_arc.lock().await;
+            arti_clients = guard.get_arti_clients();
+            if !arti_clients.is_empty() {
+                active_ports = tor::detect_active_managed_tor_ports();
+                swarm_guard = Some(guard_arc.clone());
+                pre_warmed = true;
+                println!("[Crawli Bootstrap] Using pre-warmed Phantom Swarm ({} clients)", arti_clients.len());
+            }
+        }
+
+        if !pre_warmed {
+            tor::cleanup_stale_tor_daemons();
+            app.emit(
+                "crawl_log",
+                format!("[System] Bootstrapping Target: {}", url),
+            )
+            .unwrap_or_default();
+            println!("[Crawli Bootstrap] starting tor bootstrap for {}", url);
+
+            let target_daemons = options
+                .daemons
+                .unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 })
+                .max(1);
+            match tor::bootstrap_tor_cluster(app.clone(), target_daemons).await {
+                Ok((guard, ports)) => {
+                    println!(
+                        "[Crawli Bootstrap] tor bootstrap complete: runtime={} ports={:?}",
+                        guard.runtime_label(),
+                        ports
+                    );
+                    arti_clients = guard.get_arti_clients();
+                    swarm_guard = Some(std::sync::Arc::new(tokio::sync::Mutex::new(guard)));
+                    active_ports = ports;
+                }
+                Err(e) => return Err(format!("Failed to start Tor Swarm: {}", e)),
+            }
+        }
+    }
+
+    let daemon_count = if is_onion {
+        arti_clients.len().max(1)
+    } else {
+        options
+            .daemons
+            .unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 })
+            .max(1)
+    };
+
+    let mut frontier = frontier::CrawlerFrontier::new(
+        Some(app.clone()),
+        url.to_string(),
+        daemon_count,
+        is_onion,
+        active_ports,
+        arti_clients,
+        options.clone(),
+    );
+    println!(
+        "[Crawli Bootstrap] frontier initialized: clients={} daemons={} onion={}",
+        frontier.http_clients.len(),
+        frontier.num_daemons,
+        frontier.is_onion
+    );
+    frontier.swarm_guard = swarm_guard;
+
+    let vfs_path = support_dir.join(".crawli_vtdb");
+    let vfs_path_str = vfs_path.to_string_lossy().to_string();
+    let _ = vfs.initialize(&vfs_path_str).await;
+    let _ = vfs.clear().await;
+    println!("[Crawli Bootstrap] vfs initialized at {}", vfs_path_str);
+
+    println!("[Crawli Fingerprint] requesting initial URL: {}", url);
+    app.emit(
+        "crawl_log",
+        "[System] Generating Site Fingerprint...".to_string(),
     )
-    .await;
-    aria_downloader::clear_download_control();
-    result.map_err(|e| e.to_string())
+    .unwrap_or_default();
+
+    let fingerprint_attempts = if is_onion { 4 } else { 2 };
+    let mut fingerprint_attempt = 1usize;
+    let resp = loop {
+        let attempt = fingerprint_attempt;
+        let (cid, client) = frontier.get_client();
+        match client.get(url).send().await {
+            Ok(r) => {
+                println!(
+                    "[Crawli Fingerprint] initial URL responded: status={} final={}",
+                    r.status(),
+                    r.url()
+                );
+                break r;
+            }
+            Err(e) => {
+                let error_text = e.to_string();
+                println!(
+                    "[Crawli Fingerprint] initial URL request failed on attempt {} via cid {}: {}",
+                    attempt, cid, error_text
+                );
+
+                if attempt >= fingerprint_attempts {
+                    return Err(format!(
+                        "OFFLINE_SYNC_ERROR: The site might be down. Please manually check it to verify if it is actually functional and active. ({})",
+                        error_text
+                    ));
+                }
+
+                let _ = app.emit(
+                    "crawl_log",
+                    format!(
+                        "[System] Initial fingerprint connect failed on attempt {}. Rotating client slot and retrying...",
+                        attempt
+                    ),
+                );
+                if is_onion {
+                    frontier.trigger_circuit_isolation(cid).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis((attempt as u64) * 750)).await;
+                fingerprint_attempt = fingerprint_attempt.saturating_add(1);
+            }
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let content_type = headers
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let is_binary = !content_type.starts_with("text/")
+        && !content_type.contains("json")
+        && !content_type.contains("xml")
+        && (content_type.contains("application/")
+            || url.ends_with(".7z")
+            || url.ends_with(".zip")
+            || url.ends_with(".rar"));
+
+    let body = if is_binary {
+        "[BINARY_OR_ARCHIVE_DATA]".to_string()
+    } else {
+        resp.text()
+            .await
+            .unwrap_or_else(|_| "[DECODE_ERROR]".to_string())
+    };
+
+    let fingerprint = adapters::SiteFingerprint {
+        url: url.to_string(),
+        status,
+        headers,
+        body,
+    };
+
+    if let Some(name) = looks_like_direct_artifact(url, is_binary) {
+        let registry = adapters::AdapterRegistry::new();
+        if let Some(adapter) = registry.determine_adapter(&fingerprint).await {
+            app.emit(
+                "crawl_log",
+                format!("[Adapter] Match found: {}", adapter.name()),
+            )
+            .unwrap_or_default();
+        } else {
+            app.emit(
+                "crawl_log",
+                "[Adapter] Match found: Direct Artifact (No specialized adapter match)".to_string(),
+            )
+            .unwrap_or_default();
+        }
+
+        let size = fingerprint
+            .headers
+            .get("content-length")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let entry = adapters::FileEntry {
+            path: name.clone(),
+            size_bytes: size,
+            entry_type: adapters::EntryType::File,
+            raw_url: url.to_string(),
+        };
+        app.emit(
+            "crawl_log",
+            format!(
+                "[System] Raw File Target Intercepted: {}. Enqueueing directly to Aria Forge.",
+                name
+            ),
+        )
+        .unwrap_or_default();
+        let fallback_entries = vec![entry.clone()];
+        vfs.insert_entries(&fallback_entries)
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = app.emit("crawl_progress", fallback_entries.clone());
+
+        let arc_frontier = std::sync::Arc::new(frontier);
+        let state = app.state::<AppState>();
+        let mut lock = state.active_frontier.lock().await;
+        *lock = Some(arc_frontier.clone());
+        drop(lock);
+        let _ = app.emit(
+            "crawl_status_update",
+            crawl_status_snapshot(arc_frontier.as_ref(), "complete", 100.0, Some(0)),
+        );
+
+        return Ok(CrawlAttemptResult {
+            summary: summarize_entry_slice(&fallback_entries),
+            was_cancelled: false,
+        });
+    }
+
+    let registry = adapters::AdapterRegistry::new();
+    let Some(adapter) = registry.determine_adapter(&fingerprint).await else {
+        return Err("No known adapter matched this sites architecture.".to_string());
+    };
+
+    app.emit(
+        "crawl_log",
+        format!("[Adapter] Match found: {}", adapter.name()),
+    )
+    .unwrap_or_default();
+
+    let arc_frontier = std::sync::Arc::new(frontier);
+    {
+        let state = app.state::<AppState>();
+        let mut lock = state.active_frontier.lock().await;
+        *lock = Some(arc_frontier.clone());
+        *state.current_target_dir.lock().await = Some(target_paths.target_dir.clone());
+        *state.current_target_key.lock().await =
+            Some(target_paths.target_identity.target_key.clone());
+    }
+
+    let _ = app.emit(
+        "crawl_status_update",
+        crawl_status_snapshot(arc_frontier.as_ref(), "probing", 0.0, None),
+    );
+    let status_emitter = spawn_crawl_status_emitter(app.clone(), arc_frontier.clone());
+    let crawl_result = adapter.crawl(url, arc_frontier.clone(), app.clone()).await;
+    status_emitter.abort();
+    let _ = status_emitter.await;
+
+    let was_cancelled = arc_frontier.is_cancelled();
+    let final_payload = if was_cancelled {
+        let visited = arc_frontier.visited_count();
+        let processed = arc_frontier.processed_count();
+        let queued = visited.saturating_sub(processed);
+        let progress = estimate_progress_percent(
+            visited.max(1),
+            processed,
+            queued,
+            arc_frontier.active_workers(),
+        );
+        crawl_status_snapshot(arc_frontier.as_ref(), "cancelled", progress, None)
+    } else if crawl_result.is_ok() {
+        crawl_status_snapshot(arc_frontier.as_ref(), "complete", 100.0, Some(0))
+    } else {
+        let visited = arc_frontier.visited_count();
+        let processed = arc_frontier.processed_count();
+        let queued = visited.saturating_sub(processed);
+        let progress = estimate_progress_percent(
+            visited.max(1),
+            processed,
+            queued,
+            arc_frontier.active_workers(),
+        );
+        crawl_status_snapshot(arc_frontier.as_ref(), "error", progress, None)
+    };
+    telemetry_bridge::publish_crawl_status(&app, final_payload);
+
+    match crawl_result {
+        Ok(files) => {
+            let state = app.state::<AppState>();
+            *state.current_target_dir.lock().await = None;
+            *state.current_target_key.lock().await = None;
+            if !files.is_empty() {
+                vfs.insert_entries(&files)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            let mut summary = vfs.summarize_entries().await.map_err(|e| e.to_string())?;
+            if summary.discovered_count == 0 && !files.is_empty() {
+                summary = summarize_entry_slice(&files);
+            }
+            Ok(CrawlAttemptResult {
+                summary,
+                was_cancelled,
+            })
+        }
+        Err(e) => {
+            let state = app.state::<AppState>();
+            let mut lock = state.active_frontier.lock().await;
+            *lock = None;
+            *state.current_target_dir.lock().await = None;
+            *state.current_target_key.lock().await = None;
+            Err(e.to_string())
+        }
+    }
+}
+
+async fn scaffold_download_from_vfs(
+    vfs: &db::SledVfs,
+    output_root: &std::path::Path,
+    app: &tauri::AppHandle,
+    connections: usize,
+    force_tor: bool,
+) -> anyhow::Result<u32> {
+    use anyhow::anyhow;
+    use aria_downloader::BatchFileEntry;
+
+    let base = output_root.to_path_buf();
+    tokio::fs::create_dir_all(&base).await?;
+    let support_dir = base.join("temp_onionforge_forger");
+    tokio::fs::create_dir_all(&support_dir).await?;
+
+    let mut written_final: u32 = 0;
+    let mut batch_files: Vec<BatchFileEntry> = Vec::new();
+    let mut manifest = String::new();
+    let mut total_entries = 0usize;
+    let mut total_bytes_hint = 0u64;
+    let mut unknown_size_files = 0usize;
+
+    manifest.push_str("# OnionForge Download Manifest\n");
+    manifest.push_str(&format!("# Generated: {}\n", chrono_stub()));
+
+    vfs.with_entry_batches(512, |entries| {
+        for entry in entries {
+            total_entries = total_entries.saturating_add(1);
+            let full_path = match path_utils::resolve_path_within_root(
+                &base,
+                &entry.path,
+                matches!(entry.entry_type, adapters::EntryType::Folder),
+            ) {
+                Ok(Some(path)) => path,
+                Ok(None) => continue,
+                Err(err) => {
+                    let _ = app.emit(
+                        "crawl_log",
+                        format!("[SECURITY] Rejected unsafe path '{}': {}", entry.path, err),
+                    );
+                    continue;
+                }
+            };
+
+            match entry.entry_type {
+                adapters::EntryType::Folder => {
+                    std::fs::create_dir_all(&full_path)?;
+                    let gitkeep = full_path.join(".gitkeep");
+                    if !gitkeep.exists() {
+                        let _ = std::fs::write(&gitkeep, b"");
+                    }
+                    written_final = written_final.saturating_add(1);
+                }
+                adapters::EntryType::File => {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+
+                    let safe_target = full_path.to_string_lossy().to_string();
+                    let url_lower = entry.raw_url.to_lowercase();
+                    if url_lower.starts_with("http://") || url_lower.starts_with("https://") {
+                        batch_files.push(BatchFileEntry {
+                            url: entry.raw_url.clone(),
+                            path: safe_target,
+                            size_hint: entry.size_bytes,
+                        });
+                        total_bytes_hint =
+                            total_bytes_hint.saturating_add(entry.size_bytes.unwrap_or(0));
+                        if entry.size_bytes.unwrap_or(0) == 0 {
+                            unknown_size_files = unknown_size_files.saturating_add(1);
+                        }
+                    } else {
+                        if !full_path.exists() {
+                            let _ = std::fs::write(&full_path, b"");
+                        }
+                        let _ = app.emit(
+                            "crawl_log",
+                            format!(
+                                "[MIRROR] Placeholder scaffolded for {} (no valid source URL).",
+                                entry.path
+                            ),
+                        );
+                        written_final = written_final.saturating_add(1);
+                    }
+
+                    let meta_path = support_dir.join(format!(
+                        "{}.onionforge.meta",
+                        support_key_for_path(&entry.path)
+                    ));
+                    let size_str = entry
+                        .size_bytes
+                        .map(|s: u64| s.to_string())
+                        .unwrap_or_else(|| "0".to_string());
+                    let meta_content = format!(
+                        "url={}\nsize={}\ntype=file\noriginal_path={}\n",
+                        entry.raw_url, size_str, entry.path
+                    );
+                    let _ = std::fs::write(&meta_path, meta_content.as_bytes());
+                }
+            }
+
+            let type_tag = match entry.entry_type {
+                adapters::EntryType::Folder => "DIR ",
+                adapters::EntryType::File => "FILE",
+            };
+            let size_tag = entry
+                .size_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "0 B".to_string());
+            let decoded_path = path_utils::url_decode(&entry.path);
+            manifest.push_str(&format!(
+                "{} {:>12}  {}  {}\n",
+                type_tag, size_tag, decoded_path, entry.raw_url
+            ));
+        }
+        Ok(())
+    })
+    .await?;
+
+    manifest.insert_str(
+        manifest
+            .find('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(manifest.len()),
+        &format!("# Total Entries: {}\n\n", total_entries),
+    );
+
+    if !batch_files.is_empty() {
+        let batch_count = batch_files.len();
+        let _ = app.emit(
+            "download_batch_started",
+            DownloadBatchStartedEvent {
+                total_files: batch_count,
+                total_bytes_hint,
+                unknown_size_files,
+                output_dir: base.to_string_lossy().to_string(),
+            },
+        );
+        let _ = app.emit(
+            "crawl_log",
+            format!(
+                "[ARIA] Batch mirror engaged: {} files | Circuits: {}",
+                batch_count,
+                connections.max(1)
+            ),
+        );
+
+        let control = aria_downloader::activate_download_control()
+            .ok_or_else(|| anyhow!("A download is already active."))?;
+        let batch_result = aria_downloader::start_batch_download(
+            app.clone(),
+            batch_files,
+            connections.max(1),
+            force_tor,
+            Some(base.to_string_lossy().to_string()),
+            control,
+        )
+        .await;
+        aria_downloader::clear_download_control();
+        batch_result?;
+
+        written_final = written_final.saturating_add(batch_count as u32);
+    }
+
+    let manifest_path = support_dir.join("_onionforge_manifest.txt");
+    tokio::fs::write(&manifest_path, manifest.as_bytes()).await?;
+
+    Ok(written_final)
+}
+
+async fn scaffold_download_from_entries_with_plan(
+    entries: &[adapters::FileEntry],
+    ordered_entries: &[adapters::FileEntry],
+    target_paths: &target_state::TargetPaths,
+    output_root: &std::path::Path,
+    app: &tauri::AppHandle,
+    connections: usize,
+    force_tor: bool,
+) -> anyhow::Result<u32> {
+    use anyhow::anyhow;
+    use aria_downloader::BatchFileEntry;
+    use std::collections::{BTreeMap, HashSet};
+
+    let base = output_root.to_path_buf();
+    tokio::fs::create_dir_all(&base).await?;
+    let support_dir = base.join("temp_onionforge_forger");
+    tokio::fs::create_dir_all(&support_dir).await?;
+
+    let mut written_final: u32 = 0;
+    let mut batch_lookup: BTreeMap<String, BatchFileEntry> = BTreeMap::new();
+    let mut manifest = String::new();
+    let mut total_bytes_hint = 0u64;
+    let mut unknown_size_files = 0usize;
+
+    manifest.push_str("# OnionForge Download Manifest\n");
+    manifest.push_str(&format!("# Generated: {}\n", chrono_stub()));
+    manifest.push_str(&format!("# Total Entries: {}\n\n", entries.len()));
+
+    for entry in entries {
+        let full_path = match path_utils::resolve_path_within_root(
+            &base,
+            &entry.path,
+            matches!(entry.entry_type, adapters::EntryType::Folder),
+        ) {
+            Ok(Some(path)) => path,
+            Ok(None) => continue,
+            Err(err) => {
+                let _ = app.emit(
+                    "crawl_log",
+                    format!("[SECURITY] Rejected unsafe path '{}': {}", entry.path, err),
+                );
+                continue;
+            }
+        };
+
+        match entry.entry_type {
+            adapters::EntryType::Folder => {
+                tokio::fs::create_dir_all(&full_path).await?;
+                let gitkeep = full_path.join(".gitkeep");
+                if !gitkeep.exists() {
+                    let _ = tokio::fs::write(&gitkeep, b"").await;
+                }
+                written_final = written_final.saturating_add(1);
+            }
+            adapters::EntryType::File => {
+                if let Some(parent) = full_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+
+                let safe_target = full_path.to_string_lossy().to_string();
+                let url_lower = entry.raw_url.to_lowercase();
+                if url_lower.starts_with("http://") || url_lower.starts_with("https://") {
+                    batch_lookup.insert(
+                        entry.path.clone(),
+                        BatchFileEntry {
+                            url: entry.raw_url.clone(),
+                            path: safe_target,
+                            size_hint: entry.size_bytes,
+                        },
+                    );
+                    total_bytes_hint =
+                        total_bytes_hint.saturating_add(entry.size_bytes.unwrap_or(0));
+                    if entry.size_bytes.unwrap_or(0) == 0 {
+                        unknown_size_files = unknown_size_files.saturating_add(1);
+                    }
+                } else {
+                    if !full_path.exists() {
+                        tokio::fs::write(&full_path, b"").await?;
+                    }
+                    let _ = app.emit(
+                        "crawl_log",
+                        format!(
+                            "[MIRROR] Placeholder scaffolded for {} (no valid source URL).",
+                            entry.path
+                        ),
+                    );
+                    written_final = written_final.saturating_add(1);
+                }
+
+                let meta_path = support_dir.join(format!(
+                    "{}.onionforge.meta",
+                    support_key_for_path(&entry.path)
+                ));
+                let size_str = entry
+                    .size_bytes
+                    .map(|s: u64| s.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let meta_content = format!(
+                    "url={}\nsize={}\ntype=file\noriginal_path={}\n",
+                    entry.raw_url, size_str, entry.path
+                );
+                let _ = tokio::fs::write(&meta_path, meta_content.as_bytes()).await;
+            }
+        }
+
+        let type_tag = match entry.entry_type {
+            adapters::EntryType::Folder => "DIR ",
+            adapters::EntryType::File => "FILE",
+        };
+        let size_tag = entry
+            .size_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "0 B".to_string());
+        let decoded_path = path_utils::url_decode(&entry.path);
+        manifest.push_str(&format!(
+            "{} {:>12}  {}  {}\n",
+            type_tag, size_tag, decoded_path, entry.raw_url
+        ));
+    }
+
+    let batch_files: Vec<BatchFileEntry> = ordered_entries
+        .iter()
+        .filter_map(|entry| batch_lookup.remove(&entry.path))
+        .collect();
+
+    if !batch_files.is_empty() {
+        let _ = app.emit(
+            "download_batch_started",
+            DownloadBatchStartedEvent {
+                total_files: batch_files.len(),
+                total_bytes_hint,
+                unknown_size_files,
+                output_dir: base.to_string_lossy().to_string(),
+            },
+        );
+        let _ = app.emit(
+            "crawl_log",
+            format!(
+                "[ARIA] Failure-first batch engaged: {} planned files | Circuits: {}",
+                batch_files.len(),
+                connections.max(1)
+            ),
+        );
+
+        let control = aria_downloader::activate_download_control()
+            .ok_or_else(|| anyhow!("A download is already active."))?;
+        let batch_result = aria_downloader::start_batch_download(
+            app.clone(),
+            batch_files,
+            connections.max(1),
+            force_tor,
+            Some(base.to_string_lossy().to_string()),
+            control,
+        )
+        .await;
+        aria_downloader::clear_download_control();
+
+        let previous_failures =
+            target_state::load_failure_manifest(&target_paths.failure_manifest_path)?;
+        let next_failures = target_state::reconcile_failure_manifest(
+            &previous_failures,
+            ordered_entries,
+            entries,
+            output_root,
+            if batch_result.is_err() {
+                "failed"
+            } else {
+                "resume"
+            },
+        )?;
+        target_state::save_failure_manifest(&target_paths.failure_manifest_path, &next_failures)?;
+
+        let unresolved_paths: HashSet<&str> = next_failures
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect();
+        let successful_downloads = ordered_entries
+            .iter()
+            .filter(|entry| !unresolved_paths.contains(entry.path.as_str()))
+            .count() as u32;
+        written_final = written_final.saturating_add(successful_downloads);
+
+        batch_result?;
+    } else {
+        let next_failures = target_state::reconcile_failure_manifest(
+            &target_state::load_failure_manifest(&target_paths.failure_manifest_path)?,
+            &[],
+            entries,
+            output_root,
+            "skipped",
+        )?;
+        target_state::save_failure_manifest(&target_paths.failure_manifest_path, &next_failures)?;
+    }
+
+    let manifest_path = support_dir.join("_onionforge_manifest.txt");
+    tokio::fs::write(&manifest_path, manifest.as_bytes()).await?;
+
+    Ok(written_final)
 }
 
 #[tauri::command]
@@ -253,328 +991,318 @@ async fn start_crawl(
     options: frontier::CrawlOptions,
     output_dir: String,
     app: tauri::AppHandle,
-) -> Result<Vec<adapters::FileEntry>, String> {
-    let is_onion = url.contains(".onion");
+) -> Result<CrawlSessionResult, String> {
+    let state = app.state::<AppState>();
+    let telemetry = state.telemetry.clone();
+    let vfs = state.vfs.clone();
+    let _crawl_session_guard = runtime_metrics::CrawlSessionGuard::new(telemetry);
     let output_root = canonical_output_root(&output_dir)?;
     let output_root_str = output_root.to_string_lossy().to_string();
-    let support_dir = output_root.join("temp_onionforge_forger");
-    tokio::fs::create_dir_all(&support_dir)
-        .await
-        .map_err(|e| format!("Failed to create support directory: {e}"))?;
-
-    let mut swarm_guard = None;
-    let mut active_ports = Vec::new();
     let auto_download = options.download;
+    let target_paths = target_state::target_paths(&output_root, &url).map_err(|e| e.to_string())?;
+    let mut ledger =
+        target_state::load_or_default_ledger(&target_paths).map_err(|e| e.to_string())?;
+    let best_prior_entries = target_state::load_entries_snapshot(&target_paths.best_snapshot_path)
+        .map_err(|e| e.to_string())?;
+    let best_prior_count = best_prior_entries.len();
+    let retry_budget = 2usize;
+    let started_at_epoch = chrono::Local::now().timestamp().max(0) as u64;
 
-    if is_onion {
-        // Flush any zombie Tor daemons from previous sessions before starting new ones
-        tor::cleanup_stale_tor_daemons();
-
+    if options.resume_index.is_some() {
         app.emit(
             "crawl_log",
-            format!("[System] Bootstrapping Target: {}", url),
+            "[SYSTEM] Advanced baseline override active: manual resume index selected.".to_string(),
         )
-        .unwrap();
-
-        let target_daemons = options.daemons.unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 }).max(1);
-        match tor::bootstrap_tor_cluster(app.clone(), target_daemons).await {
-            Ok((guard, ports)) => {
-                swarm_guard = Some(guard);
-                active_ports = ports;
-            }
-            Err(e) => return Err(format!("Failed to start Tor Swarm: {}", e)),
-        }
-    }
-
-    let daemon_count = if is_onion {
-        active_ports.len().max(1)
-    } else {
-        options.daemons.unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 }).max(1)
-    };
-
-    let mut frontier = frontier::CrawlerFrontier::new(
-        Some(app.clone()),
-        url.clone(),
-        daemon_count,
-        is_onion,
-        active_ports,
-        options.clone(),
-    );
-    frontier.swarm_guard = swarm_guard;
-
-    // Initialize VFS Database for this crawl session
-    let state = app.state::<AppState>();
-    let vfs_path = support_dir.join(".crawli_vtdb");
-    let vfs_path_str = vfs_path.to_string_lossy().to_string();
-    let _ = state.vfs.initialize(&vfs_path_str).await;
-    if !options.resume {
-        let _ = state.vfs.clear().await;
-    }
-
-    let client = frontier.get_client().1;
-    app.emit(
-        "crawl_log",
-        "[System] Generating Site Fingerprint...".to_string(),
-    )
-    .unwrap();
-
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => return Err(format!("OFFLINE_SYNC_ERROR: The site might be down. Please manually check it to verify if it is actually functional and active. ({})", e)),
-    };
-
-    let status = resp.status().as_u16();
-    let headers = resp.headers().clone();
-
-    // Safety Net: Prevent reqwest from trying to UTF-8 decode a massive 20GB .7z payload
-    let content_type = headers
-        .get("content-type")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let is_binary = !content_type.starts_with("text/")
-        && !content_type.contains("json")
-        && !content_type.contains("xml")
-        && (content_type.contains("application/")
-            || url.ends_with(".7z")
-            || url.ends_with(".zip")
-            || url.ends_with(".rar"));
-
-    let body = if is_binary {
-        "[BINARY_OR_ARCHIVE_DATA]".to_string()
-    } else {
-        resp.text()
-            .await
-            .unwrap_or_else(|_| "[DECODE_ERROR]".to_string())
-    };
-
-    let fingerprint = adapters::SiteFingerprint {
-        url: url.clone(),
-        status,
-        headers,
-        body,
-    };
-
-    if let Some(name) = looks_like_direct_artifact(&url, is_binary) {
-        // Resolve adapter identity for direct artifact mode so UI can surface it reliably.
-        let registry = adapters::AdapterRegistry::new();
-        if let Some(adapter) = registry.determine_adapter(&fingerprint).await {
-            app.emit(
-                "crawl_log",
-                format!("[Adapter] Match found: {}", adapter.name()),
-            )
-            .unwrap_or_default();
-        } else {
-            app.emit(
-                "crawl_log",
-                "[Adapter] Match found: Direct Artifact (No specialized adapter match)".to_string(),
-            )
-            .unwrap_or_default();
-        }
-
-        // Direct file URL interception happens before adapter resolution so detection-only
-        // adapters never short-circuit raw artifact downloads.
-        let size = fingerprint
-            .headers
-            .get("content-length")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        let entry = adapters::FileEntry {
-            path: name.clone(),
-            size_bytes: size,
-            entry_type: adapters::EntryType::File,
-            raw_url: url.clone(),
-        };
+        .unwrap_or_default();
+    } else if best_prior_count > 0 {
         app.emit(
             "crawl_log",
             format!(
-                "[System] Raw File Target Intercepted: {}. Enqueueing directly to Aria Forge.",
-                name
+                "[SYSTEM] Auto baseline loaded for {}: {} best-known entries.",
+                target_paths.target_identity.target_key, best_prior_count
             ),
         )
-        .unwrap();
-        let fallback_entries = vec![entry.clone()];
-        let _ = app.emit("crawl_progress", fallback_entries.clone());
+        .unwrap_or_default();
+    }
 
-        if auto_download {
-            let circuits = options.circuits.unwrap_or(120).max(1);
-            let safe_target = path_utils::resolve_download_target_within_root(&output_root, &name)
-                .map_err(|e| format!("Direct artifact path rejected: {e}"))?;
-            let safe_target_str = safe_target.to_string_lossy().to_string();
+    let mut final_attempt_result: Option<CrawlAttemptResult> = None;
+    let mut final_entries: Vec<adapters::FileEntry> = Vec::new();
+    let mut final_merged_entries = best_prior_entries.clone();
+    let mut final_instability_reasons = Vec::new();
+    let mut retry_count_used = 0usize;
+
+    for attempt_idx in 0..=retry_budget {
+        if attempt_idx > 0 {
+            retry_count_used = attempt_idx;
             app.emit(
                 "crawl_log",
                 format!(
-                    "[OPSEC] Auto-Mirror engaged for direct artifact via Aria Forge. Target: {} | Circuits: {}",
-                    safe_target_str, circuits
+                    "[SYSTEM] Baseline catch-up retry {}/{} engaged for {}.",
+                    attempt_idx, retry_budget, target_paths.target_identity.target_key
                 ),
             )
             .unwrap_or_default();
+        }
 
-            match start_aria_single_download(&app, url.clone(), safe_target_str, circuits, is_onion)
-                .await
+        let attempt_result =
+            execute_crawl_attempt(&url, &options, &output_root, &target_paths, &app, &vfs).await?;
+        let current_entries = vfs.iter_entries().await.map_err(|e| e.to_string())?;
+        let raw_this_run_count = current_entries.len();
+        let telemetry_snapshot = state.telemetry.snapshot_counters();
+        let mut instability_reasons = Vec::new();
+        if telemetry_snapshot.timeout_count > 0 {
+            instability_reasons.push(format!("timeouts={}", telemetry_snapshot.timeout_count));
+        }
+        if telemetry_snapshot.throttle_count > 0 {
+            instability_reasons.push(format!("throttles={}", telemetry_snapshot.throttle_count));
+        }
+        if telemetry_snapshot.node_failovers > 0 {
+            instability_reasons.push(format!("failovers={}", telemetry_snapshot.node_failovers));
+        }
+        if attempt_result.was_cancelled {
+            instability_reasons.push("cancelled".to_string());
+        }
+
+        let merged_entries = target_state::merge_entries(&best_prior_entries, &current_entries);
+        let should_retry = attempt_idx < retry_budget
+            && best_prior_count > 0
+            && raw_this_run_count < best_prior_count
+            && !attempt_result.was_cancelled
+            && !instability_reasons.is_empty();
+
+        if should_retry {
+            app.emit(
+                "crawl_log",
+                format!(
+                    "[SYSTEM] Crawl underperformed baseline for {} (raw {} < best {}). Retrying after instability: {}",
+                    target_paths.target_identity.target_key,
+                    raw_this_run_count,
+                    best_prior_count,
+                    instability_reasons.join(", ")
+                ),
+            )
+            .unwrap_or_default();
+            continue;
+        }
+
+        final_instability_reasons = instability_reasons;
+        final_merged_entries = merged_entries;
+        final_entries = current_entries;
+        final_attempt_result = Some(attempt_result);
+        break;
+    }
+
+    let final_attempt_result = final_attempt_result.ok_or_else(|| {
+        "No crawl attempt result was produced for baseline evaluation.".to_string()
+    })?;
+    let raw_this_run_count = final_entries.len();
+    let merged_effective_count = final_merged_entries.len();
+    let crawl_outcome = if best_prior_count == 0 {
+        target_state::CrawlOutcome::FirstRun
+    } else if merged_effective_count > best_prior_count {
+        target_state::CrawlOutcome::ExceededBest
+    } else if raw_this_run_count < best_prior_count && !final_instability_reasons.is_empty() {
+        target_state::CrawlOutcome::Degraded
+    } else {
+        target_state::CrawlOutcome::MatchedBest
+    };
+
+    let authoritative_entries = if matches!(
+        crawl_outcome,
+        target_state::CrawlOutcome::FirstRun | target_state::CrawlOutcome::ExceededBest
+    ) {
+        final_merged_entries.clone()
+    } else if !best_prior_entries.is_empty() {
+        best_prior_entries.clone()
+    } else {
+        final_entries.clone()
+    };
+
+    target_state::save_entries_snapshot(&target_paths.current_snapshot_path, &final_entries)
+        .map_err(|e| e.to_string())?;
+    let listing_paths =
+        target_state::write_current_and_history_listings(&target_paths, &final_entries, &url)
+            .map_err(|e| e.to_string())?;
+
+    if matches!(
+        crawl_outcome,
+        target_state::CrawlOutcome::FirstRun | target_state::CrawlOutcome::ExceededBest
+    ) || !target_paths.best_snapshot_path.exists()
+    {
+        target_state::save_entries_snapshot(
+            &target_paths.best_snapshot_path,
+            &authoritative_entries,
+        )
+        .map_err(|e| e.to_string())?;
+        target_state::write_best_listings(&target_paths, &authoritative_entries, &url)
+            .map_err(|e| e.to_string())?;
+        ledger.best_snapshot_version = ledger.best_snapshot_version.saturating_add(1);
+    }
+
+    let finished_at_epoch = chrono::Local::now().timestamp().max(0) as u64;
+    target_state::append_run_record(
+        &mut ledger,
+        target_state::CrawlRunRecord {
+            started_at_epoch,
+            finished_at_epoch,
+            raw_this_run_count,
+            best_prior_count,
+            merged_effective_count,
+            outcome: target_state::crawl_outcome_label(crawl_outcome.clone()).to_string(),
+            retry_count_used,
+            instability_reasons: final_instability_reasons.clone(),
+            current_listing_path: listing_paths
+                .current_canonical_path
+                .to_string_lossy()
+                .to_string(),
+            current_dirs_listing_path: listing_paths
+                .current_dirs_path
+                .to_string_lossy()
+                .to_string(),
+            history_canonical_path: listing_paths
+                .history_canonical_path
+                .to_string_lossy()
+                .to_string(),
+            history_dirs_path: listing_paths
+                .history_dirs_path
+                .to_string_lossy()
+                .to_string(),
+        },
+        crawl_outcome.clone(),
+        authoritative_entries.len(),
+    );
+    target_state::save_ledger(&target_paths, &ledger).map_err(|e| e.to_string())?;
+
+    app.emit(
+        "crawl_log",
+        format!(
+            "[SYSTEM] Stable listings ready: {} | {} | {} | {}",
+            target_paths.stable_current_listing_path.display(),
+            target_paths.stable_current_dirs_listing_path.display(),
+            target_paths.stable_best_listing_path.display(),
+            target_paths.stable_best_dirs_listing_path.display(),
+        ),
+    )
+    .unwrap_or_default();
+
+    let mut auto_download_started = false;
+    if auto_download {
+        let failure_records =
+            target_state::load_failure_manifest(&target_paths.failure_manifest_path)
+                .map_err(|e| e.to_string())?;
+        let resume_build = target_state::build_download_resume_plan(
+            &target_paths.target_identity.target_key,
+            &authoritative_entries,
+            &failure_records,
+            &output_root,
+            &target_paths.failure_manifest_path,
+        )
+        .map_err(|e| e.to_string())?;
+        target_state::save_resume_plan(&target_paths.latest_resume_plan_path, &resume_build.plan)
+            .map_err(|e| e.to_string())?;
+        let _ = app.emit("download_resume_plan", resume_build.plan.clone());
+
+        if resume_build.plan.all_items_skipped {
+            app.emit(
+                "crawl_log",
+                format!(
+                    "[OPSEC] Auto-Mirror skipped for {}: all items already complete.",
+                    target_paths.target_identity.target_key
+                ),
+            )
+            .unwrap_or_default();
+            telemetry_bridge::publish_batch_progress(
+                &app,
+                telemetry_bridge::BridgeBatchProgress {
+                    completed: resume_build.plan.skipped_exact_matches_count,
+                    failed: 0,
+                    total: resume_build.plan.skipped_exact_matches_count,
+                    current_file: "All items skipped".to_string(),
+                    speed_mbps: 0.0,
+                    downloaded_bytes: 0,
+                    active_circuits: Some(0),
+                    bbr_bottleneck_mbps: None,
+                    ekf_covariance: None,
+                },
+            );
+        } else {
+            let circuits = options.circuits.unwrap_or(120).max(1);
+            app.emit(
+                "crawl_log",
+                format!(
+                    "[OPSEC] Auto-Mirror engaged. Failures first: {} | Missing/Mismatch: {} | Skipped exact: {}",
+                    resume_build.plan.failed_first_count,
+                    resume_build.plan.missing_or_mismatch_count,
+                    resume_build.plan.skipped_exact_matches_count
+                ),
+            )
+            .unwrap_or_default();
+            let is_onion = url.contains(".onion");
+            match scaffold_download_from_entries_with_plan(
+                &authoritative_entries,
+                &resume_build.ordered_entries,
+                &target_paths,
+                &output_root,
+                &app,
+                circuits,
+                is_onion,
+            )
+            .await
             {
-                Ok(_) => {
+                Ok(count) => {
+                    auto_download_started = true;
                     app.emit(
                         "crawl_log",
-                        "[OPSEC] Direct artifact download task finished.".to_string(),
+                        format!("[OPSEC] Mirror complete. {} items written to disk.", count),
                     )
                     .unwrap_or_default();
                 }
                 Err(e) => {
-                    app.emit(
-                        "crawl_log",
-                        format!("[ERROR] Direct artifact download failed: {}", e),
-                    )
-                    .unwrap_or_default();
-                }
-            }
-        }
-
-        let arc_frontier = std::sync::Arc::new(frontier);
-        {
-            let state = app.state::<AppState>();
-            let mut lock = state.active_frontier.lock().await;
-            *lock = Some(arc_frontier.clone());
-        }
-        let _ = app.emit(
-            "crawl_status_update",
-            crawl_status_snapshot(arc_frontier.as_ref(), "complete", 100.0, Some(0)),
-        );
-        return Ok(fallback_entries);
-    }
-
-    let registry = adapters::AdapterRegistry::new();
-    if let Some(adapter) = registry.determine_adapter(&fingerprint).await {
-        app.emit(
-            "crawl_log",
-            format!("[Adapter] Match found: {}", adapter.name()),
-        )
-        .unwrap();
-
-        let arc_frontier = std::sync::Arc::new(frontier);
-
-        // Store frontier in app state for cancel support
-        {
-            let state = app.state::<AppState>();
-            let mut lock = state.active_frontier.lock().await;
-            *lock = Some(arc_frontier.clone());
-        }
-
-        let _ = app.emit(
-            "crawl_status_update",
-            crawl_status_snapshot(arc_frontier.as_ref(), "probing", 0.0, None),
-        );
-        let status_emitter = spawn_crawl_status_emitter(app.clone(), arc_frontier.clone());
-
-        let crawl_result = adapter.crawl(&url, arc_frontier.clone(), app.clone()).await;
-
-        status_emitter.abort();
-        let _ = status_emitter.await;
-
-        let final_payload = if arc_frontier.is_cancelled() {
-            let visited = arc_frontier.visited_count();
-            let processed = arc_frontier.processed_count();
-            let queued = visited.saturating_sub(processed);
-            let progress = estimate_progress_percent(
-                visited.max(1),
-                processed,
-                queued,
-                arc_frontier.active_workers(),
-            );
-            crawl_status_snapshot(arc_frontier.as_ref(), "cancelled", progress, None)
-        } else if crawl_result.is_ok() {
-            crawl_status_snapshot(arc_frontier.as_ref(), "complete", 100.0, Some(0))
-        } else {
-            let visited = arc_frontier.visited_count();
-            let processed = arc_frontier.processed_count();
-            let queued = visited.saturating_sub(processed);
-            let progress = estimate_progress_percent(
-                visited.max(1),
-                processed,
-                queued,
-                arc_frontier.active_workers(),
-            );
-            crawl_status_snapshot(arc_frontier.as_ref(), "error", progress, None)
-        };
-        let _ = app.emit("crawl_status_update", final_payload);
-
-        match crawl_result {
-            Ok(files) => {
-                // We keep the active_frontier alive here so that the UI can manually trigger
-                // "Download All" later and still have access to the warm Tor circuits!
-                
-                // Immediately generate definitive crawl index log
-                if !files.is_empty() {
-                    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                    let log_filename = format!("crawl_index_{}.txt", timestamp);
-                    let log_path = output_root.join(&log_filename);
-                    
-                    // Fire-and-forget write of all discovered paths
-                    let files_clone = files.clone();
-                    let log_path_clone = log_path.clone();
-                    let app_clone = app.clone();
-                    tokio::spawn(async move {
-                        let mut content = String::with_capacity(files_clone.len() * 128);
-                        content.push_str(&format!("CRAWL INDEX COMPLETED AT: {}\n", chrono::Local::now().to_rfc2822()));
-                        content.push_str(&format!("TOTAL ENTRIES: {}\n", files_clone.len()));
-                        content.push_str("========================================================================\n\n");
-                        
-                        for file in files_clone {
-                            let type_str = if matches!(file.entry_type, adapters::EntryType::Folder) { "[DIR]" } else { "[FILE]" };
-                            let size_str = file.size_bytes.map(|s| format!("{} bytes", s)).unwrap_or_else(|| "Unknown size".to_string());
-                            content.push_str(&format!("{:<7} {} ({})\n", type_str, file.path, size_str));
-                        }
-                        
-                        if let Ok(_) = tokio::fs::write(&log_path_clone, content).await {
-                            let _ = app_clone.emit("crawl_log", format!("[SYSTEM] Crawl index exported to {}", log_path_clone.display()));
-                        }
-                    });
-                }
-
-                // Auto-download if enabled
-                if auto_download {
-                    if files.is_empty() {
-                        app.emit(
-                            "crawl_log",
-                            "[OPSEC] Auto-Mirror skipped: adapter returned 0 downloadable entries."
-                                .to_string(),
-                        )
+                    app.emit("crawl_log", format!("[ERROR] Mirror failed: {}", e))
                         .unwrap_or_default();
-                    } else {
-                        let circuits = options.circuits.unwrap_or(120).max(1);
-                        app.emit("crawl_log", format!("[OPSEC] Auto-Mirror engaged. Routing {} entries through Aria mirror pipeline to {}", files.len(), output_root_str)).unwrap();
-                        match scaffold_download(&files, &output_root, &app, circuits, is_onion)
-                            .await
-                        {
-                            Ok(count) => {
-                                app.emit(
-                                    "crawl_log",
-                                    format!(
-                                        "[OPSEC] Mirror complete. {} items written to disk.",
-                                        count
-                                    ),
-                                )
-                                .unwrap();
-                            }
-                            Err(e) => {
-                                app.emit("crawl_log", format!("[ERROR] Mirror failed: {}", e))
-                                    .unwrap();
-                            }
-                        }
-                    }
                 }
-                Ok(files)
-            }
-            Err(e) => {
-                // Clear active frontier on error too
-                let state = app.state::<AppState>();
-                let mut lock = state.active_frontier.lock().await;
-                *lock = None;
-                Err(e.to_string())
             }
         }
-    } else {
-        Err("No known adapter matched this sites architecture.".to_string())
     }
+
+    Ok(CrawlSessionResult {
+        target_key: target_paths.target_identity.target_key.clone(),
+        discovered_count: final_attempt_result.summary.discovered_count,
+        file_count: final_attempt_result.summary.file_count,
+        folder_count: final_attempt_result.summary.folder_count,
+        best_prior_count,
+        raw_this_run_count,
+        merged_effective_count,
+        crawl_outcome: target_state::crawl_outcome_label(crawl_outcome).to_string(),
+        retry_count_used,
+        stable_current_listing_path: target_paths
+            .stable_current_listing_path
+            .to_string_lossy()
+            .to_string(),
+        stable_current_dirs_listing_path: target_paths
+            .stable_current_dirs_listing_path
+            .to_string_lossy()
+            .to_string(),
+        stable_best_listing_path: target_paths
+            .stable_best_listing_path
+            .to_string_lossy()
+            .to_string(),
+        stable_best_dirs_listing_path: target_paths
+            .stable_best_dirs_listing_path
+            .to_string_lossy()
+            .to_string(),
+        auto_download_started,
+        output_dir: output_root_str,
+    })
+}
+
+pub async fn start_crawl_for_example(
+    url: String,
+    options: frontier::CrawlOptions,
+    output_dir: String,
+    app: tauri::AppHandle,
+) -> Result<CrawlSessionResult, String> {
+    start_crawl(url, options, output_dir, app).await
 }
 
 /// Sled IPC Receiver: Persist incoming entries silently in the background
@@ -851,6 +1579,7 @@ async fn export_json(output_path: String, app: tauri::AppHandle) -> Result<Strin
 async fn download_all(
     output_dir: String,
     connections: Option<usize>,
+    target_url: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<u32, String> {
     use tauri::Emitter;
@@ -859,11 +1588,79 @@ async fn download_all(
         "[System] Querying Sled VFS for full mirroring operation...",
     );
     let state = app.state::<AppState>();
-    let entries = state.vfs.iter_entries().await.map_err(|e| e.to_string())?;
     let output_root = canonical_output_root(&output_dir)?;
-    let force_tor = entries.iter().any(|entry| entry.raw_url.contains(".onion"));
     let circuits = connections.unwrap_or(120).max(1);
-    scaffold_download(&entries, &output_root, &app, circuits, force_tor)
+
+    if let Some(target_url) = target_url.filter(|value| !value.trim().is_empty()) {
+        let target_paths =
+            target_state::target_paths(&output_root, &target_url).map_err(|e| e.to_string())?;
+        let authoritative_entries =
+            target_state::load_entries_snapshot(&target_paths.best_snapshot_path)
+                .map_err(|e| e.to_string())?;
+        if !authoritative_entries.is_empty() {
+            let failure_records =
+                target_state::load_failure_manifest(&target_paths.failure_manifest_path)
+                    .map_err(|e| e.to_string())?;
+            let resume_build = target_state::build_download_resume_plan(
+                &target_paths.target_identity.target_key,
+                &authoritative_entries,
+                &failure_records,
+                &output_root,
+                &target_paths.failure_manifest_path,
+            )
+            .map_err(|e| e.to_string())?;
+            target_state::save_resume_plan(
+                &target_paths.latest_resume_plan_path,
+                &resume_build.plan,
+            )
+            .map_err(|e| e.to_string())?;
+            let _ = app.emit("download_resume_plan", resume_build.plan.clone());
+
+            if resume_build.plan.all_items_skipped {
+                let _ = app.emit(
+                    "crawl_log",
+                    format!(
+                        "[SYSTEM] Download resume skipped for {}: all items already complete.",
+                        target_paths.target_identity.target_key
+                    ),
+                );
+                telemetry_bridge::publish_batch_progress(
+                    &app,
+                    telemetry_bridge::BridgeBatchProgress {
+                        completed: resume_build.plan.skipped_exact_matches_count,
+                        failed: 0,
+                        total: resume_build.plan.skipped_exact_matches_count,
+                        current_file: "All items skipped".to_string(),
+                        speed_mbps: 0.0,
+                        downloaded_bytes: 0,
+                        active_circuits: Some(0),
+                        bbr_bottleneck_mbps: None,
+                        ekf_covariance: None,
+                    },
+                );
+                return Ok(0);
+            }
+
+            return scaffold_download_from_entries_with_plan(
+                &authoritative_entries,
+                &resume_build.ordered_entries,
+                &target_paths,
+                &output_root,
+                &app,
+                circuits,
+                target_url.contains(".onion"),
+            )
+            .await
+            .map_err(|e| e.to_string());
+        }
+    }
+
+    let entries = state.vfs.iter_entries().await.map_err(|e| e.to_string())?;
+    let force_tor = entries.iter().any(|entry| entry.raw_url.contains(".onion"));
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    scaffold_download_from_vfs(&state.vfs, &output_root, &app, circuits, force_tor)
         .await
         .map_err(|e| e.to_string())
 }
@@ -976,6 +1773,28 @@ fn stop_active_download(app: tauri::AppHandle) -> Result<bool, String> {
     Ok(stopped)
 }
 
+#[tauri::command]
+async fn pre_resolve_onion(url: String, app: tauri::AppHandle) -> Result<(), String> {
+    if !url.contains(".onion") { return Ok(()); }
+    let state = app.state::<AppState>();
+    if let Some(guard_arc) = state.swarm_guard.lock().await.clone() {
+        tauri::async_runtime::spawn(async move {
+            let guard = guard_arc.lock().await;
+            if let Some(client) = guard.get_arti_clients().first() {
+                let tor_client = if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::task::block_in_place(|| client.blocking_read().clone())
+                } else {
+                    client.blocking_read().clone()
+                };
+                let token = ::arti_client::IsolationToken::new();
+                let arti = arti_client::ArtiClient::new((*tor_client).clone(), Some(token));
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), arti.head(&url).send()).await;
+            }
+        });
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Flush any zombie Tor daemons from previous sessions on startup
@@ -984,9 +1803,22 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState {
-            active_frontier: Mutex::new(None),
-            vfs: db::SledVfs::default(),
+        .manage(AppState::default())
+        .setup(|app| {
+            let state = app.state::<AppState>();
+            runtime_metrics::spawn_metrics_emitter(app.handle().clone(), state.telemetry.clone());
+            telemetry_bridge::spawn_bridge_emitter(
+                app.handle().clone(),
+                state.telemetry_bridge.clone(),
+            );
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                if let Ok((guard, _)) = tor::bootstrap_tor_cluster(handle.clone(), 4).await {
+                    *state.swarm_guard.lock().await = Some(Arc::new(tokio::sync::Mutex::new(guard)));
+                }
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             start_crawl,
@@ -999,7 +1831,8 @@ pub fn run() {
             stop_active_download,
             get_vfs_children,
             get_adapter_support_catalog,
-            ingest_vfs_entries
+            ingest_vfs_entries,
+            pre_resolve_onion
         ])
         .on_window_event(|_window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -1010,3 +1843,5 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+pub mod arti_client;
+pub mod arti_connector;

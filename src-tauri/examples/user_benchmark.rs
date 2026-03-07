@@ -1,0 +1,103 @@
+use crawli_lib::adapters::qilin::QilinAdapter;
+use crawli_lib::adapters::{CrawlerAdapter, EntryType};
+use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
+use std::sync::Arc;
+use tauri::Builder;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = Builder::default().build(tauri::generate_context!())?;
+    let target = "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed".to_string();
+
+    let options = CrawlOptions {
+        listing: true,
+        sizes: true,
+        download: false,
+        circuits: Some(60), // Use 60 circuits
+        daemons: Some(5),   // Use 5 daemons
+        agnostic_state: false,
+        resume: false,
+        resume_index: None,
+    };
+
+    println!("Bootstrapping Tor cluster...");
+    let tor_daemons = 5;
+    let (_swarm, ports) =
+        crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), tor_daemons).await?;
+    println!("Tor cluster bootstrapped on ports: {:?}", ports);
+
+    if let Some(&port) = ports.first() {
+        println!("Testing direct connection through port {}...", port);
+        let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{}", port))?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        match client.get(&target).send().await {
+            Ok(resp) => {
+                println!("Direct connection response: {}", resp.status());
+            }
+            Err(e) => {
+                println!("Direct connection failed: {}", e);
+            }
+        }
+    }
+
+    println!("Starting Qilin crawl on: {}", target);
+    let start_time = std::time::Instant::now();
+
+    let mut tor_ports = Vec::with_capacity(60);
+    if ports.is_empty() {
+        tor_ports = vec![0; 60];
+    } else {
+        for i in 0..60 {
+            tor_ports.push(ports[i % ports.len()]);
+        }
+    }
+
+    let frontier = Arc::new(CrawlerFrontier::new(
+        Some(app.handle().clone()),
+        target.clone(),
+        60,    // circuits
+        false, // force_tor
+        tor_ports,
+        Vec::new(),
+        options,
+    ));
+
+    let adapter = QilinAdapter;
+    let entries = adapter
+        .crawl(&target, frontier, app.handle().clone())
+        .await?;
+
+    let duration_secs = start_time.elapsed().as_secs_f64();
+    let num_entries = entries.len();
+    let throughput = (num_entries as f64) / duration_secs;
+
+    let mut num_files = 0;
+    let mut num_folders = 0;
+    let mut total_size: u64 = 0;
+
+    for entry in entries {
+        match entry.entry_type {
+            EntryType::File => {
+                num_files += 1;
+                total_size += entry.size_bytes.unwrap_or(0);
+            }
+            EntryType::Folder => num_folders += 1,
+        }
+    }
+
+    println!("\n=== QILIN CRAWL BENCHMARK RESULTS ===");
+    println!("Target:        {}", target);
+    println!("Total Entries: {}", num_entries);
+    println!("  Files:       {}", num_files);
+    println!("  Folders:     {}", num_folders);
+    println!("Total Size:    {} bytes", total_size);
+    println!("Duration:      {:.2} seconds", duration_secs);
+    println!("Throughput:    {:.2} entries / sec", throughput);
+    println!("=====================================\n");
+
+    Ok(())
+}

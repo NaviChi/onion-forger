@@ -75,6 +75,15 @@
   font-weight: 700;
 }
 
+.resource-card {
+  min-width: 300px;
+}
+
+.resource-card .dash-value,
+.resource-card .dash-sub {
+  font-family: 'JetBrains Mono', monospace;
+}
+
 .progress-card {
   min-width: 100%;
   flex: 1 1 100%;

@@ -1,7 +1,43 @@
-> **Last Updated:** 2026-03-04T15:08 CST
+> **Last Updated:** 2026-03-06T16:40 CST
 
-Version: 1.0.6
-Updated: 2026-03-04
+## Phase 1.0.8: Target Baseline Status and Failure-First Queue Visibility (2026-03-06)
+
+### Issues Found
+- Operators could not see whether the latest crawl matched, exceeded, or degraded relative to the best known result for the same target
+- The UI exposed manual resume-index selection, but it did not make the new automatic per-target baseline behavior visible
+- Download telemetry showed batch progress, but not whether the next queue was built from failures first, missing/mismatch files, or all-skipped completion
+
+### Fixes Implemented
+- Added persisted crawl baseline state to the frontend result contract and rendered it in a dedicated dashboard surface
+- Added download resume-plan state to the frontend and surfaced `failures first`, `missing/mismatch`, `skipped exact`, and `all items skipped` counts in the download-progress area
+- Relabeled manual resume-index selection as an advanced baseline override instead of the primary path
+- Added stable listing file-path logging so operators can locate the per-target current/best artifacts directly in the selected output folder
+
+### Prevention Rules
+**17. Repeat-crawl UX must show baseline outcome (`first`, `matched`, `exceeded`, `degraded`) explicitly; operators should not infer it from raw node counts alone.**
+**18. Automatic baseline behavior must remain the default path, with manual resume-index selection presented as an advanced override.**
+**19. Download queue telemetry must distinguish failures-first planning from ordinary batch progress.**
+
+## Phase 1.0.7: Resource Telemetry Dashboard and Fixture Coverage (2026-03-06)
+
+### Issues Found
+- Operators could see bandwidth/circuit metrics, but not Crawli process CPU usage, process RSS, or whole-system RAM pressure during heavy sessions
+- The progress surface still made it easy to confuse circuit budget with live Qilin worker target
+- Browser fixture mode had no representation of the new operator telemetry surface, so Playwright could not validate it
+
+### Fixes Implemented
+- Added `resourceMetrics` state to `App.tsx` and subscribed it to the backend `resource_metrics_update` event
+- Added a dedicated dashboard operator card in `Dashboard.tsx` for process CPU, process RSS, system RAM, active workers/target, active/peak circuits, node host, failovers, throttles, and timeouts
+- Added deterministic fixture telemetry in `vfsFixture.ts` and Playwright coverage for zero-state plus active-state operator rendering
+- Updated crawl-finish handling in `App.tsx` to consume the compact `CrawlSessionResult` contract instead of expecting a full returned file array
+
+### Prevention Rules
+**14. Operator load telemetry must come from backend resource events, not from inferred frontend timing or bandwidth counters.**
+**15. Fixture mode must include any new critical dashboard surface that is expected to be covered by Playwright.**
+**16. If the backend changes a command return shape, the frontend contract and browser tests must change in the same patch.**
+
+Version: 1.0.7
+Updated: 2026-03-06
 Authors: Navi (User), Codex (GPT-5)
 Related Rules: [CRITICAL-L0] Native/Web Boundary, [MANDATORY-L1] Prevention Discipline, [MANDATORY-L1] Testing & Validation
 
@@ -58,6 +94,9 @@ Issue-to-fix mapping:
 - Issue: Rapid backend routing updates caused UI throughput labels to jitter.
   - Root Cause: high-frequency bandwidth sampling fed directly into UI telemetry without smoothing.
   - Fix: implemented EMA/EWMA smoothing in React state and rendered both instant and smoothed throughput for operator context.
+- Issue: The dashboard listened to four separate hot telemetry events, which increased renderer wakeups and made schema migration harder.
+  - Root Cause: crawl, resource, batch, and per-file download telemetry were added independently over time, so `App.tsx` accumulated multiple event listeners and duplicated normalization logic.
+  - Fix: switched the frontend to a single `telemetry_bridge_update` listener and moved the batch/download normalization into shared reducer-style helpers inside `App.tsx`.
 
 # Prevention Rules
 **1. Progress visuals must bind to backend telemetry events, not inferred log strings.**
@@ -73,6 +112,9 @@ Issue-to-fix mapping:
 **11. Display-path rendering must sanitize OS-specific canonical prefixes before binding to UI text or keys.**
 **12. Download progress bars must blend file-count and byte-count signals to avoid false plateaus.**
 **13. ETA displays must include confidence signaling when totals/speeds are estimate-driven.**
+**14. High-frequency operator UI state must prefer one aggregated bridge event over multiple parallel hot listeners.**
+**15. Overlay integrity geometry checks must distinguish true layout shifts from internal scroll-container translation.**
+**16. Dynamic popovers/menus used in integrity tests must be reopened deterministically before child-control interaction.**
 
 # Risk
 - Estimated progress may briefly plateau in highly dynamic directory trees.
@@ -85,6 +127,8 @@ Issue-to-fix mapping:
 - 2026-03-03: Added delta-based frontend throughput fallback for sparse batch telemetry updates.
 - 2026-03-03: Added Windows path normalization, byte-aware progress fill, and active/peak circuit+throughput telemetry.
 - 2026-03-04: Added EWMA throughput smoothing and explicit ETA confidence telemetry to stabilize download operator readouts.
+- 2026-03-06: Migrated the dashboard to `telemetry_bridge_update`, consolidating crawl/resource/batch/download listeners into one aggregated operator-plane feed.
+- 2026-03-07: Hardened the overlay integrity harness so internal `.app-container` scrolling and support-popover re-entry no longer produce false UI regressions.
 
 # Appendices
 - Validation:

@@ -173,7 +173,7 @@ impl CrawlerAdapter for IncRansomAdapter {
         });
 
         // 4. Autonomous Worker Pool with pending-counter termination
-        let max_concurrent = 120; // Massive worker-stealer parallel pool
+        let max_concurrent = frontier.recommended_listing_workers();
         let mut workers = tokio::task::JoinSet::new();
 
         for _ in 0..max_concurrent {
@@ -237,11 +237,18 @@ impl CrawlerAdapter for IncRansomAdapter {
                     // 5-pass HTTP Resilience for Deep-Web Tor packet loss
                     let mut backoff = 1000u64;
                     let mut success = false;
+                    let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
                     for _attempt in 1..=5 {
                         let start_time = std::time::Instant::now();
                         let resp_result = client.post(&folder_api_url).json(&body).send().await;
 
                         f.record_success(cid, 4096, start_time.elapsed().as_millis() as u64);
+
+                        if let Ok(resp) = &resp_result {
+                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
 
                         if let Ok(resp) = resp_result {
                             if resp.status().is_success() {

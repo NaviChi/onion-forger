@@ -37,4 +37,8 @@ impl super::CrawlerAdapter for LockBitAdapter {
         // LockBit hosts rotate; keep a resilient host-token fast-path.
         vec!["lockbit"]
     }
+
+    fn regex_marker(&self) -> Option<&'static str> {
+        Some(r"(?i)lockbit|nginx\s+output")
+    }
 }

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use reqwest::header::HeaderMap;
+use http::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
@@ -68,6 +68,8 @@ pub trait CrawlerAdapter: Send + Sync {
     }
 }
 
+pub mod abyss;
+pub mod alphalocker;
 pub mod autoindex;
 pub mod dragonforce;
 pub mod inc_ransom;
@@ -75,8 +77,10 @@ pub mod lockbit;
 pub mod nu;
 pub mod pear;
 pub mod play;
+pub mod plugin_host;
 pub mod qilin;
 pub mod qilin_nodes;
+pub mod qilin_ddos_guard;
 pub mod worldleaks;
 
 pub fn support_catalog() -> Vec<AdapterSupportInfo> {
@@ -184,6 +188,28 @@ pub fn support_catalog() -> Vec<AdapterSupportInfo> {
             notes: "Most heavily tested adapter with full listing/scaffold validation.",
         },
         AdapterSupportInfo {
+            id: "abyss",
+            name: "Abyss Ransomware",
+            support_level: "Full Crawl",
+            matching_strategy: "Known-domain + direct archive URL detection",
+            sample_urls: vec![
+                "http://vmmefm7ktazj2bwtmy46o3wxhk42tctasyyqv6ymuzlivszteyhkkyad.onion/iamdesign.rar",
+            ],
+            tested_for: vec!["Adapter fingerprint match (engine_test)"],
+            notes: "Handles direct archive downloads and directory listing traversal for Abyss leak sites.",
+        },
+        AdapterSupportInfo {
+            id: "alphalocker",
+            name: "AlphaLocker Ransomware",
+            support_level: "Full Crawl",
+            matching_strategy: "Known-domain and URL-path signature matching",
+            sample_urls: vec![
+                "http://3v4zoso2ghne47usnhyoe4dsezmfqhfv5v5iuep4saic5nnfpc6phrad.onion/gazomet.pl%20&%20cgas.pl/Files/",
+            ],
+            tested_for: vec!["Adapter fingerprint match (engine_test)"],
+            notes: "Handles autoindex and custom table-based listings with URL-encoded paths for AlphaLocker sites.",
+        },
+        AdapterSupportInfo {
             id: "autoindex",
             name: "Generic Autoindex",
             support_level: "Fallback",
@@ -210,6 +236,10 @@ impl Default for AdapterRegistry {
 
 impl AdapterRegistry {
     pub fn new() -> Self {
+        Self::with_plugin_dir(None)
+    }
+
+    pub fn with_plugin_dir(plugin_dir: Option<&std::path::Path>) -> Self {
         let mut registry = AdapterRegistry {
             adapters: Vec::new(),
             domain_cache: std::collections::HashMap::new(),
@@ -246,12 +276,25 @@ impl AdapterRegistry {
         registry
             .adapters
             .push(("lockbit".to_string(), Box::new(lockbit::LockBitAdapter)));
+        registry.adapters.push((
+            "abyss".to_string(),
+            Box::new(abyss::AbyssAdapter),
+        ));
+        registry.adapters.push((
+            "alphalocker".to_string(),
+            Box::new(alphalocker::AlphaLockerAdapter),
+        ));
         registry
             .adapters
             .push(("qilin".to_string(), Box::new(qilin::QilinAdapter)));
         registry
             .adapters
             .push(("nu_server".to_string(), Box::new(nu::NuServerAdapter)));
+
+        for entry in plugin_host::load_runtime_plugins(plugin_dir, &mut registry.domain_cache) {
+            registry.adapters.push(entry);
+        }
+
         registry // Error placeholder if lines changed again
             .adapters
             .push((

@@ -17,6 +17,9 @@ test.describe('Crawli React Application', () => {
         if (await urlInput.isVisible()) {
             await expect(urlInput).toBeEditable();
         }
+
+        await expect(page.getByTestId('resource-metrics-card')).toBeVisible();
+        await expect(page.getByTestId('resource-process-cpu')).toContainText('CPU 0.0%');
     });
 
     test('mocked crawl execution handles missing Tauri IPC gracefully', async ({ page }) => {
@@ -33,6 +36,16 @@ test.describe('Crawli React Application', () => {
             const dashboardBody = page.locator('body');
             await expect(dashboardBody).toBeVisible();
         }
+    });
+
+    test('fixture mode renders live operator telemetry', async ({ page }) => {
+        await page.goto('/?fixture=vfs');
+
+        await expect(page.getByTestId('resource-metrics-card')).toBeVisible();
+        await expect(page.getByTestId('resource-process-cpu')).toContainText('CPU 18.4%');
+        await expect(page.getByTestId('resource-process-memory')).toContainText('RSS 412.0 MB');
+        await expect(page.getByTestId('resource-worker-metrics')).toContainText('Workers 6/12');
+        await expect(page.getByTestId('resource-node-metrics')).toContainText('fixture-storage-primary.onion');
     });
 
 });

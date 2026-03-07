@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectIoPolicy {
@@ -11,8 +11,18 @@ pub enum DirectIoPolicy {
 
 static DIRECT_IO_POLICY: OnceLock<DirectIoPolicy> = OnceLock::new();
 static DIRECT_IO_DEGRADED: AtomicBool = AtomicBool::new(false);
+static RUNTIME_DIRECT_IO_OVERRIDE: OnceLock<Mutex<Option<DirectIoPolicy>>> = OnceLock::new();
+
+fn runtime_override_slot() -> &'static Mutex<Option<DirectIoPolicy>> {
+    RUNTIME_DIRECT_IO_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
 
 pub fn direct_io_policy() -> DirectIoPolicy {
+    if let Ok(guard) = runtime_override_slot().lock() {
+        if let Some(policy) = *guard {
+            return policy;
+        }
+    }
     *DIRECT_IO_POLICY.get_or_init(|| {
         match std::env::var("CRAWLI_DIRECT_IO")
             .unwrap_or_else(|_| "auto".to_string())
@@ -31,6 +41,27 @@ pub fn direct_io_policy_label() -> &'static str {
         DirectIoPolicy::Auto => "auto",
         DirectIoPolicy::Always => "always",
         DirectIoPolicy::Off => "off",
+    }
+}
+
+pub fn set_runtime_direct_io_override(policy: Option<DirectIoPolicy>) {
+    if let Ok(mut guard) = runtime_override_slot().lock() {
+        *guard = policy;
+    }
+}
+
+pub struct RuntimeDirectIoOverrideGuard;
+
+impl RuntimeDirectIoOverrideGuard {
+    pub fn new(policy: Option<DirectIoPolicy>) -> Self {
+        set_runtime_direct_io_override(policy);
+        Self
+    }
+}
+
+impl Drop for RuntimeDirectIoOverrideGuard {
+    fn drop(&mut self) {
+        set_runtime_direct_io_override(None);
     }
 }
 

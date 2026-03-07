@@ -140,7 +140,7 @@ impl CrawlerAdapter for AutoindexAdapter {
             }
         });
 
-        let max_concurrent = 120; // Massive worker-stealer parallel pool
+        let max_concurrent = frontier.recommended_listing_workers();
         let mut workers = tokio::task::JoinSet::new();
 
         let _base_url = current_url.trim_end_matches('/').to_string();
@@ -154,6 +154,7 @@ impl CrawlerAdapter for AutoindexAdapter {
 
             workers.spawn(async move {
                 let mut idle_sleep_ms: u64 = 50;
+                let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
                 loop {
                     // Check cancellation before doing any work
                     if f.is_cancelled() {
@@ -164,12 +165,13 @@ impl CrawlerAdapter for AutoindexAdapter {
                         Some(url) => {
                             idle_sleep_ms = 50;
                             url
-                        },
+                        }
                         None => {
                             if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                                 break;
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms))
+                                .await;
                             idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
                             continue;
                         }
@@ -195,6 +197,9 @@ impl CrawlerAdapter for AutoindexAdapter {
                     )
                     .await
                     {
+                        if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                            tokio::time::sleep(delay).await;
+                        }
                         if resp.status().is_success() {
                             if let Ok(body) = resp.text().await {
                                 bytes_downloaded += body.len() as u64;
@@ -239,10 +244,12 @@ impl CrawlerAdapter for AutoindexAdapter {
 
                             for (filename, parsed_size, is_dir) in parsed {
                                 let encoded = path_utils::url_encode(&filename);
-                                let child_url = format!("{}/{}", next_url.trim_end_matches('/'), encoded);
+                                let child_url =
+                                    format!("{}/{}", next_url.trim_end_matches('/'), encoded);
 
                                 if is_dir {
-                                    let sanitized_path = format!("/{}", path_utils::sanitize_path(&filename));
+                                    let sanitized_path =
+                                        format!("/{}", path_utils::sanitize_path(&filename));
                                     local_files.push(FileEntry {
                                         path: sanitized_path,
                                         size_bytes: None,
@@ -251,7 +258,8 @@ impl CrawlerAdapter for AutoindexAdapter {
                                     });
                                     local_folders.push(format!("{}/", child_url));
                                 } else {
-                                    let sanitized_path = format!("/{}", path_utils::sanitize_path(&filename));
+                                    let sanitized_path =
+                                        format!("/{}", path_utils::sanitize_path(&filename));
                                     local_files.push(FileEntry {
                                         path: sanitized_path,
                                         size_bytes: parsed_size,
@@ -262,7 +270,9 @@ impl CrawlerAdapter for AutoindexAdapter {
                             }
                             (local_files, local_folders)
                         }
-                    }).await.unwrap_or_default();
+                    })
+                    .await
+                    .unwrap_or_default();
 
                     let mut new_files = spawned_files;
                     for sub_url in spawned_folders {
@@ -278,9 +288,13 @@ impl CrawlerAdapter for AutoindexAdapter {
                             if nf.entry_type == EntryType::File && nf.size_bytes.is_none() {
                                 if let Ok(Ok(head_resp)) = tokio::time::timeout(
                                     std::time::Duration::from_secs(10),
-                                    client.head(&nf.raw_url).send()
-                                ).await {
-                                    nf.size_bytes = head_resp.headers().get("content-length")
+                                    client.head(&nf.raw_url).send(),
+                                )
+                                .await
+                                {
+                                    nf.size_bytes = head_resp
+                                        .headers()
+                                        .get("content-length")
                                         .and_then(|v| v.to_str().ok())
                                         .and_then(|s| s.parse::<u64>().ok());
                                 }

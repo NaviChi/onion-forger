@@ -29,7 +29,10 @@ async fn main() {
                 println!("Response Status: {}", resp.status());
                 if let Ok(text) = resp.text().await {
                     println!("Response length: {}", text.len());
-                    println!("Contains `<table id=\"list\">`: {}", text.contains("<table id=\"list\">"));
+                    println!(
+                        "Contains `<table id=\"list\">`: {}",
+                        text.contains("<table id=\"list\">")
+                    );
                     println!("Contains `Data browser`: {}", text.contains("Data browser"));
                     let preview = text.chars().take(500).collect::<String>();
                     println!("Preview:\n{}", preview);

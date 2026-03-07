@@ -63,6 +63,23 @@ export const VFS_FIXTURE_STATS = VFS_FIXTURE_ENTRIES.reduce(
   { files: 0, folders: 0, size: 0, totalNodes: 0 }
 );
 
+export const FIXTURE_RESOURCE_METRICS = {
+  processCpuPercent: 18.4,
+  processMemoryBytes: 412 * 1024 * 1024,
+  processThreads: 0,
+  systemMemoryUsedBytes: 11 * 1024 * 1024 * 1024,
+  systemMemoryTotalBytes: 32 * 1024 * 1024 * 1024,
+  systemMemoryPercent: 34.4,
+  activeWorkers: 6,
+  workerTarget: 12,
+  activeCircuits: 9,
+  peakActiveCircuits: 12,
+  currentNodeHost: "fixture-storage-primary.onion",
+  nodeFailovers: 1,
+  throttleCount: 2,
+  timeoutCount: 1,
+};
+
 export function isVfsFixtureMode(): boolean {
   if (typeof window === "undefined") return false;
   const params = new URLSearchParams(window.location.search);

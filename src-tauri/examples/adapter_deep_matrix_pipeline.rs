@@ -95,6 +95,8 @@ fn main() -> anyhow::Result<()> {
                 circuits: Some(5),
                 daemons: Some(5),
                 agnostic_state: false,
+                resume: false,
+                resume_index: None,
             };
             let frontier = Arc::new(CrawlerFrontier::new(
                 None,
@@ -102,6 +104,7 @@ fn main() -> anyhow::Result<()> {
                 10,
                 false,
                 vec![],
+                Vec::new(),
                 options,
             ));
             frontier.mark_visited(target.url);

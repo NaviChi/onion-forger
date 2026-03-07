@@ -41,7 +41,7 @@ fn recursive_extract_json(
                     };
 
                     let size_bytes = map.get("size").and_then(|v| v.as_u64());
-                    
+
                     // Segregate NextJS HTML routes (/?path=) from Backend API downloads (/download?path=)
                     let api_endpoint = if is_dir { "" } else { "download" };
                     let raw_url = format!(
@@ -250,7 +250,7 @@ impl CrawlerAdapter for DragonForceAdapter {
             }
         });
 
-        let max_concurrent = 120; // Massive worker-stealer parallel pool
+        let max_concurrent = frontier.recommended_listing_workers();
         let mut workers = tokio::task::JoinSet::new();
 
         for _ in 0..max_concurrent {
@@ -282,10 +282,13 @@ impl CrawlerAdapter for DragonForceAdapter {
                     }
                     impl Drop for TaskGuard {
                         fn drop(&mut self) {
-                            self.counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            self.counter
+                                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
-                    let _guard = TaskGuard { counter: pending_clone.clone() };
+                    let _guard = TaskGuard {
+                        counter: pending_clone.clone(),
+                    };
 
                     let dynamic_host = if let Ok(u) = url::Url::parse(&next_url) {
                         u.host_str().unwrap_or("").to_string()
@@ -306,6 +309,7 @@ impl CrawlerAdapter for DragonForceAdapter {
                     let mut bytes_downloaded = 0;
                     let mut html = String::new();
                     let mut active_cid = cid;
+                    let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
 
                     for _ in 0..4 {
                         let (current_cid, current_client) = f.get_client();
@@ -315,6 +319,9 @@ impl CrawlerAdapter for DragonForceAdapter {
                         if let Ok(Ok(resp)) =
                             tokio::time::timeout(std::time::Duration::from_secs(45), req).await
                         {
+                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                                tokio::time::sleep(delay).await;
+                            }
                             if resp.status().is_success() {
                                 if let Ok(Ok(body)) = tokio::time::timeout(
                                     std::time::Duration::from_secs(45),

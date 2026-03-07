@@ -65,6 +65,45 @@ fn test_adapter_support_catalog_shape() {
 }
 
 #[tokio::test]
+async fn test_runtime_plugin_manifest_matches_without_rebuild() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let plugin_dir = std::env::temp_dir().join(format!("crawli_plugin_fixture_{unique}"));
+    std::fs::create_dir_all(&plugin_dir).expect("plugin dir should be creatable");
+    let manifest_path = plugin_dir.join("fixture_autoindex.json");
+    std::fs::write(
+        &manifest_path,
+        r#"{
+            "id": "fixture_autoindex",
+            "name": "Fixture Autoindex Plugin",
+            "host_pipeline": "autoindex",
+            "known_domains": ["fixture-plugin.onion"],
+            "url_contains_any": ["/fixture"],
+            "body_contains_all": ["Index of /fixture/", "Special Fixture Marker"]
+        }"#,
+    )
+    .expect("manifest should be writable");
+
+    let registry = crawli_lib::adapters::AdapterRegistry::with_plugin_dir(Some(&plugin_dir));
+    let fp = SiteFingerprint {
+        url: "http://fixture-plugin.onion/fixture".to_string(),
+        status: 200,
+        headers: HeaderMap::new(),
+        body: "Special Fixture Marker\nIndex of /fixture/".to_string(),
+    };
+
+    let adapter = registry
+        .determine_adapter(&fp)
+        .await
+        .expect("plugin adapter should match");
+    assert_eq!(adapter.name(), "Fixture Autoindex Plugin");
+
+    let _ = std::fs::remove_dir_all(plugin_dir);
+}
+
+#[tokio::test]
 async fn test_frontier_initialization() {
     let options = CrawlOptions::default();
     let frontier = CrawlerFrontier::new(
@@ -73,6 +112,7 @@ async fn test_frontier_initialization() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        vec![],
         options,
     );
 
@@ -105,6 +145,7 @@ async fn test_frontier_clearnet_initialization() {
         4,
         false,
         vec![],
+        vec![],
         options,
     );
 
@@ -130,6 +171,7 @@ async fn test_onion_listing_worker_target_stays_pinned_after_failures() {
         daemons: Some(4),
         agnostic_state: false,
         resume: false,
+        resume_index: None,
     };
     let frontier = CrawlerFrontier::new(
         None,
@@ -137,6 +179,7 @@ async fn test_onion_listing_worker_target_stays_pinned_after_failures() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        vec![],
         options,
     );
 
@@ -165,7 +208,15 @@ async fn test_frontier_fresh_crawl_ignores_stale_wal_by_default() {
     let wal_path = std::path::PathBuf::from(format!("/tmp/crawli_{}.wal", wal_name));
     let _ = std::fs::write(&wal_path, b"http://wal-reset.onion/preseed\n");
 
-    let frontier = CrawlerFrontier::new(None, unique, 1, true, vec![9051], CrawlOptions::default());
+    let frontier = CrawlerFrontier::new(
+        None,
+        unique,
+        1,
+        true,
+        vec![9051],
+        vec![],
+        CrawlOptions::default(),
+    );
     assert_eq!(
         frontier.visited_count(),
         0,
@@ -183,6 +234,7 @@ async fn test_bloom_filter_dedup() {
         1,
         true,
         vec![9051],
+        vec![],
         CrawlOptions::default(),
     );
 
@@ -201,6 +253,7 @@ async fn test_client_round_robin() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        vec![],
         CrawlOptions::default(),
     );
 
@@ -341,9 +394,15 @@ async fn test_adapter_fingerprint_matching() {
     };
     let adapter: Option<&dyn crawli_lib::adapters::CrawlerAdapter> =
         registry.determine_adapter(&qilin_fp).await;
-    assert!(adapter.is_some(), "Qilin adapter should match unknown domain via DOM heuristic");
+    assert!(
+        adapter.is_some(),
+        "Qilin adapter should match unknown domain via DOM heuristic"
+    );
     assert_eq!(adapter.unwrap().name(), "Qilin Nginx Autoindex / CMS");
-    println!("✅ Qilin Autonomous Detection matched: {}", adapter.unwrap().name());
+    println!(
+        "✅ Qilin Autonomous Detection matched: {}",
+        adapter.unwrap().name()
+    );
 
     // --- Autoindex fallback ---
     let ai_fp = SiteFingerprint {
@@ -366,6 +425,7 @@ async fn test_crawl_options_propagation() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        vec![],
         CrawlOptions {
             listing: false,
             sizes: false,
@@ -374,6 +434,7 @@ async fn test_crawl_options_propagation() {
             daemons: None,
             agnostic_state: false,
             resume: false,
+            resume_index: None,
         },
     );
     assert!(!frontier.active_options.listing);
@@ -387,6 +448,7 @@ async fn test_crawl_options_propagation() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        vec![],
         CrawlOptions {
             listing: true,
             sizes: true,
@@ -395,6 +457,7 @@ async fn test_crawl_options_propagation() {
             daemons: None,
             agnostic_state: false,
             resume: false,
+            resume_index: None,
         },
     );
     assert!(frontier2.active_options.listing);
@@ -412,6 +475,7 @@ async fn test_high_volume_bloom_filter_stress() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        vec![],
         CrawlOptions::default(),
     );
 
@@ -456,6 +520,7 @@ async fn test_concurrent_worker_simulation() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        vec![],
         CrawlOptions::default(),
     ));
 
@@ -535,21 +600,43 @@ fn test_dragonforce_nextjs_predictive_hydration() {
         simulated_parent_url,
     );
 
-    assert_eq!(entries.len(), 2, "Expected exactly 2 entries extracted from the NextJS mock JSON");
+    assert_eq!(
+        entries.len(),
+        2,
+        "Expected exactly 2 entries extracted from the NextJS mock JSON"
+    );
 
-    let folder = entries.iter().find(|e| e.entry_type == crawli_lib::adapters::EntryType::Folder).unwrap();
-    let file = entries.iter().find(|e| e.entry_type == crawli_lib::adapters::EntryType::File).unwrap();
+    let folder = entries
+        .iter()
+        .find(|e| e.entry_type == crawli_lib::adapters::EntryType::Folder)
+        .unwrap();
+    let file = entries
+        .iter()
+        .find(|e| e.entry_type == crawli_lib::adapters::EntryType::File)
+        .unwrap();
 
     // Verify Path Context Preservation and HTML routing (/?path=...)
     assert_eq!(folder.path, "/internal_accounting");
-    assert!(folder.raw_url.contains("/?path="), "Folders must route to HTML endpoint");
-    assert!(!folder.raw_url.contains("/download?path="), "Folders must not map to the download API");
-    
+    assert!(
+        folder.raw_url.contains("/?path="),
+        "Folders must route to HTML endpoint"
+    );
+    assert!(
+        !folder.raw_url.contains("/download?path="),
+        "Folders must not map to the download API"
+    );
+
     // Verify API Segregation (/download?path=...)
     assert_eq!(file.path, "/internal_accounting/dragonforce_manifest.json");
     assert_eq!(file.size_bytes, Some(55621));
-    assert!(file.raw_url.contains("/download?path="), "Files MUST route to the backend download API");
-    assert!(!file.raw_url.contains("/?path="), "Files must not map to the HTML viewer endpoint");
+    assert!(
+        file.raw_url.contains("/download?path="),
+        "Files MUST route to the backend download API"
+    );
+    assert!(
+        !file.raw_url.contains("/?path="),
+        "Files must not map to the HTML viewer endpoint"
+    );
 
     println!("✅ DragonForce Predictive State Hydrator parsed NextJS DOM correctly.");
 }

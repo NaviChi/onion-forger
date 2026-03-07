@@ -1,11 +1,22 @@
 use crate::adapters::FileEntry;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::mem;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct SledVfs {
     db: Arc<Mutex<Option<sled::Db>>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VfsSummary {
+    pub discovered_count: usize,
+    pub file_count: usize,
+    pub folder_count: usize,
+    pub total_size_bytes: u64,
 }
 
 impl Default for SledVfs {
@@ -50,9 +61,9 @@ impl SledVfs {
     }
 
     pub async fn iter_entries(&self) -> Result<Vec<FileEntry>> {
-        let guard = self.db.lock().await;
+        let db = { self.db.lock().await.clone() };
         let mut entries = Vec::new();
-        if let Some(db) = guard.as_ref() {
+        if let Some(db) = db.as_ref() {
             for (_, value) in db.iter().flatten() {
                 if let Ok(entry) = serde_json::from_slice::<FileEntry>(&value) {
                     entries.push(entry);
@@ -60,6 +71,58 @@ impl SledVfs {
             }
         }
         Ok(entries)
+    }
+
+    pub async fn summarize_entries(&self) -> Result<VfsSummary> {
+        let db = { self.db.lock().await.clone() };
+        let mut summary = VfsSummary::default();
+
+        if let Some(db) = db.as_ref() {
+            for (_, value) in db.iter().flatten() {
+                if let Ok(entry) = serde_json::from_slice::<FileEntry>(&value) {
+                    summary.discovered_count += 1;
+                    match entry.entry_type {
+                        crate::adapters::EntryType::File => {
+                            summary.file_count += 1;
+                            summary.total_size_bytes = summary
+                                .total_size_bytes
+                                .saturating_add(entry.size_bytes.unwrap_or(0));
+                        }
+                        crate::adapters::EntryType::Folder => {
+                            summary.folder_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+
+    pub async fn with_entry_batches<F>(&self, batch_size: usize, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(Vec<FileEntry>) -> Result<()>,
+    {
+        let db = { self.db.lock().await.clone() };
+        let Some(db) = db else {
+            return Ok(());
+        };
+
+        let mut batch = Vec::with_capacity(batch_size.max(1));
+        for (_, value) in db.iter().flatten() {
+            if let Ok(entry) = serde_json::from_slice::<FileEntry>(&value) {
+                batch.push(entry);
+                if batch.len() >= batch_size.max(1) {
+                    visitor(mem::take(&mut batch))?;
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            visitor(batch)?;
+        }
+
+        Ok(())
     }
 
     pub async fn get_children(&self, parent_prefix: &str) -> Result<Vec<FileEntry>> {

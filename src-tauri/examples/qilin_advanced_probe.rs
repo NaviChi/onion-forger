@@ -33,17 +33,28 @@ async fn main() {
     println!("-> [Theory A] Executing WebDAV PROPFIND request...");
     let mut headers = HeaderMap::new();
     headers.insert("Depth", HeaderValue::from_static("infinity"));
-    
-    match client.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), base_url).headers(headers).send().await {
+
+    match client
+        .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), base_url)
+        .headers(headers)
+        .send()
+        .await
+    {
         Ok(resp) => {
             println!("   Status: {}", resp.status());
             if resp.status().is_success() || resp.status() == reqwest::StatusCode::MULTI_STATUS {
                 if let Ok(text) = resp.text().await {
                     let preview = text.chars().take(300).collect::<String>();
-                    println!("   [✅ SUCCESS] WebDAV Enabled! Payload Preview:\n{}\n", preview);
+                    println!(
+                        "   [✅ SUCCESS] WebDAV Enabled! Payload Preview:\n{}\n",
+                        preview
+                    );
                 }
             } else {
-                println!("   [❌ FAILED] WebDAV appears blocked or unsupported (Status {}).\n", resp.status());
+                println!(
+                    "   [❌ FAILED] WebDAV appears blocked or unsupported (Status {}).\n",
+                    resp.status()
+                );
             }
         }
         Err(e) => println!("   [❌ ERROR] PROPFIND Request failed: {}\n", e),
@@ -57,13 +68,20 @@ async fn main() {
     match client.get(&json_url).send().await {
         Ok(resp) => {
             println!("   Status: {}", resp.status());
-            let content_type = resp.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("unknown");
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("unknown");
             println!("   Content-Type: {}", content_type);
-            
+
             if content_type.contains("application/json") {
                 if let Ok(text) = resp.text().await {
                     let preview = text.chars().take(300).collect::<String>();
-                    println!("   [✅ SUCCESS] JSON Format Extracted! Payload Preview:\n{}\n", preview);
+                    println!(
+                        "   [✅ SUCCESS] JSON Format Extracted! Payload Preview:\n{}\n",
+                        preview
+                    );
                 }
             } else {
                 println!("   [❌ FAILED] Server ignored format flag and returned HTML.\n");
@@ -80,13 +98,24 @@ async fn main() {
     match client.get(&zip_url).send().await {
         Ok(resp) => {
             println!("   Status: {}", resp.status());
-            let content_type = resp.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("unknown");
-            let disposition = resp.headers().get("content-disposition").and_then(|h| h.to_str().ok()).unwrap_or("none");
-            
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("unknown");
+            let disposition = resp
+                .headers()
+                .get("content-disposition")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("none");
+
             println!("   Content-Type: {}", content_type);
             println!("   Content-Disposition: {}", disposition);
-            
-            if content_type.contains("application/zip") || content_type.contains("application/x-zip") || disposition.contains("attachment") {
+
+            if content_type.contains("application/zip")
+                || content_type.contains("application/x-zip")
+                || disposition.contains("attachment")
+            {
                 println!("   [✅ SUCCESS] Server-side zip trigger discovered!\n");
             } else {
                 println!("   [❌ FAILED] Archive endpoint not present. Target responded with standard HTML.\n");

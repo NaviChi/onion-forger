@@ -42,19 +42,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fuzz Matrix: Test if single character search strings yield exhaustively all files containing that letter
     let fuzzer_array = vec!["a", "e", "1", "x"];
-    
+
     for char in fuzzer_array {
         let target = format!("{}{}/?search={}", host, base_route, char);
         println!("[*] Injecting Exhaustive Vector: {}", target);
-        
+
         match client.get(&target).send().await {
             Ok(res) => {
                 if res.status().is_success() {
                     let text = res.text().await.unwrap_or_default();
                     let occurrences = text.matches("<tr>").count(); // Rough count of file rows
-                    
+
                     println!("    -> [SUCCESS] Search space flattened. Extracted ~{} items containing '{}'.", occurrences, char);
-                    
+
                     if text.contains("class=\"pagination\"") || text.contains("Next") {
                         println!("    -> Pagination loops detected. This parameter will recursively extract entirely.");
                     }
@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => println!("    -> [ERROR] {}", e),
         }
-        
+
         println!("\n[!] Awaiting Tor Exit Flush (20s)...");
         sleep(Duration::from_secs(20)).await;
     }

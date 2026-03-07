@@ -16,6 +16,7 @@ interface DashboardProps {
     workerTarget: number;
     etaSeconds: number | null;
     estimation: string;
+    deltaNewFiles?: number;
   };
   downloadBatchStatus: {
     totalFiles: number;
@@ -44,6 +45,40 @@ interface DashboardProps {
   downloadProgress: Record<string, any>;
   elapsed: number;
   downloadElapsed: number;
+  resourceMetrics: {
+    processCpuPercent: number;
+    processMemoryBytes: number;
+    processThreads: number;
+    systemMemoryUsedBytes: number;
+    systemMemoryTotalBytes: number;
+    systemMemoryPercent: number;
+    activeWorkers: number;
+    workerTarget: number;
+    activeCircuits: number;
+    peakActiveCircuits: number;
+    currentNodeHost?: string | null;
+    nodeFailovers: number;
+    throttleCount: number;
+    timeoutCount: number;
+  };
+  crawlRunStatus: {
+    targetKey: string;
+    bestPriorCount: number;
+    rawThisRunCount: number;
+    mergedEffectiveCount: number;
+    crawlOutcome: string;
+    retryCountUsed: number;
+    stableCurrentListingPath: string;
+    stableBestListingPath: string;
+  } | null;
+  downloadResumePlan: {
+    failedFirstCount: number;
+    missingOrMismatchCount: number;
+    skippedExactMatchesCount: number;
+    allItemsSkipped: boolean;
+    plannedFileCount: number;
+    failureManifestPath: string;
+  } | null;
 }
 
 export function Dashboard({
@@ -57,6 +92,9 @@ export function Dashboard({
   downloadProgress,
   elapsed,
   downloadElapsed,
+  resourceMetrics,
+  crawlRunStatus,
+  downloadResumePlan,
 }: DashboardProps) {
   let phase = "IDLE";
   let networkStatus = "Standby";
@@ -115,6 +153,15 @@ export function Dashboard({
   const diskWriteMbps = Math.max(0, downloadBatchStatus.diskWriteMbps || 0);
   const activeCircuits = Math.max(0, downloadBatchStatus.activeCircuits || 0);
   const etaConfidencePct = Math.round(Math.max(0, Math.min(1, downloadBatchStatus.etaConfidence || 0)) * 100);
+  const processMemoryMb = (resourceMetrics.processMemoryBytes / 1048576).toFixed(1);
+  const systemMemoryGbUsed = (resourceMetrics.systemMemoryUsedBytes / 1073741824).toFixed(1);
+  const systemMemoryGbTotal = (resourceMetrics.systemMemoryTotalBytes / 1073741824).toFixed(1);
+  const effectiveActiveWorkers =
+    resourceMetrics.workerTarget > 0 ? resourceMetrics.activeWorkers : crawlStatus.activeWorkers;
+  const effectiveWorkerTarget =
+    resourceMetrics.workerTarget > 0 ? resourceMetrics.workerTarget : Math.max(crawlStatus.workerTarget, 1);
+  const currentListingName = crawlRunStatus?.stableCurrentListingPath.split(/[\\/]/).pop() || "";
+  const bestListingName = crawlRunStatus?.stableBestListingPath.split(/[\\/]/).pop() || "";
 
   if (isCrawling) {
     phase = "PROBING TARGET";
@@ -199,6 +246,48 @@ export function Dashboard({
         </div>
       </div>
 
+      <div className="dash-card resource-card" data-testid="resource-metrics-card">
+        <div className="dash-icon"><Cpu size={24} /></div>
+        <div className="dash-info">
+          <div className="dash-title">PROCESS + SYSTEM</div>
+          <div className="dash-value" data-testid="resource-process-cpu">
+            CPU {resourceMetrics.processCpuPercent.toFixed(1)}%
+          </div>
+          <div className="dash-sub" data-testid="resource-process-memory" style={{ fontFamily: 'JetBrains Mono' }}>
+            RSS {processMemoryMb} MB | Threads {resourceMetrics.processThreads}
+          </div>
+          <div className="dash-sub" data-testid="resource-system-memory" style={{ fontFamily: 'JetBrains Mono' }}>
+            RAM {resourceMetrics.systemMemoryPercent.toFixed(1)}% ({systemMemoryGbUsed}/{systemMemoryGbTotal} GB)
+          </div>
+          <div className="dash-sub" data-testid="resource-worker-metrics" style={{ fontFamily: 'JetBrains Mono' }}>
+            Workers {effectiveActiveWorkers}/{effectiveWorkerTarget} | Circuits {resourceMetrics.activeCircuits}/{resourceMetrics.peakActiveCircuits}
+          </div>
+          <div className="dash-sub" data-testid="resource-node-metrics" style={{ fontFamily: 'JetBrains Mono' }}>
+            Node {resourceMetrics.currentNodeHost || "unresolved"} | Failovers {resourceMetrics.nodeFailovers} | 429/503 {resourceMetrics.throttleCount} | Timeouts {resourceMetrics.timeoutCount}
+          </div>
+        </div>
+      </div>
+
+      <div className="dash-card resource-card" data-testid="crawl-baseline-card">
+        <div className="dash-icon"><Database size={24} /></div>
+        <div className="dash-info">
+          <div className="dash-title">TARGET BASELINE</div>
+          <div className="dash-value" data-testid="crawl-baseline-outcome">
+            {crawlRunStatus ? crawlRunStatus.crawlOutcome.replace(/_/g, ' ').toUpperCase() : "NO BASELINE YET"}
+          </div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>
+            {crawlRunStatus
+              ? `${crawlRunStatus.targetKey} | raw ${crawlRunStatus.rawThisRunCount} | best ${crawlRunStatus.bestPriorCount} | merged ${crawlRunStatus.mergedEffectiveCount}`
+              : "Run a crawl to initialize per-target best/current listings."}
+          </div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>
+            {crawlRunStatus
+              ? `Retries used ${crawlRunStatus.retryCountUsed}/2 | current ${currentListingName} | best ${bestListingName}`
+              : "Stable listing files will be shown here after the first run."}
+          </div>
+        </div>
+      </div>
+
       <div className="dash-card progress-card">
         <div className="dash-info" style={{ width: "100%" }}>
           <div className="dash-title">{showDownloadProgress ? "DOWNLOAD PROGRESS" : "CRAWL PROGRESS"}</div>
@@ -224,6 +313,11 @@ export function Dashboard({
               <div className="dash-sub" style={{ fontFamily: "JetBrains Mono" }}>
                 Elapsed: {downloadElapsedSec}s | Throughput: {speedMb} MB/s (EWMA {smoothedSpeedMb}) | ETA Confidence: {etaConfidencePct}% | Disk I/O: {diskWriteMbps.toFixed(2)} MB/s | Hint Size: {hintedGb} GB | Unknown Sizes: {downloadBatchStatus.unknownSizeFiles.toLocaleString()}
               </div>
+              {downloadResumePlan ? (
+                <div className="dash-sub" style={{ fontFamily: "JetBrains Mono" }}>
+                  Failures first: {downloadResumePlan.failedFirstCount} | Missing/Mismatch: {downloadResumePlan.missingOrMismatchCount} | Skipped exact: {downloadResumePlan.skippedExactMatchesCount} | {downloadResumePlan.allItemsSkipped ? "All items skipped" : `Planned files: ${downloadResumePlan.plannedFileCount}`}
+                </div>
+              ) : null}
               {downloadBatchStatus.currentFile ? (
                 <div className="dash-sub" style={{ fontFamily: "JetBrains Mono" }}>
                   Current: {downloadBatchStatus.currentFile}
@@ -232,7 +326,8 @@ export function Dashboard({
             </>
           ) : (
             <div className="dash-sub" style={{ fontFamily: "JetBrains Mono" }}>
-              Seen: {crawlStatus.visitedNodes.toLocaleString()} | Processed: {crawlStatus.processedNodes.toLocaleString()} | Queue: {crawlStatus.queuedNodes.toLocaleString()} | Workers: {crawlStatus.activeWorkers}/{Math.max(crawlStatus.workerTarget, 1)}
+              Seen: {crawlStatus.visitedNodes.toLocaleString()} | Processed: {crawlStatus.processedNodes.toLocaleString()} | Queue: {crawlStatus.queuedNodes.toLocaleString()} | Workers: {effectiveActiveWorkers}/{effectiveWorkerTarget}
+              {crawlStatus.deltaNewFiles !== undefined ? ` | Delta New: ${crawlStatus.deltaNewFiles.toLocaleString()}` : ""}
             </div>
           )}
         </div>

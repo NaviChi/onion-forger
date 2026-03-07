@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 /// Standalone Evaluation Suite for Theory Vectors A-C on QData.
-/// 
+///
 /// Target: http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion
 /// Route: /site/data?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed/
 #[tokio::main]
@@ -42,17 +42,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ==========================================
     println!("[TEST A] Executing WebDAV PROPFIND Vector...");
     println!("   -> Action: Requesting raw XML directory payload via PROPFIND method.");
-    let req_a = client.request(Method::from_bytes(b"PROPFIND").unwrap(), &target_dir)
+    let req_a = client
+        .request(Method::from_bytes(b"PROPFIND").unwrap(), &target_dir)
         .header("Depth", "infinity")
         .build()?;
-    
+
     match client.execute(req_a).await {
         Ok(res) => {
             println!("   -> Response Status: {}", res.status());
             if res.status().is_success() || res.status().as_u16() == 207 {
                 println!("   -> [SUCCESS] Target exposes WebDAV XML payloads!");
                 let body = res.text().await.unwrap_or_default();
-                println!("   -> Snippet: {:?}", &body.chars().take(200).collect::<String>());
+                println!(
+                    "   -> Snippet: {:?}",
+                    &body.chars().take(200).collect::<String>()
+                );
             } else {
                 println!("   -> [FAILED] Target rejected PROPFIND logic. Not a WebDAV node.");
             }
@@ -68,19 +72,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ==========================================
     println!("\n[TEST B] Executing Nginx Autoindex Format Extraction...");
     println!("   -> Action: Injecting `?search=` JSON parameters.");
-    
+
     // QData now uses Search/Pagination routing logic. If it autoindexes JSON, it'll likely expose it via a clean query or `?format=json`
-    let target_b = format!("{}?search=M", target_dir); 
+    let target_b = format!("{}?search=M", target_dir);
     match client.get(&target_b).send().await {
         Ok(res) => {
             println!("   -> Response Status: {}", res.status());
-            let content_type = res.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("unknown");
+            let content_type = res
+                .headers()
+                .get("content-type")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("unknown");
             println!("   -> Content-Type: {}", content_type);
-            
+
             if content_type.contains("application/json") {
                 println!("   -> [SUCCESS] Nginx Autoindex yielded structural JSON!");
             } else {
-                println!("   -> [FAILED] Nginx JSON Autoindex formatting is disabled or unrecognized.");
+                println!(
+                    "   -> [FAILED] Nginx JSON Autoindex formatting is disabled or unrecognized."
+                );
             }
         }
         Err(e) => println!("   -> [ERROR] Request dropped: {}", e),
@@ -94,18 +104,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ==========================================
     println!("\n[TEST C] Executing Server-Side Archive Trigger Fuzzing...");
     let archive_suffixes = vec!["&download=1", "&zip=true", "&archive=tar"];
-    
+
     for suffix in archive_suffixes {
         println!("   -> Injecting suffix: {}", suffix);
         let target_c = format!("{}{}", target_dir, suffix);
         match client.get(&target_c).send().await {
             Ok(res) => {
-                let content_type = res.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("unknown");
+                let content_type = res
+                    .headers()
+                    .get("content-type")
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or("unknown");
                 let status = res.status();
-                if status.is_success() && (content_type.contains("application/zip") || content_type.contains("application/x-tar")) {
-                    println!("      -> [SUCCESS] Archive endpoint found! ({})", content_type);
+                if status.is_success()
+                    && (content_type.contains("application/zip")
+                        || content_type.contains("application/x-tar"))
+                {
+                    println!(
+                        "      -> [SUCCESS] Archive endpoint found! ({})",
+                        content_type
+                    );
                 } else {
-                    println!("      -> [FAILED] Status: {}, Type: {}", status, content_type);
+                    println!(
+                        "      -> [FAILED] Status: {}, Type: {}",
+                        status, content_type
+                    );
                 }
             }
             Err(e) => println!("      -> [ERROR] Request dropped: {}", e),
@@ -120,8 +143,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ==========================================
     println!("\n[TEST E] Executing Headless API Hydration Probe...");
     println!("   -> Action: Spoofing XMLHTTPRequest to force Next.js/Vue API JSON payloads.");
-    
-    let req_e = client.get(&target_dir)
+
+    let req_e = client
+        .get(&target_dir)
         .header("Accept", "application/json")
         .header("X-Requested-With", "XMLHttpRequest")
         .header("Sec-Fetch-Mode", "cors")
@@ -131,15 +155,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match client.execute(req_e).await {
         Ok(res) => {
             println!("   -> Response Status: {}", res.status());
-            let content_type = res.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("unknown");
+            let content_type = res
+                .headers()
+                .get("content-type")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("unknown");
             println!("   -> Content-Type: {}", content_type);
-            
+
             if content_type.contains("application/json") {
-                println!("   -> [SUCCESS] Headless CMS API Endpoint discovered! ({})", content_type);
+                println!(
+                    "   -> [SUCCESS] Headless CMS API Endpoint discovered! ({})",
+                    content_type
+                );
                 let text = res.text().await.unwrap_or_default();
-                println!("   -> Snippet: {}", &text.chars().take(250).collect::<String>());
+                println!(
+                    "   -> Snippet: {}",
+                    &text.chars().take(250).collect::<String>()
+                );
             } else {
-                println!("   -> [FAILED] Target ignored API headers and returned standard HTML/DOM.");
+                println!(
+                    "   -> [FAILED] Target ignored API headers and returned standard HTML/DOM."
+                );
             }
         }
         Err(e) => println!("   -> [ERROR] Request dropped: {}", e),

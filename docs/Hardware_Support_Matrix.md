@@ -11,7 +11,7 @@ OnionForge is a cross-platform Tauri/Rust application. Code must not assume UNIX
 | OS | Status | Known Architectural Blockers |
 | :--- | :--- | :--- |
 | **macOS (Darwin)** | Fully Supported | UNIX Sockets handle Tor multiplexing flawlessly. Apple Silicon (M1/M2/M3) memory bandwidth effectively masks poor IO logic. |
-| **Windows 10/11** | Fully Supported | TCP/IP Ephemeral Port Exhaustion (Max 16k ports). High process context-switching overhead for `tor.exe`. Requires strictly capped Tor Daemon pools (Max 16). |
+| **Windows 10/11** | Fully Supported | TCP/IP Ephemeral Port Exhaustion (Max 16k ports). Native Arti plus the direct `ArtiClient` hot path removes most old loopback SOCKS churn, but compatibility SOCKS consumers and aggressive hidden-service retry storms can still saturate `TIME_WAIT` and local ports if fanout is uncapped. |
 | **Linux** | Fully Supported | Extremely stable, but requires AppImage/Debian GUI fallback states if running headlessly or on X11 vs Wayland. |
 
 ---
@@ -47,7 +47,7 @@ Crawling `.onion` domains introduces extreme latency variations. The engine must
 
 | Network State | Constraint | Required Implementation Strategy |
 | :--- | :--- | :--- |
-| **High Bandwidth (Clearnet / Fiber)** | Fast | Capable of 300+ Aria2 circuits. Bottleneck moves from Network to Disk IO. |
+| **High Bandwidth (Clearnet / Fiber)** | Fast | Capable of 300+ downloader workers. Bottleneck moves from Network to Disk IO. |
 | **Tor Network (Standard)** | Medium / Erratic | Expect random circuit deaths. Thompson Sampling / Multi-Armed Bandit algorithms must be used to dynamically score and drop slow Tor nodes. |
 | **Slow Bandwidth (Target Throttling)** | High Risk | **CRITICAL CONSTRAINT:** Targets like Qilin will actively rate-limit or tarpit connections. If the network drops below 50kbps, brute-force workers will stack up and exhaust local ports. |
 
@@ -62,11 +62,11 @@ Never assume the target has an SSD. Downloader loops must attempt `mmap` for spe
 
 ### Directive B: The 20-to-1 Circuit Ratio Concept
 Concurrent downloading is only as fast as the multiplexer allows. 
-- You should *never* assign 300 circuits to 4 or 6 Tor daemons (a 50:1 or 75:1 ratio). That forces one single `tor.exe` process to handle 75 isolated byte streams, triggering catastrophic context-switching CPU locks on Windows.
+- You should *never* assign 300 circuits to 4 or 6 managed Arti client slots (a 50:1 or 75:1 ratio). That forces too many isolated streams and circuit rebuilds onto a small client pool, increasing latency variance and slowing recovery on Windows.
 - **The Golden Ratio** is between **10:1 and 20:1**. 
-    - e.g., 6 Daemons = ~120 Circuits.
-    - e.g., 12 Daemons = ~240 Circuits.
-By defaulting to 120 circuits and 6 daemons, each Tor instance comfortably routes 20 files, ensuring high bandwidth without burning down the OS kernel.
+    - e.g., 6 managed clients = ~120 circuits.
+    - e.g., 12 managed clients = ~240 circuits.
+By defaulting to 120 circuits and 6 managed clients, each live Arti slot comfortably routes about 20 files, ensuring high bandwidth without burning down the OS kernel.
 
 ### Directive C: Stream, Don't Load (String Parsing)
 When parsing JSON or HTML from a target, never load massive strings into RAM (`std::fs::read_to_string`). Use asynchronous streaming readers (`reqwest::Stream`) whenever possible. This ensures computers running on 4GB of RAM won't segfault if QData outputs a 500MB `autoindex` XML document.

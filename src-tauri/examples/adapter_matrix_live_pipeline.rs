@@ -1,7 +1,8 @@
 use crawli_lib::adapters::{self, AdapterRegistry, EntryType, FileEntry, SiteFingerprint};
 use crawli_lib::aria_downloader::{self, BatchFileEntry};
 use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
-use crawli_lib::{path_utils, tor};
+use crawli_lib::telemetry_bridge::{self, TelemetryBridgeUpdate};
+use crawli_lib::{path_utils, tor, AppState};
 use reqwest::header::HeaderMap;
 use std::collections::HashMap;
 use std::fs;
@@ -9,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{Event, Listener};
+use tauri::{Event, Listener, Manager};
 
 const MAX_ADAPTERS: usize = 10;
 const CRAWL_TIMEOUT_SECS: u64 = 600;
@@ -166,18 +167,6 @@ fn build_batch_files(entries: &[FileEntry], output_root: &Path) -> Vec<BatchFile
     batch_files
 }
 
-fn json_u64(payload: &serde_json::Value, key: &str, alt: &str) -> u64 {
-    payload
-        .get(key)
-        .and_then(|v| v.as_u64())
-        .or_else(|| payload.get(alt).and_then(|v| v.as_u64()))
-        .unwrap_or(0)
-}
-
-fn json_usize(payload: &serde_json::Value, key: &str, alt: &str) -> usize {
-    json_u64(payload, key, alt) as usize
-}
-
 async fn run_single_adapter(
     app: &tauri::AppHandle,
     adapter: &adapters::AdapterSupportInfo,
@@ -244,7 +233,7 @@ async fn run_single_adapter(
     if is_onion {
         match tor::bootstrap_tor_cluster(app.clone(), 8).await {
             Ok((guard, ports)) => {
-                swarm_guard = Some(guard);
+                swarm_guard = Some(Arc::new(tokio::sync::Mutex::new(guard)));
                 active_ports = ports;
             }
             Err(err) => {
@@ -262,11 +251,18 @@ async fn run_single_adapter(
         daemons: Some(16),
         resume: false,
         agnostic_state: false,
+        resume_index: None,
     };
     let daemon_count = if is_onion {
         active_ports.len().max(1)
     } else {
         8
+    };
+    let arti_clients = if let Some(guard) = &swarm_guard {
+        let locked = guard.lock().await;
+        locked.get_arti_clients()
+    } else {
+        Vec::new()
     };
     let mut frontier = CrawlerFrontier::new(
         Some(app.clone()),
@@ -274,6 +270,7 @@ async fn run_single_adapter(
         daemon_count,
         is_onion,
         active_ports,
+        arti_clients,
         options.clone(),
     );
     frontier.swarm_guard = swarm_guard;
@@ -471,24 +468,18 @@ async fn run_single_adapter(
     let c_done = progress_done.clone();
     let c_fail = progress_fail.clone();
     let c_bytes = progress_bytes.clone();
-    let batch_listener_id = app.listen_any("batch_progress", move |evt: Event| {
-        let payload: serde_json::Value = match serde_json::from_str(evt.payload()) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        c_done.store(
-            json_usize(&payload, "completed", "completed"),
-            Ordering::Relaxed,
-        );
-        c_fail.store(json_usize(&payload, "failed", "failed"), Ordering::Relaxed);
-        c_bytes.store(
-            json_u64(&payload, "downloadedBytes", "downloaded_bytes"),
-            Ordering::Relaxed,
-        );
-        // Ignore the BBR / EKF fields in the CLI matrix output for now since we just check disk.
+    let batch_listener_id = app.listen_any("telemetry_bridge_update", move |evt: Event| {
+        if let Ok(update) = serde_json::from_str::<TelemetryBridgeUpdate>(evt.payload()) {
+            if let Some(payload) = update.batch_progress {
+                c_done.store(payload.completed, Ordering::Relaxed);
+                c_fail.store(payload.failed, Ordering::Relaxed);
+                c_bytes.store(payload.downloaded_bytes, Ordering::Relaxed);
+                // Ignore the BBR / EKF fields in the CLI matrix output for now since we just check disk.
+            }
+        }
     });
 
-    let log_listener_id = app.listen_any("log", move |evt: Event| {
+    let _log_listener_id = app.listen_any("log", move |evt: Event| {
         let text = evt.payload().trim_matches('"').replace("\\\"", "\"");
         println!("[Tauri::Log] {}", text);
     });
@@ -670,9 +661,12 @@ fn main() {
         );
 
         let app = tauri::Builder::default()
+            .manage(AppState::default())
             .build(tauri::generate_context!())
             .expect("build tauri app");
         let app_handle = app.handle().clone();
+        let bridge = app.state::<AppState>().telemetry_bridge.clone();
+        telemetry_bridge::spawn_bridge_emitter(app.handle().clone(), bridge);
 
         let mut results: Vec<AdapterRunResult> = Vec::new();
         let catalog = adapters::support_catalog();

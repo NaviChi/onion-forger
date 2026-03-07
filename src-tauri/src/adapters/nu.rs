@@ -30,4 +30,12 @@ impl super::CrawlerAdapter for NuServerAdapter {
     fn name(&self) -> &'static str {
         "Nu Server"
     }
+
+    fn known_domains(&self) -> Vec<&'static str> {
+        vec![]
+    }
+
+    fn regex_marker(&self) -> Option<&'static str> {
+        Some(r"^#\s*(acct|srvinf:\s*nu)")
+    }
 }

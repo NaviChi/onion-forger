@@ -190,7 +190,11 @@ pub fn extract_agnostic_path(url: &str) -> String {
             for (k, v) in parsed.query_pairs() {
                 if k == "path" {
                     let sanitized = sanitize_path(&v);
-                    return if sanitized.is_empty() { "_root".to_string() } else { sanitized };
+                    return if sanitized.is_empty() {
+                        "_root".to_string()
+                    } else {
+                        sanitized
+                    };
                 }
             }
         }
@@ -206,7 +210,11 @@ pub fn extract_agnostic_path(url: &str) -> String {
             if slash_idx < amp_idx {
                 let logical_path = &after_uuid[slash_idx..];
                 let sanitized = sanitize_path(logical_path);
-                return if sanitized.is_empty() { "_root".to_string() } else { sanitized };
+                return if sanitized.is_empty() {
+                    "_root".to_string()
+                } else {
+                    sanitized
+                };
             }
         }
     }
@@ -214,7 +222,11 @@ pub fn extract_agnostic_path(url: &str) -> String {
     // 3. Fallback: Standard Traversal (Play, LockBit, Autoindex)
     if let Ok(parsed) = reqwest::Url::parse(url) {
         let sanitized = sanitize_path(parsed.path());
-        return if sanitized.is_empty() { "_root".to_string() } else { sanitized };
+        return if sanitized.is_empty() {
+            "_root".to_string()
+        } else {
+            sanitized
+        };
     }
 
     url.to_string()

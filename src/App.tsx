@@ -7,7 +7,7 @@ import { VibeLoader } from "./components/VibeLoader";
 import { downloadDir, join } from "@tauri-apps/api/path";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp } from "lucide-react";
-import { VFS_FIXTURE_STATS, isVfsFixtureMode } from "./fixtures/vfsFixture";
+import { FIXTURE_RESOURCE_METRICS, VFS_FIXTURE_STATS, isVfsFixtureMode } from "./fixtures/vfsFixture";
 
 import "./App.css";
 
@@ -17,7 +17,11 @@ interface DownloadProgressEvent {
   bytes_downloaded: number;
   total_bytes: number | null;
   speed_bps: number;
+  bytesDownloaded?: number;
+  totalBytes?: number | null;
+  speedBps?: number;
   active_circuits?: number;
+  activeCircuits?: number;
 }
 
 interface CrawlStatusEvent {
@@ -30,6 +34,7 @@ interface CrawlStatusEvent {
   workerTarget: number;
   etaSeconds: number | null;
   estimation: string;
+  deltaNewFiles?: number;
 }
 
 interface DownloadBatchStartedEvent {
@@ -74,6 +79,58 @@ interface DownloadBatchStatus {
   etaSeconds: number | null;
 }
 
+interface CrawlSessionResult {
+  targetKey: string;
+  discoveredCount: number;
+  fileCount: number;
+  folderCount: number;
+  bestPriorCount: number;
+  rawThisRunCount: number;
+  mergedEffectiveCount: number;
+  crawlOutcome: string;
+  retryCountUsed: number;
+  stableCurrentListingPath: string;
+  stableCurrentDirsListingPath: string;
+  stableBestListingPath: string;
+  stableBestDirsListingPath: string;
+  autoDownloadStarted: boolean;
+  outputDir: string;
+}
+
+interface DownloadResumePlan {
+  targetKey: string;
+  failedFirstCount: number;
+  missingOrMismatchCount: number;
+  skippedExactMatchesCount: number;
+  allItemsSkipped: boolean;
+  plannedFileCount: number;
+  failureManifestPath: string;
+}
+
+interface ResourceMetricsSnapshot {
+  processCpuPercent: number;
+  processMemoryBytes: number;
+  processThreads: number;
+  systemMemoryUsedBytes: number;
+  systemMemoryTotalBytes: number;
+  systemMemoryPercent: number;
+  activeWorkers: number;
+  workerTarget: number;
+  activeCircuits: number;
+  peakActiveCircuits: number;
+  currentNodeHost?: string | null;
+  nodeFailovers: number;
+  throttleCount: number;
+  timeoutCount: number;
+}
+
+interface TelemetryBridgeUpdate {
+  crawlStatus?: CrawlStatusEvent;
+  resourceMetrics?: ResourceMetricsSnapshot;
+  batchProgress?: BatchProgressEvent;
+  downloadProgress?: DownloadProgressEvent[];
+}
+
 interface TorStatus {
   state: string;
   message: string;
@@ -88,6 +145,14 @@ interface ToastInfo {
   message: string;
 }
 
+interface LogAggregate {
+  key: string;
+  sample: string;
+  count: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
+}
+
 interface AdapterSupportInfo {
   id: string;
   name: string;
@@ -99,6 +164,18 @@ interface AdapterSupportInfo {
 }
 
 const FALLBACK_SUPPORT_CATALOG: AdapterSupportInfo[] = [
+  {
+    id: "qilin",
+    name: "Qilin Nginx Autoindex",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Known-domain + QData marker signature matching",
+    sampleUrls: ["http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed"],
+    testedFor: [
+      "Adapter fingerprint match (engine_test)",
+      "Autoindex traversal delegation (qilin adapter)",
+    ],
+    notes: "Uses adaptive QData storage-node routing with bounded failover and streamed VFS ingestion.",
+  },
   {
     id: "worldleaks",
     name: "WorldLeaks SPA",
@@ -188,6 +265,24 @@ const FALLBACK_SUPPORT_CATALOG: AdapterSupportInfo[] = [
     notes: "Most heavily tested adapter with full listing/scaffold validation.",
   },
   {
+    id: "abyss",
+    name: "Abyss Ransomware",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Known-domain + direct archive URL detection (.rar, .zip, .7z)",
+    sampleUrls: ["http://vmmefm7ktazj2bwtmy46o3wxhk42tctasyyqv6ymuzlivszteyhkkyad.onion/iamdesign.rar"],
+    testedFor: ["Adapter fingerprint match (engine_test)"],
+    notes: "Dual mode: direct file HEAD probe for archives, recursive directory traversal for listings.",
+  },
+  {
+    id: "alphalocker",
+    name: "AlphaLocker Ransomware",
+    supportLevel: "Full Crawl",
+    matchingStrategy: "Known-domain + URL-path signature matching",
+    sampleUrls: ["http://3v4zoso2ghne47usnhyoe4dsezmfqhfv5v5iuep4saic5nnfpc6phrad.onion/gazomet.pl%20&%20cgas.pl/Files/"],
+    testedFor: ["Adapter fingerprint match (engine_test)"],
+    notes: "Supports URL-encoded paths and parses both autoindex and custom table layouts.",
+  },
+  {
     id: "autoindex",
     name: "Generic Autoindex",
     supportLevel: "Fallback",
@@ -249,6 +344,17 @@ function formatDuration(ms: number): string {
   return `${sec}s`;
 }
 
+function summarizeLogKey(raw: string): string {
+  return raw
+    .replace(/^>\s*/, "")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi, "<uuid>")
+    .replace(/[a-z2-7]{56}\.onion/gi, "<onion>")
+    .replace(/\b[Cc]ircuit\s+\d+\b/g, "Circuit <n>")
+    .replace(/\b[Dd]aemon\s+\d+\b/g, "Daemon <n>")
+    .replace(/\b[Pp]ort\s+\d+\b/g, "Port <n>")
+    .replace(/\b[Aa]ttempt\s+\d+\b/g, "Attempt <n>");
+}
+
 const INITIAL_CRAWL_STATUS: CrawlStatusEvent = {
   phase: "idle",
   progressPercent: 0,
@@ -284,6 +390,23 @@ const INITIAL_DOWNLOAD_BATCH_STATUS: DownloadBatchStatus = {
   etaSeconds: null,
 };
 
+const INITIAL_RESOURCE_METRICS: ResourceMetricsSnapshot = {
+  processCpuPercent: 0,
+  processMemoryBytes: 0,
+  processThreads: 0,
+  systemMemoryUsedBytes: 0,
+  systemMemoryTotalBytes: 0,
+  systemMemoryPercent: 0,
+  activeWorkers: 0,
+  workerTarget: 0,
+  activeCircuits: 0,
+  peakActiveCircuits: 0,
+  currentNodeHost: null,
+  nodeFailovers: 0,
+  throttleCount: 0,
+  timeoutCount: 0,
+};
+
 function App() {
   const isTauriRuntime = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
   const isFixtureMode = !isTauriRuntime && isVfsFixtureMode();
@@ -295,7 +418,7 @@ function App() {
   const [logs, setLogs] = useState<string[]>([
     "Initializing Kernel Modules...",
     "[SYSTEM] Local Tor Daemon initialized on 127.0.0.1:9051",
-    "[SYSTEM] Adapter Registry loaded (WorldLeaks, DragonForce, LockBit, INC Ransom, Pear, Play, Autoindex)",
+    "[SYSTEM] Adapter Registry loaded (Qilin, WorldLeaks, DragonForce, LockBit, INC Ransom, Pear, Play, Abyss, AlphaLocker, Autoindex)",
   ]);
   const [activeAdapter, setActiveAdapter] = useState("Unidentified");
   const [torStatus, setTorStatus] = useState<TorStatus | null>(null);
@@ -303,10 +426,14 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadProgressEvent>>({});
   const [crawlStatus, setCrawlStatus] = useState<CrawlStatusEvent>(INITIAL_CRAWL_STATUS);
   const [downloadBatchStatus, setDownloadBatchStatus] = useState<DownloadBatchStatus>(INITIAL_DOWNLOAD_BATCH_STATUS);
+  const [resourceMetrics, setResourceMetrics] = useState<ResourceMetricsSnapshot>(INITIAL_RESOURCE_METRICS);
+  const [lastCrawlResult, setLastCrawlResult] = useState<CrawlSessionResult | null>(null);
+  const [downloadResumePlan, setDownloadResumePlan] = useState<DownloadResumePlan | null>(null);
+  const [logAggregates, setLogAggregates] = useState<Record<string, LogAggregate>>({});
   const [selectedFiles, setSelectedFiles] = useState<FileEntry[]>([]);
   const [toasts, setToasts] = useState<ToastInfo[]>([]);
   const [outputDir, setOutputDir] = useState("");
-  const [daemonPorts, setDaemonPorts] = useState<number[]>([9051, 9052, 9053, 9054]);
+  const [activeDaemons, setActiveDaemons] = useState<number>(4);
   const [crawlStartTime, setCrawlStartTime] = useState<number | null>(null);
   const [crawlElapsed, setCrawlElapsed] = useState(0);
   const [downloadElapsed, setDownloadElapsed] = useState(0);
@@ -324,6 +451,7 @@ function App() {
   const aggregateDiskSampleRef = useRef<{ ts: number; bytes: number } | null>(null);
   const perFileDownloadedBytesRef = useRef<Record<string, number>>({});
   const activeDownloadOutputDirRef = useRef("");
+  const processedLogCountRef = useRef(0);
 
   const [crawlOptions, setCrawlOptions] = useState({
     listing: true,
@@ -332,7 +460,8 @@ function App() {
     circuits: 120,
     daemons: 0,
     agnosticState: false,
-    resume: false
+    resume: false,
+    resumeIndex: undefined as string | undefined
   });
 
   const showToast = (type: "success" | "error", title: string, message: string) => {
@@ -351,6 +480,18 @@ function App() {
     }, 1000);
     return () => clearInterval(interval);
   }, [isCrawling, crawlStartTime]);
+
+  // Pre-resolve onion descriptors 500ms after user finishes typing
+  useEffect(() => {
+    if (url.includes('.onion')) {
+      const timer = setTimeout(() => {
+        if (isTauriRuntime) {
+          invoke('pre_resolve_onion', { url }).catch(console.error);
+        }
+      }, 500);
+      return () => clearTimeout(timer);
+    }
+  }, [url, isTauriRuntime]);
 
   useEffect(() => {
     const startedAt = downloadBatchStatus.startedAt;
@@ -375,6 +516,7 @@ function App() {
     fixtureNoticeShownRef.current = true;
     setVfsStats(VFS_FIXTURE_STATS);
     setVfsRefreshTrigger(Date.now());
+    setResourceMetrics(FIXTURE_RESOURCE_METRICS);
     setLogs((l) => [
       ...l.slice(-399),
       "[SYSTEM] Fixture VFS mode enabled for browser integrity testing.",
@@ -479,11 +621,193 @@ function App() {
         })
       );
 
-      unlistenPromises.push(
-        listen<CrawlStatusEvent>("crawl_status_update", (event) => {
-          setCrawlStatus(event.payload);
-        })
-      );
+      const applyBatchProgress = (rawPayload: BatchProgressEvent) => {
+        const payload = rawPayload as BatchProgressEvent & {
+          speed_mbps?: number;
+          downloaded_bytes?: number;
+          current_file?: string;
+          active_circuits?: number;
+          bbr_bottleneck_mbps?: number;
+          ekf_covariance?: number;
+        };
+        const speedMbpsRaw = payload.speedMbps ?? payload.speed_mbps;
+        const downloadedBytesRaw = payload.downloadedBytes ?? payload.downloaded_bytes;
+        const currentFileRaw = payload.currentFile ?? payload.current_file;
+        const activeCircuitsRaw = payload.activeCircuits ?? payload.active_circuits;
+        const bbrRaw = payload.bbrBottleneckMbps ?? payload.bbr_bottleneck_mbps ?? 0;
+        const ekfRaw = payload.ekfCovariance ?? payload.ekf_covariance ?? 0;
+        const now = Date.now();
+        setDownloadBatchStatus((prev) => {
+          const startedAt = prev.startedAt ?? now;
+          const completedFiles = Math.max(prev.completedFiles, payload.completed || 0);
+          const failedFiles = Math.max(prev.failedFiles, payload.failed || 0);
+          const totalFiles = Math.max(prev.totalFiles, payload.total || 0);
+          const done = completedFiles + failedFiles;
+          const remaining = Math.max(totalFiles - done, 0);
+          const elapsedSeconds = Math.max(1, Math.floor((now - startedAt) / 1000));
+          const etaSeconds =
+            done > 0 && remaining > 0 ? Math.ceil((elapsedSeconds / done) * remaining) : null;
+          const mergedDownloadedBytes = Math.max(
+            prev.downloadedBytes,
+            downloadedBytesRaw || 0,
+            aggregateDownloadBytesRef.current,
+          );
+          aggregateDownloadBytesRef.current = mergedDownloadedBytes;
+
+          let resolvedSpeedMbps = speedMbpsRaw ?? prev.speedMbps;
+          if ((speedMbpsRaw === undefined || speedMbpsRaw <= 0) && batchSpeedSampleRef.current) {
+            const sample = batchSpeedSampleRef.current;
+            const deltaBytes = Math.max(0, mergedDownloadedBytes - sample.bytes);
+            const deltaSeconds = Math.max((now - sample.ts) / 1000, 0);
+            if (deltaBytes > 0 && deltaSeconds > 0) {
+              resolvedSpeedMbps = (deltaBytes / deltaSeconds) / 1048576;
+            }
+          }
+          batchSpeedSampleRef.current = { ts: now, bytes: mergedDownloadedBytes };
+
+          let diskWriteMbps = prev.diskWriteMbps;
+          if (aggregateDiskSampleRef.current) {
+            const sample = aggregateDiskSampleRef.current;
+            const deltaBytes = Math.max(0, mergedDownloadedBytes - sample.bytes);
+            const deltaSeconds = Math.max((now - sample.ts) / 1000, 0);
+            if (deltaBytes > 0 && deltaSeconds > 0) {
+              diskWriteMbps = (deltaBytes / deltaSeconds) / 1048576;
+            }
+          }
+          aggregateDiskSampleRef.current = { ts: now, bytes: mergedDownloadedBytes };
+
+          if (prev.startedAt === null) {
+            setDownloadElapsed(0);
+          }
+
+          const roots = [activeDownloadOutputDirRef.current, prev.outputDir, outputDir];
+          const currentFile = currentFileRaw ? toDisplayPath(currentFileRaw, roots) : prev.currentFile;
+          const activeCircuits = activeCircuitsRaw ?? prev.activeCircuits;
+          const peakBandwidthMbps = Math.max(prev.peakBandwidthMbps, resolvedSpeedMbps || 0);
+          const peakDiskWriteMbps = Math.max(prev.peakDiskWriteMbps, diskWriteMbps || 0);
+          const instant = Math.max(0, resolvedSpeedMbps || 0);
+          const smoothedSpeedMbps =
+            prev.smoothedSpeedMbps > 0
+              ? prev.smoothedSpeedMbps * 0.72 + instant * 0.28
+              : instant;
+          const progressFactor = totalFiles > 0 ? done / totalFiles : 0;
+          const unknownFactor =
+            totalFiles > 0 ? 1 - (prev.unknownSizeFiles / totalFiles) : 0.5;
+          const speedStability =
+            smoothedSpeedMbps > 0
+              ? 1 - Math.min(Math.abs(instant - smoothedSpeedMbps) / smoothedSpeedMbps, 1)
+              : 0;
+          const etaConfidence = Math.max(
+            0.05,
+            Math.min(0.99, progressFactor * 0.45 + unknownFactor * 0.20 + speedStability * 0.35),
+          );
+
+          return {
+            ...prev,
+            totalFiles,
+            completedFiles,
+            failedFiles,
+            currentFile,
+            speedMbps: resolvedSpeedMbps,
+            smoothedSpeedMbps,
+            downloadedBytes: mergedDownloadedBytes,
+            activeCircuits,
+            peakActiveCircuits: Math.max(prev.peakActiveCircuits, activeCircuits || 0),
+            peakBandwidthMbps,
+            diskWriteMbps,
+            peakDiskWriteMbps,
+            etaConfidence,
+            outputDir: prev.outputDir || activeDownloadOutputDirRef.current || outputDir,
+            bbrBottleneckMbps: bbrRaw,
+            ekfCovariance: ekfRaw,
+            startedAt,
+            etaSeconds,
+          };
+        });
+      };
+
+      const applyDownloadProgress = (rawPayload: DownloadProgressEvent) => {
+        const payload = rawPayload as DownloadProgressEvent & {
+          bytesDownloaded?: number;
+          totalBytes?: number | null;
+          speedBps?: number;
+          activeCircuits?: number;
+        };
+        const bytesDownloaded = payload.bytes_downloaded ?? payload.bytesDownloaded ?? 0;
+        const totalBytes = payload.total_bytes ?? payload.totalBytes ?? null;
+        const speedBps = payload.speed_bps ?? payload.speedBps ?? 0;
+        const activeCircuitsValue = payload.active_circuits ?? payload.activeCircuits ?? 0;
+        const roots = [activeDownloadOutputDirRef.current, outputDir];
+        const displayPath = toDisplayPath(payload.path, roots);
+        const normalizedPayload: DownloadProgressEvent = {
+          ...payload,
+          path: displayPath,
+          bytes_downloaded: bytesDownloaded,
+          total_bytes: totalBytes,
+          speed_bps: speedBps,
+          active_circuits: activeCircuitsValue,
+        };
+
+        setDownloadProgress((prev) => ({
+          ...prev,
+          [displayPath]: normalizedPayload,
+        }));
+
+        const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
+        const nextBytes = Math.max(previousBytes, bytesDownloaded);
+        if (nextBytes > previousBytes) {
+          perFileDownloadedBytesRef.current[displayPath] = nextBytes;
+          aggregateDownloadBytesRef.current += nextBytes - previousBytes;
+        }
+        const aggregateBytes = aggregateDownloadBytesRef.current;
+        const now = Date.now();
+        let diskWriteMbps = 0;
+        if (aggregateDiskSampleRef.current) {
+          const sample = aggregateDiskSampleRef.current;
+          const deltaBytes = Math.max(0, aggregateBytes - sample.bytes);
+          const deltaSeconds = Math.max((now - sample.ts) / 1000, 0);
+          if (deltaBytes > 0 && deltaSeconds > 0) {
+            diskWriteMbps = (deltaBytes / deltaSeconds) / 1048576;
+          }
+        }
+        aggregateDiskSampleRef.current = { ts: now, bytes: aggregateBytes };
+
+        const speedMbps = Math.max(0, speedBps / 1048576);
+        const activeCircuits = Math.max(0, activeCircuitsValue);
+        setDownloadBatchStatus((prev) => {
+          const done = prev.completedFiles + prev.failedFiles;
+          const total = Math.max(prev.totalFiles, 1);
+          const progressFactor = done / total;
+          const unknownFactor = 1 - (prev.unknownSizeFiles / total);
+          const instant = speedMbps > 0 ? speedMbps : prev.speedMbps;
+          const smoothedSpeedMbps =
+            instant > 0
+              ? (prev.smoothedSpeedMbps > 0
+                ? prev.smoothedSpeedMbps * 0.72 + instant * 0.28
+                : instant)
+              : prev.smoothedSpeedMbps;
+          const speedStability =
+            smoothedSpeedMbps > 0
+              ? 1 - Math.min(Math.abs(instant - smoothedSpeedMbps) / smoothedSpeedMbps, 1)
+              : 0;
+          return {
+            ...prev,
+            currentFile: displayPath || prev.currentFile,
+            downloadedBytes: Math.max(prev.downloadedBytes, aggregateBytes),
+            speedMbps: instant,
+            smoothedSpeedMbps,
+            activeCircuits,
+            peakActiveCircuits: Math.max(prev.peakActiveCircuits, activeCircuits),
+            peakBandwidthMbps: Math.max(prev.peakBandwidthMbps, speedMbps),
+            diskWriteMbps: diskWriteMbps > 0 ? diskWriteMbps : prev.diskWriteMbps,
+            peakDiskWriteMbps: Math.max(prev.peakDiskWriteMbps, diskWriteMbps),
+            etaConfidence: Math.max(
+              0.05,
+              Math.min(0.99, progressFactor * 0.45 + unknownFactor * 0.20 + speedStability * 0.35),
+            ),
+          };
+        });
+      };
 
       unlistenPromises.push(
         listen<DownloadBatchStartedEvent>("download_batch_started", (event) => {
@@ -521,108 +845,19 @@ function App() {
       );
 
       unlistenPromises.push(
-        listen<BatchProgressEvent>("batch_progress", (event) => {
-          const payload = event.payload as BatchProgressEvent & {
-            speed_mbps?: number;
-            downloaded_bytes?: number;
-            current_file?: string;
-            active_circuits?: number;
-            bbr_bottleneck_mbps?: number;
-            ekf_covariance?: number;
-          };
-          const speedMbpsRaw = payload.speedMbps ?? payload.speed_mbps;
-          const downloadedBytesRaw = payload.downloadedBytes ?? payload.downloaded_bytes;
-          const currentFileRaw = payload.currentFile ?? payload.current_file;
-          const activeCircuitsRaw = payload.activeCircuits ?? payload.active_circuits;
-          const bbrRaw = payload.bbrBottleneckMbps ?? payload.bbr_bottleneck_mbps ?? 0;
-          const ekfRaw = payload.ekfCovariance ?? payload.ekf_covariance ?? 0;
-          const now = Date.now();
-          setDownloadBatchStatus((prev) => {
-            const startedAt = prev.startedAt ?? now;
-            const completedFiles = Math.max(prev.completedFiles, payload.completed || 0);
-            const failedFiles = Math.max(prev.failedFiles, payload.failed || 0);
-            const totalFiles = Math.max(prev.totalFiles, payload.total || 0);
-            const done = completedFiles + failedFiles;
-            const remaining = Math.max(totalFiles - done, 0);
-            const elapsedSeconds = Math.max(1, Math.floor((now - startedAt) / 1000));
-            const etaSeconds =
-              done > 0 && remaining > 0 ? Math.ceil((elapsedSeconds / done) * remaining) : null;
-            const mergedDownloadedBytes = Math.max(
-              prev.downloadedBytes,
-              downloadedBytesRaw || 0,
-              aggregateDownloadBytesRef.current,
-            );
-            aggregateDownloadBytesRef.current = mergedDownloadedBytes;
-
-            let resolvedSpeedMbps = speedMbpsRaw ?? prev.speedMbps;
-            if ((speedMbpsRaw === undefined || speedMbpsRaw <= 0) && batchSpeedSampleRef.current) {
-              const sample = batchSpeedSampleRef.current;
-              const deltaBytes = Math.max(0, mergedDownloadedBytes - sample.bytes);
-              const deltaSeconds = Math.max((now - sample.ts) / 1000, 0);
-              if (deltaBytes > 0 && deltaSeconds > 0) {
-                resolvedSpeedMbps = (deltaBytes / deltaSeconds) / 1048576;
-              }
-            }
-            batchSpeedSampleRef.current = { ts: now, bytes: mergedDownloadedBytes };
-
-            let diskWriteMbps = prev.diskWriteMbps;
-            if (aggregateDiskSampleRef.current) {
-              const sample = aggregateDiskSampleRef.current;
-              const deltaBytes = Math.max(0, mergedDownloadedBytes - sample.bytes);
-              const deltaSeconds = Math.max((now - sample.ts) / 1000, 0);
-              if (deltaBytes > 0 && deltaSeconds > 0) {
-                diskWriteMbps = (deltaBytes / deltaSeconds) / 1048576;
-              }
-            }
-            aggregateDiskSampleRef.current = { ts: now, bytes: mergedDownloadedBytes };
-
-            if (prev.startedAt === null) {
-              setDownloadElapsed(0);
-            }
-
-            const roots = [activeDownloadOutputDirRef.current, prev.outputDir, outputDir];
-            const currentFile = currentFileRaw ? toDisplayPath(currentFileRaw, roots) : prev.currentFile;
-            const activeCircuits = activeCircuitsRaw ?? prev.activeCircuits;
-            const peakBandwidthMbps = Math.max(prev.peakBandwidthMbps, resolvedSpeedMbps || 0);
-            const peakDiskWriteMbps = Math.max(prev.peakDiskWriteMbps, diskWriteMbps || 0);
-            const instant = Math.max(0, resolvedSpeedMbps || 0);
-            const smoothedSpeedMbps =
-              prev.smoothedSpeedMbps > 0
-                ? prev.smoothedSpeedMbps * 0.72 + instant * 0.28
-                : instant;
-            const progressFactor = totalFiles > 0 ? done / totalFiles : 0;
-            const unknownFactor =
-              totalFiles > 0 ? 1 - (prev.unknownSizeFiles / totalFiles) : 0.5;
-            const speedStability =
-              smoothedSpeedMbps > 0
-                ? 1 - Math.min(Math.abs(instant - smoothedSpeedMbps) / smoothedSpeedMbps, 1)
-                : 0;
-            const etaConfidence = Math.max(
-              0.05,
-              Math.min(0.99, progressFactor * 0.45 + unknownFactor * 0.20 + speedStability * 0.35),
-            );
-
-            return {
-              ...prev,
-              totalFiles,
-              completedFiles,
-              failedFiles,
-              currentFile,
-              speedMbps: resolvedSpeedMbps,
-              smoothedSpeedMbps,
-              downloadedBytes: mergedDownloadedBytes,
-              activeCircuits,
-              peakActiveCircuits: Math.max(prev.peakActiveCircuits, activeCircuits || 0),
-              peakBandwidthMbps,
-              diskWriteMbps,
-              peakDiskWriteMbps,
-              etaConfidence,
-              outputDir: prev.outputDir || activeDownloadOutputDirRef.current || outputDir,
-              bbrBottleneckMbps: bbrRaw,
-              ekfCovariance: ekfRaw,
-              startedAt,
-              etaSeconds,
-            };
+        listen<TelemetryBridgeUpdate>("telemetry_bridge_update", (event) => {
+          const payload = event.payload;
+          if (payload.crawlStatus) {
+            setCrawlStatus(payload.crawlStatus);
+          }
+          if (payload.resourceMetrics) {
+            setResourceMetrics(payload.resourceMetrics);
+          }
+          if (payload.batchProgress) {
+            applyBatchProgress(payload.batchProgress);
+          }
+          (payload.downloadProgress || []).forEach((progress) => {
+            applyDownloadProgress(progress);
           });
         })
       );
@@ -630,81 +865,19 @@ function App() {
       unlistenPromises.push(
         listen<TorStatus>("tor_status", (event) => {
           setTorStatus(event.payload);
-          if (event.payload.ports && event.payload.ports.length > 0) {
-            setDaemonPorts(event.payload.ports);
+          if (event.payload.daemon_count) {
+            setActiveDaemons(event.payload.daemon_count);
+          }
+          if (event.payload.state === "completed_local" || event.payload.state === "completed_managed") {
+            setTorStatus(null);
           }
           setLogs((l) => [...l.slice(-399), `[TOR] ${event.payload.state.toUpperCase()}: ${event.payload.message}`]);
         })
       );
 
       unlistenPromises.push(
-        listen<DownloadProgressEvent>("download_progress_update", (event) => {
-          const roots = [activeDownloadOutputDirRef.current, outputDir];
-          const displayPath = toDisplayPath(event.payload.path, roots);
-          const normalizedPayload: DownloadProgressEvent = {
-            ...event.payload,
-            path: displayPath,
-          };
-
-          setDownloadProgress((prev) => ({
-            ...prev,
-            [displayPath]: normalizedPayload,
-          }));
-
-          const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
-          const nextBytes = Math.max(previousBytes, event.payload.bytes_downloaded || 0);
-          if (nextBytes > previousBytes) {
-            perFileDownloadedBytesRef.current[displayPath] = nextBytes;
-            aggregateDownloadBytesRef.current += nextBytes - previousBytes;
-          }
-          const aggregateBytes = aggregateDownloadBytesRef.current;
-          const now = Date.now();
-          let diskWriteMbps = 0;
-          if (aggregateDiskSampleRef.current) {
-            const sample = aggregateDiskSampleRef.current;
-            const deltaBytes = Math.max(0, aggregateBytes - sample.bytes);
-            const deltaSeconds = Math.max((now - sample.ts) / 1000, 0);
-            if (deltaBytes > 0 && deltaSeconds > 0) {
-              diskWriteMbps = (deltaBytes / deltaSeconds) / 1048576;
-            }
-          }
-          aggregateDiskSampleRef.current = { ts: now, bytes: aggregateBytes };
-
-          const speedMbps = Math.max(0, (event.payload.speed_bps || 0) / 1048576);
-          const activeCircuits = Math.max(0, event.payload.active_circuits || 0);
-          setDownloadBatchStatus((prev) => {
-            const done = prev.completedFiles + prev.failedFiles;
-            const total = Math.max(prev.totalFiles, 1);
-            const progressFactor = done / total;
-            const unknownFactor = 1 - (prev.unknownSizeFiles / total);
-            const instant = speedMbps > 0 ? speedMbps : prev.speedMbps;
-            const smoothedSpeedMbps =
-              instant > 0
-                ? (prev.smoothedSpeedMbps > 0
-                  ? prev.smoothedSpeedMbps * 0.72 + instant * 0.28
-                  : instant)
-                : prev.smoothedSpeedMbps;
-            const speedStability =
-              smoothedSpeedMbps > 0
-                ? 1 - Math.min(Math.abs(instant - smoothedSpeedMbps) / smoothedSpeedMbps, 1)
-                : 0;
-            return {
-              ...prev,
-              currentFile: displayPath || prev.currentFile,
-              downloadedBytes: Math.max(prev.downloadedBytes, aggregateBytes),
-              speedMbps: instant,
-              smoothedSpeedMbps,
-              activeCircuits,
-              peakActiveCircuits: Math.max(prev.peakActiveCircuits, activeCircuits),
-              peakBandwidthMbps: Math.max(prev.peakBandwidthMbps, speedMbps),
-              diskWriteMbps: diskWriteMbps > 0 ? diskWriteMbps : prev.diskWriteMbps,
-              peakDiskWriteMbps: Math.max(prev.peakDiskWriteMbps, diskWriteMbps),
-              etaConfidence: Math.max(
-                0.05,
-                Math.min(0.99, progressFactor * 0.45 + unknownFactor * 0.20 + speedStability * 0.35),
-              ),
-            };
-          });
+        listen<DownloadResumePlan>("download_resume_plan", (event) => {
+          setDownloadResumePlan(event.payload);
         })
       );
 
@@ -750,8 +923,9 @@ function App() {
           showToast("success", "Download Interrupted", `${event.payload.reason} for ${displayPath}`);
         })
       );
-    } else if (!previewNoticeShownRef.current) {
+    } else if (!isFixtureMode && !previewNoticeShownRef.current) {
       previewNoticeShownRef.current = true;
+      setResourceMetrics(INITIAL_RESOURCE_METRICS);
       setLogs((l) => [
         ...l.slice(-399),
         "[SYSTEM] Browser preview mode detected: native backend event streams are disabled.",
@@ -768,6 +942,37 @@ function App() {
   useEffect(() => {
     const logContainer = document.querySelector('.forensic-log');
     if (logContainer) logContainer.scrollTop = logContainer.scrollHeight;
+  }, [logs]);
+
+  useEffect(() => {
+    if (logs.length <= processedLogCountRef.current) return;
+    const newLogs = logs.slice(processedLogCountRef.current);
+    processedLogCountRef.current = logs.length;
+
+    setLogAggregates((prev) => {
+      const next = { ...prev };
+      const baseTs = Date.now();
+      newLogs.forEach((message, idx) => {
+        const key = summarizeLogKey(message);
+        const ts = baseTs + idx;
+        const existing = next[key];
+        next[key] = existing
+          ? {
+            ...existing,
+            count: existing.count + 1,
+            lastSeenAt: ts,
+            sample: message,
+          }
+          : {
+            key,
+            sample: message,
+            count: 1,
+            firstSeenAt: ts,
+            lastSeenAt: ts,
+          };
+      });
+      return next;
+    });
   }, [logs]);
 
   useEffect(() => {
@@ -788,6 +993,8 @@ function App() {
   const handleCrawl = useCallback(async (resumeMode: boolean = false) => {
     if (!url) return;
     const preserveFixtureState = isFixtureMode;
+    processedLogCountRef.current = logs.length;
+    setLogAggregates({});
     setIsCrawling(true);
     setActiveAdapter("Unidentified");
 
@@ -795,12 +1002,17 @@ function App() {
     setCrawlElapsed(0);
     setDownloadProgress({});
     setDownloadBatchStatus(INITIAL_DOWNLOAD_BATCH_STATUS);
+    setLastCrawlResult(null);
+    setDownloadResumePlan(null);
     aggregateDownloadBytesRef.current = 0;
     aggregateDiskSampleRef.current = null;
     perFileDownloadedBytesRef.current = {};
     activeDownloadOutputDirRef.current = "";
     batchSpeedSampleRef.current = null;
     setDownloadElapsed(0);
+    if (!preserveFixtureState) {
+      setResourceMetrics(INITIAL_RESOURCE_METRICS);
+    }
     setLogs((l) => [...l, `--- Initiating Crawl ---`]);
     setLogs((l) => [...l, `> Probing Target: ${url}`]);
     setCrawlStatus({
@@ -825,12 +1037,16 @@ function App() {
         resume: resumeMode,
       };
 
-      const files = await invoke<FileEntry[]>("start_crawl", { url, options: payloadOptions, outputDir });
-      setLogs((l) => [...l, `[SYSTEM] Finish signaled. Found ${files.length} unique nodes.`]);
-      showToast("success", "Crawl Finished", `Operations complete. Extracted ${files.length} nodes from source.`);
+      const result = await invoke<CrawlSessionResult>("start_crawl", { url, options: payloadOptions, outputDir });
+      setLastCrawlResult(result);
+      setLogs((l) => [...l, `[SYSTEM] Finish signaled. Found ${result.discoveredCount} unique nodes.`]);
+      setLogs((l) => [...l, `[SYSTEM] Crawl baseline status: ${result.crawlOutcome} | raw=${result.rawThisRunCount} | best=${result.bestPriorCount} | merged=${result.mergedEffectiveCount} | retries=${result.retryCountUsed}`]);
+      setLogs((l) => [...l, `[SYSTEM] Stable current listing: ${result.stableCurrentListingPath}`]);
+      setLogs((l) => [...l, `[SYSTEM] Stable best listing: ${result.stableBestListingPath}`]);
+      showToast("success", "Crawl Finished", `Operations complete. Extracted ${result.discoveredCount} nodes from source.`);
 
       if (crawlOptions.download) {
-        setLogs((l) => [...l, `[OPSEC] Auto-Mirror complete. Files scaffolded to ${outputDir}`]);
+        setLogs((l) => [...l, `[OPSEC] Auto-Mirror complete. Files scaffolded to ${result.outputDir || outputDir}`]);
       }
     } catch (err: any) {
       if (err instanceof TypeError && err.message.includes('invoke')) {
@@ -877,6 +1093,12 @@ function App() {
           activeCircuits: 0,
           etaSeconds: null,
         }));
+        setResourceMetrics((prev) => ({
+          ...prev,
+          activeWorkers: 0,
+          workerTarget: 0,
+          activeCircuits: 0,
+        }));
         setLogs((l) => [...l, `[SYSTEM] Cancel acknowledged in preview mode (no native crawl workers active).`]);
         showToast("success", "Cancel Acknowledged", "Preview mode has no active native crawl workers.");
         return;
@@ -891,6 +1113,12 @@ function App() {
         speedMbps: 0,
         activeCircuits: 0,
         etaSeconds: null,
+      }));
+      setResourceMetrics((prev) => ({
+        ...prev,
+        activeWorkers: 0,
+        workerTarget: 0,
+        activeCircuits: 0,
       }));
       setLogs((l) => [...l, `[SYSTEM] ⚠ ${result}`]);
       showToast("success", "Cancellation Requested", result);
@@ -1002,6 +1230,7 @@ function App() {
       const count = await invoke<number>("download_all", {
         outputDir,
         connections: crawlOptions.circuits,
+        targetUrl: url || undefined,
       });
       showToast("success", "Mirror Complete", `${count} total items structured on disk.`);
       setLogs((l) => [...l, `[MIRROR] Complete. ${count} total items on disk.`]);
@@ -1073,6 +1302,10 @@ function App() {
 
   const supportRows = supportCatalog.length > 0 ? supportCatalog : FALLBACK_SUPPORT_CATALOG;
   const fullCrawlCount = supportRows.filter((item) => item.supportLevel === "Full Crawl").length;
+  const aggregateRows = Object.values(logAggregates).sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    return b.lastSeenAt - a.lastSeenAt;
+  });
 
   return (
     <div className="app-container">
@@ -1316,6 +1549,37 @@ function App() {
           <span style={{ fontSize: '0.85rem', color: crawlOptions.agnosticState ? 'var(--text-main)' : 'var(--text-muted)' }}>URI-Agnostic State</span>
         </label>
 
+        <button
+          className="action-btn popup-hover"
+          data-testid="btn-resume-index"
+          onClick={async () => {
+            if (crawlOptions.resumeIndex) {
+              setCrawlOptions(prev => ({ ...prev, resumeIndex: undefined, resume: false }));
+            } else {
+              const selected = await open({
+                multiple: false,
+                filters: [{ name: 'Onion Forge Index', extensions: ['txt'] }]
+              });
+              if (selected && typeof selected === 'string') {
+                setCrawlOptions(prev => ({ ...prev, resumeIndex: selected, resume: true }));
+              }
+            }
+          }}
+          disabled={isCrawling}
+          style={{
+            width: 'auto',
+            padding: '2px 10px',
+            background: 'transparent',
+            border: `1px solid ${crawlOptions.resumeIndex ? 'var(--accent-primary)' : 'var(--border-color)'}`,
+            fontSize: '0.85rem',
+            cursor: isCrawling ? 'not-allowed' : 'pointer',
+            color: crawlOptions.resumeIndex ? 'var(--accent-primary)' : 'var(--text-main)',
+            borderRadius: '4px'
+          }}
+        >
+          {crawlOptions.resumeIndex ? `Advanced Override: ${crawlOptions.resumeIndex.split(/[\\/]/).pop()}` : "Advanced Baseline Override"}
+        </button>
+
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: 'auto' }}>
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Concurrency:</span>
           <select
@@ -1381,6 +1645,9 @@ function App() {
         downloadProgress={downloadProgress}
         elapsed={crawlElapsed}
         downloadElapsed={downloadElapsed}
+        resourceMetrics={resourceMetrics}
+        crawlRunStatus={lastCrawlResult}
+        downloadResumePlan={downloadResumePlan}
       />
 
       <div className="main-workspace">
@@ -1391,6 +1658,49 @@ function App() {
             </span>
           </div>
           <div className="panel-content">
+            <div style={{
+              display: 'grid',
+              gap: '6px',
+              maxHeight: '180px',
+              overflow: 'auto',
+              padding: '8px 10px',
+              borderBottom: '1px solid rgba(255,255,255,0.06)',
+              background: 'rgba(255,255,255,0.02)'
+            }}>
+              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                Unique Message Summary
+              </div>
+              {aggregateRows.length === 0 ? (
+                <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                  Waiting for crawl and downloader logs...
+                </div>
+              ) : aggregateRows.map((aggregate) => (
+                <div
+                  key={aggregate.key}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: '56px 1fr',
+                    gap: '8px',
+                    padding: '6px 8px',
+                    border: '1px solid rgba(255,255,255,0.06)',
+                    borderRadius: '6px',
+                    background: 'rgba(10, 14, 20, 0.55)'
+                  }}
+                >
+                  <div style={{ fontFamily: 'JetBrains Mono', color: 'var(--accent-primary)', fontSize: '0.78rem' }}>
+                    ×{aggregate.count}
+                  </div>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-main)', wordBreak: 'break-word' }}>
+                      {aggregate.sample}
+                    </div>
+                    <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontFamily: 'JetBrains Mono' }}>
+                      First {new Date(aggregate.firstSeenAt).toLocaleTimeString()} | Last {new Date(aggregate.lastSeenAt).toLocaleTimeString()}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
             <div className="forensic-log">
               {logs.map((log, i) => (
                 <div key={i} className="term-line" style={{
@@ -1469,28 +1779,28 @@ function App() {
       </div>
 
       <div className="network-monitor">
-        {daemonPorts.length > 6 ? (
+        {activeDaemons > 6 ? (
           <div className="daemon-box" style={{ flex: 1, justifyContent: "center" }}>
             <div className="daemon-icon">
               {isCrawling ? <VibeLoader size={18} variant="secondary" /> : <Zap size={18} />}
             </div>
             <div className="daemon-info" style={{ flex: "none" }}>
-              <div className="daemon-header">SWARM ACTIVE ({daemonPorts.length} NODES)</div>
+              <div className="daemon-header">ARTI SWARM ({activeDaemons} NODES)</div>
               <div className="daemon-body">
                 <span style={{ fontSize: '0.85rem', color: 'var(--accent-secondary)', fontFamily: 'JetBrains Mono', wordBreak: 'break-all' }}>
-                  PORTS: {daemonPorts.join(", ")}
+                  MODE: NATIVE MEMORY
                 </span>
               </div>
             </div>
           </div>
         ) : (
-          daemonPorts.map((port, idx) => (
-            <div key={port} className="daemon-box">
+          Array.from({ length: activeDaemons }).map((_, idx) => (
+            <div key={idx} className="daemon-box">
               <div className="daemon-icon">
                 {isCrawling ? <VibeLoader size={18} variant="secondary" /> : <Zap size={18} />}
               </div>
               <div className="daemon-info">
-                <div className="daemon-header">NODE {idx}: PORT {port}</div>
+                <div className="daemon-header">ARTI NODE {idx + 1}</div>
                 <div className="daemon-body">
                   <span style={{ color: isCrawling ? 'var(--accent-primary)' : 'var(--text-muted)' }}>
                     {isCrawling ? 'ACTIVE' : 'STANDBY'}

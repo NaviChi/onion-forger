@@ -4,6 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
+const NODE_TTL_SECS: u64 = 604_800; // 7 days
+const PROBE_TIMEOUT_SECS: u64 = 15;
+const PREFERRED_NODE_TIMEOUT_SECS: u64 = 8;
+const TOURNAMENT_HEAD_WIDTH: usize = 4;
+const BASE_NODE_COOLDOWN_SECS: u64 = 45;
+const MAX_NODE_COOLDOWN_SECS: u64 = 15 * 60;
+
 /// A discovered QData storage node for a specific victim UUID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageNode {
@@ -17,6 +24,78 @@ pub struct StorageNode {
     pub avg_latency_ms: u64,
     /// Number of times this node has been successfully contacted
     pub hit_count: u32,
+    /// Successful probe count used for tournament scoring
+    #[serde(default)]
+    pub success_count: u32,
+    /// Failed probe count used for tournament scoring
+    #[serde(default)]
+    pub failure_count: u32,
+    /// Consecutive failures used to apply temporary demotion
+    #[serde(default)]
+    pub failure_streak: u32,
+    /// Unix timestamp until which this node should be temporarily deprioritized
+    #[serde(default)]
+    pub cooldown_until: u64,
+}
+
+impl StorageNode {
+    fn success_ratio(&self) -> f64 {
+        let success = self.success_count as f64 + 1.0;
+        let total = (self.success_count + self.failure_count) as f64 + 2.0;
+        success / total
+    }
+
+    fn is_cooling_down(&self, now: u64) -> bool {
+        self.cooldown_until > now
+    }
+
+    fn tournament_score(&self, now: u64) -> f64 {
+        let latency_ms = if self.avg_latency_ms == 0 {
+            20_000.0
+        } else {
+            self.avg_latency_ms as f64
+        };
+        let latency_score = (15_000.0 / latency_ms.clamp(250.0, 30_000.0)).clamp(0.1, 60.0);
+        let reliability_score = self.success_ratio() * 100.0;
+        let stickiness_bonus = (self.hit_count.min(20) as f64) * 1.25;
+        let freshness_bonus = if now.saturating_sub(self.last_seen) <= 60 * 60 {
+            6.0
+        } else {
+            0.0
+        };
+        let streak_penalty = self.failure_streak.min(12) as f64 * 5.0;
+        let cooldown_penalty = if self.is_cooling_down(now) {
+            250.0
+        } else {
+            0.0
+        };
+
+        reliability_score + latency_score + stickiness_bonus + freshness_bonus
+            - streak_penalty
+            - cooldown_penalty
+    }
+
+    fn record_success(&mut self, latency_ms: u64) {
+        self.last_seen = now_unix();
+        self.hit_count = self.hit_count.saturating_add(1);
+        self.success_count = self.success_count.saturating_add(1);
+        self.failure_streak = 0;
+        self.cooldown_until = 0;
+        self.avg_latency_ms = if self.avg_latency_ms == 0 {
+            latency_ms
+        } else {
+            ((self.avg_latency_ms as f64 * 0.65) + (latency_ms as f64 * 0.35)) as u64
+        };
+    }
+
+    fn record_failure(&mut self) {
+        self.failure_count = self.failure_count.saturating_add(1);
+        self.failure_streak = self.failure_streak.saturating_add(1);
+        let cooldown = BASE_NODE_COOLDOWN_SECS
+            .saturating_mul(1_u64 << self.failure_streak.min(4))
+            .min(MAX_NODE_COOLDOWN_SECS);
+        self.cooldown_until = now_unix().saturating_add(cooldown);
+    }
 }
 
 /// Persistent cache of discovered Qilin storage nodes.
@@ -35,6 +114,88 @@ impl Default for QilinNodeCache {
 }
 
 impl QilinNodeCache {
+    fn looks_like_live_qdata_listing(body: &str) -> bool {
+        body.contains("QData")
+            || body.contains("Data browser")
+            || body.contains("<table id=\"list\">")
+            || body.contains("File Name")
+            || body.contains("File Size")
+            || body.contains("<td class=\"link\">")
+    }
+
+    fn resolve_candidate_url(base_url: &str, raw_target: &str) -> Option<String> {
+        if let Ok(parsed) = reqwest::Url::parse(raw_target) {
+            return Some(parsed.to_string());
+        }
+        let base = reqwest::Url::parse(base_url).ok()?;
+        base.join(raw_target).ok().map(|joined| joined.to_string())
+    }
+
+    async fn validate_stage_a_candidate(
+        &self,
+        uuid: &str,
+        final_url: &str,
+        body: &str,
+    ) -> Option<StorageNode> {
+        if !Self::looks_like_live_qdata_listing(body) {
+            println!(
+                "[QilinNodeCache] Stage A — redirect landed, but body did not look like a QData listing. Continuing discovery."
+            );
+            return None;
+        }
+
+        let parsed_final = reqwest::Url::parse(final_url).ok()?;
+        let host = parsed_final.host_str().unwrap_or("").to_string();
+        let node = StorageNode {
+            url: final_url.to_string(),
+            host: host.clone(),
+            last_seen: now_unix(),
+            avg_latency_ms: 0,
+            hit_count: 5,
+            success_count: 1,
+            failure_count: 0,
+            failure_streak: 0,
+            cooldown_until: 0,
+        };
+        let _ = self.save_node(uuid, &node).await;
+        println!(
+            "[QilinNodeCache] Stage A — Valid live listing discovered & cached: {}",
+            host
+        );
+        Some(node)
+    }
+
+    async fn follow_watch_data_target(
+        &self,
+        client: &crate::arti_client::ArtiClient,
+        cms_url: &str,
+        uuid: &str,
+        raw_target: &str,
+    ) -> Option<StorageNode> {
+        let resolved = Self::resolve_candidate_url(cms_url, raw_target)?;
+        println!(
+            "[QilinNodeCache] Stage B — Following Watch data candidate: {}",
+            resolved
+        );
+
+        let resp = client.get(&resolved).send().await.ok()?;
+        let final_url = resp.url().as_str().to_string();
+        let status = resp.status();
+        let body = resp.text().await.ok()?;
+
+        println!(
+            "[QilinNodeCache] Stage B — Watch data candidate status={}, final={}",
+            status, final_url
+        );
+
+        if !status.is_success() && status.as_u16() != 301 && status.as_u16() != 302 {
+            return None;
+        }
+
+        self.validate_stage_a_candidate(uuid, &final_url, &body)
+            .await
+    }
+
     /// Initialize the sled database at ~/.crawli/qilin_nodes.sled
     pub async fn initialize(&self) -> anyhow::Result<()> {
         let mut path = std::env::var("HOME")
@@ -69,15 +230,18 @@ impl QilinNodeCache {
         let guard = self.db.lock().await;
         let mut nodes = Vec::new();
         let now = now_unix();
-        const TTL_SECS: u64 = 604800; // 7 days
         if let Some(db) = guard.as_ref() {
             let prefix = format!("node:{}:", uuid);
             let mut stale_keys = Vec::new();
             for item in db.scan_prefix(prefix.as_bytes()).flatten() {
                 if let Ok(node) = serde_json::from_slice::<StorageNode>(&item.1) {
-                    if now.saturating_sub(node.last_seen) > TTL_SECS {
+                    if now.saturating_sub(node.last_seen) > NODE_TTL_SECS {
                         stale_keys.push(item.0.to_vec());
-                        println!("[QilinNodeCache] TTL eviction: {} (last seen {}s ago)", node.host, now - node.last_seen);
+                        println!(
+                            "[QilinNodeCache] TTL eviction: {} (last seen {}s ago)",
+                            node.host,
+                            now - node.last_seen
+                        );
                     } else {
                         nodes.push(node);
                     }
@@ -90,10 +254,12 @@ impl QilinNodeCache {
                 let _ = db.flush_async().await;
             }
         }
-        // Sort by hit_count descending, then by latency ascending (prefer reliable + fast nodes)
         nodes.sort_by(|a, b| {
-            b.hit_count.cmp(&a.hit_count)
+            b.tournament_score(now)
+                .partial_cmp(&a.tournament_score(now))
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.avg_latency_ms.cmp(&b.avg_latency_ms))
+                .then(b.hit_count.cmp(&a.hit_count))
         });
         nodes
     }
@@ -108,9 +274,83 @@ impl QilinNodeCache {
             last_seen: now_unix(),
             avg_latency_ms: 0,
             hit_count: 0,
+            success_count: 0,
+            failure_count: 0,
+            failure_streak: 0,
+            cooldown_until: 0,
         };
         let _ = self.save_node(uuid, &node).await;
         println!("[QilinNodeCache] Seeded: {} -> {}", uuid, url);
+    }
+
+    async fn persist_node_state(&self, uuid: &str, node: StorageNode) {
+        let _ = self.save_node(uuid, &node).await;
+    }
+
+    async fn record_probe_failure(&self, uuid: &str, node: &StorageNode, reason: &str) {
+        let mut updated = node.clone();
+        updated.record_failure();
+        self.persist_node_state(uuid, updated.clone()).await;
+        println!(
+            "[QilinNodeCache] Demoted node {} after {} (cooldown until {})",
+            updated.host, reason, updated.cooldown_until
+        );
+    }
+
+    async fn record_probe_success(
+        &self,
+        uuid: &str,
+        node: &StorageNode,
+        latency_ms: u64,
+    ) -> StorageNode {
+        let mut updated = node.clone();
+        updated.record_success(latency_ms);
+        self.persist_node_state(uuid, updated.clone()).await;
+        updated
+    }
+
+    async fn probe_node(
+        &self,
+        uuid: &str,
+        client: &crate::arti_client::ArtiClient,
+        node: StorageNode,
+        timeout_secs: u64,
+    ) -> Option<(StorageNode, u128)> {
+        let start = std::time::Instant::now();
+        match tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            client.get(&node.url).send(),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let latency = start.elapsed().as_millis();
+                let status = resp.status();
+                println!(
+                    "[QilinNodeCache] Probe — {} responded in {}ms (status={})",
+                    node.host, latency, status
+                );
+
+                if status.is_success() || status.as_u16() == 301 || status.as_u16() == 302 {
+                    let updated = self.record_probe_success(uuid, &node, latency as u64).await;
+                    Some((updated, latency))
+                } else {
+                    self.record_probe_failure(uuid, &node, &format!("status {}", status))
+                        .await;
+                    None
+                }
+            }
+            Ok(Err(e)) => {
+                println!("[QilinNodeCache] Probe — {} unreachable: {}", node.host, e);
+                self.record_probe_failure(uuid, &node, &e.to_string()).await;
+                None
+            }
+            Err(_) => {
+                println!("[QilinNodeCache] Probe — {} timed out", node.host);
+                self.record_probe_failure(uuid, &node, "timeout").await;
+                None
+            }
+        }
     }
 
     /// Pre-seed the cache with all known Qilin QData storage domains.
@@ -158,47 +398,49 @@ impl QilinNodeCache {
         &self,
         cms_url: &str,
         uuid: &str,
-        client: &reqwest::Client,
+        client: &crate::arti_client::ArtiClient,
     ) -> Option<StorageNode> {
-        println!("[QilinNodeCache] Starting multi-path discovery for UUID: {}", uuid);
+        println!(
+            "[QilinNodeCache] Starting multi-path discovery for UUID: {}",
+            uuid
+        );
 
         let parsed = reqwest::Url::parse(cms_url).ok()?;
         let base = format!("{}://{}", parsed.scheme(), parsed.host_str()?);
 
         // Stage A: Follow 302 redirect from /site/data
         let data_url = format!("{}/site/data?uuid={}", base, uuid);
-        println!("[QilinNodeCache] Stage A — Following 302 redirect: {}", data_url);
+        println!(
+            "[QilinNodeCache] Stage A — Following 302 redirect: {}",
+            data_url
+        );
 
         for attempt in 1..=3 {
-            match client.get(&data_url).send().await {
+            match client.get(&data_url).header("Referer", &base).send().await {
                 Ok(resp) => {
                     let final_url = resp.url().as_str().to_string();
                     let status = resp.status();
-                    println!("[QilinNodeCache] Stage A — Status={}, FinalURL={}", status, final_url);
+                    let body = resp.text().await.unwrap_or_default();
+                    println!(
+                        "[QilinNodeCache] Stage A — Status={}, FinalURL={}",
+                        status, final_url
+                    );
 
                     if final_url != data_url {
-                        // Redirect intercepted!
-                        if let Ok(parsed_final) = reqwest::Url::parse(&final_url) {
-                            let host = parsed_final.host_str().unwrap_or("").to_string();
-                            let node = StorageNode {
-                                url: final_url.clone(),
-                                host: host.clone(),
-                                last_seen: now_unix(),
-                                avg_latency_ms: 0,
-                                hit_count: 5, // Artificially boost hit_count
-                            };
-                            let _ = self.save_node(uuid, &node).await;
-                            println!("[QilinNodeCache] Stage A — Discovered & cached: {}", host);
-                            // Immediate Return: The authoritative 302 redirect contains the 
-                            // actual backend UUID (which may differ from the input CMS UUID).
-                            // Short-circuit to prevent Stage C/D from guessing the wrong UUID.
+                        if let Some(node) = self
+                            .validate_stage_a_candidate(uuid, &final_url, &body)
+                            .await
+                        {
                             return Some(node);
                         }
                     }
                     break;
                 }
                 Err(e) => {
-                    println!("[QilinNodeCache] Stage A — attempt {} failed: {}", attempt, e);
+                    println!(
+                        "[QilinNodeCache] Stage A — attempt {} failed: {}",
+                        attempt, e
+                    );
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
@@ -206,10 +448,27 @@ impl QilinNodeCache {
 
         // Stage B: Scrape the view page for the QData storage reference
         let view_url = format!("{}/site/view?uuid={}", base, uuid);
-        println!("[QilinNodeCache] Stage B — Scraping view page: {}", view_url);
+        println!(
+            "[QilinNodeCache] Stage B — Scraping view page: {}",
+            view_url
+        );
 
         if let Ok(resp) = client.get(&view_url).send().await {
             if let Ok(body) = resp.text().await {
+                let watch_data_re = regex::Regex::new(
+                    r#"(?is)(?:href|data-url|onclick)\s*=\s*["']([^"']*(?:site/data\?uuid=[^"']+|http://[a-z2-7]{56}\.onion/[^"']+/))["'][^>]*>\s*[^<]*watch data"#
+                ).unwrap();
+                for cap in watch_data_re.captures_iter(&body) {
+                    if let Some(target) = cap.get(1).map(|m| m.as_str()) {
+                        if let Some(node) = self
+                            .follow_watch_data_target(client, &view_url, uuid, target)
+                            .await
+                        {
+                            return Some(node);
+                        }
+                    }
+                }
+
                 // Phase 42 Fix 3: Hardened regex patterns for QData storage node discovery
                 // Captures: value="<onion>", >onion<, href="http://onion/...", data-url="...", iframe src="..."
                 let value_re = regex::Regex::new(
@@ -222,7 +481,10 @@ impl QilinNodeCache {
                         if onion_host == parsed.host_str().unwrap_or("") {
                             continue;
                         }
-                        println!("[QilinNodeCache] Stage B — Found QData storage reference: {}", onion_host);
+                        println!(
+                            "[QilinNodeCache] Stage B — Found QData storage reference: {}",
+                            onion_host
+                        );
 
                         // This is likely the storage host. Construct the URL with the UUID.
                         let storage_url = format!("http://{}/{}/", onion_host, uuid);
@@ -232,6 +494,10 @@ impl QilinNodeCache {
                             last_seen: now_unix(),
                             avg_latency_ms: 0,
                             hit_count: 0,
+                            success_count: 0,
+                            failure_count: 0,
+                            failure_streak: 0,
+                            cooldown_until: 0,
                         };
                         let _ = self.save_node(uuid, &node).await;
                     }
@@ -246,75 +512,148 @@ impl QilinNodeCache {
 
         // Stage C: Load all cached nodes
         let cached_nodes = self.get_nodes(uuid).await;
-        println!("[QilinNodeCache] Stage C — {} cached nodes found", cached_nodes.len());
+        println!(
+            "[QilinNodeCache] Stage C — {} cached nodes found",
+            cached_nodes.len()
+        );
 
         if cached_nodes.is_empty() {
             println!("[QilinNodeCache] No nodes discovered for UUID {}", uuid);
             return None;
         }
 
-        // Stage D: Phase 42 Fix 1 — Probe ALL nodes CONCURRENTLY, return fastest alive
-        println!("[QilinNodeCache] Stage D — Probing {} nodes concurrently...", cached_nodes.len());
+        let now = now_unix();
+        let mut preferred_nodes: Vec<StorageNode> = cached_nodes
+            .iter()
+            .filter(|node| !node.is_cooling_down(now))
+            .cloned()
+            .collect();
+        let mut fallback_nodes: Vec<StorageNode> = cached_nodes
+            .iter()
+            .filter(|node| node.is_cooling_down(now))
+            .cloned()
+            .collect();
 
-        let best: Arc<Mutex<Option<(StorageNode, u128)>>> = Arc::new(Mutex::new(None));
-        let mut probe_tasks = tokio::task::JoinSet::new();
+        if preferred_nodes.is_empty() {
+            preferred_nodes.append(&mut fallback_nodes);
+        } else {
+            preferred_nodes.extend(fallback_nodes.into_iter().take(2));
+        }
+
+        if let Some(sticky) = preferred_nodes.first().cloned() {
+            let sticky_confident = sticky.hit_count >= 3 && sticky.success_ratio() >= 0.65;
+            if sticky_confident {
+                println!(
+                    "[QilinNodeCache] Sticky winner probe: {} (score {:.2})",
+                    sticky.host,
+                    sticky.tournament_score(now)
+                );
+                if let Some((winner, _)) = self
+                    .probe_node(uuid, client, sticky, PREFERRED_NODE_TIMEOUT_SECS)
+                    .await
+                {
+                    println!(
+                        "[QilinNodeCache] ✅ Sticky winner held: {} ({}ms avg, {} hits)",
+                        winner.host, winner.avg_latency_ms, winner.hit_count
+                    );
+                    return Some(winner);
+                }
+            }
+        }
+
+        // Stage D: Probe the tournament head first, then score by reliability + latency.
+        println!(
+            "[QilinNodeCache] Stage D — Probing {} candidate nodes ({} preferred) concurrently...",
+            preferred_nodes.len(),
+            preferred_nodes
+                .iter()
+                .filter(|node| !node.is_cooling_down(now))
+                .count()
+        );
+
+        let best: Arc<Mutex<Option<(StorageNode, u128, f64)>>> = Arc::new(Mutex::new(None));
         let cache_ref = self.clone();
         let uuid_owned = uuid.to_string();
 
-        for node in cached_nodes.clone() {
+        preferred_nodes.sort_by(|a, b| {
+            b.tournament_score(now)
+                .partial_cmp(&a.tournament_score(now))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let head_width = TOURNAMENT_HEAD_WIDTH.min(preferred_nodes.len());
+        let head_nodes = preferred_nodes[..head_width].to_vec();
+        let tail_nodes = preferred_nodes[head_width..].to_vec();
+
+        let mut head_tasks = tokio::task::JoinSet::new();
+        for node in head_nodes {
             let client = client.clone();
             let best_ref = best.clone();
             let cache = cache_ref.clone();
             let uuid_str = uuid_owned.clone();
+            let score_snapshot = node.tournament_score(now);
 
-            probe_tasks.spawn(async move {
-                let start = std::time::Instant::now();
-                let probe_timeout = Duration::from_secs(15); // Phase 42: reduced from 30s → 15s
-
-                match tokio::time::timeout(probe_timeout, client.get(&node.url).send()).await {
-                    Ok(Ok(resp)) => {
-                        let latency = start.elapsed().as_millis();
-                        let status = resp.status();
-                        println!(
-                            "[QilinNodeCache] Stage D — {} responded in {}ms (status={})",
-                            node.host, latency, status
-                        );
-
-                        if status.is_success() || status.as_u16() == 301 || status.as_u16() == 302 {
-                            let mut updated = node.clone();
-                            updated.last_seen = now_unix();
-                            updated.hit_count += 1;
-                            updated.avg_latency_ms = if updated.avg_latency_ms == 0 {
-                                latency as u64
-                            } else {
-                                ((updated.avg_latency_ms as f64 * 0.7) + (latency as f64 * 0.3)) as u64
-                            };
-                            let _ = cache.save_node(&uuid_str, &updated).await;
-
-                            let mut guard = best_ref.lock().await;
-                            if guard.as_ref().map_or(true, |(_, best_lat)| latency < *best_lat) {
-                                *guard = Some((updated, latency));
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        println!("[QilinNodeCache] Stage D — {} unreachable: {}", node.host, e);
-                    }
-                    Err(_) => {
-                        println!("[QilinNodeCache] Stage D — {} timed out", node.host);
+            head_tasks.spawn(async move {
+                if let Some((updated, latency)) = cache
+                    .probe_node(&uuid_str, &client, node, PROBE_TIMEOUT_SECS)
+                    .await
+                {
+                    let mut guard = best_ref.lock().await;
+                    let adjusted_score = score_snapshot - (latency as f64 / 1000.0);
+                    if guard.as_ref().is_none_or(|(_, best_lat, best_score)| {
+                        adjusted_score > *best_score
+                            || ((adjusted_score - *best_score).abs() < f64::EPSILON
+                                && latency < *best_lat)
+                    }) {
+                        *guard = Some((updated, latency, adjusted_score));
                     }
                 }
             });
         }
 
-        // Wait for all probes to complete (max 15s wall-clock)
-        while probe_tasks.join_next().await.is_some() {}
+        while head_tasks.join_next().await.is_some() {}
 
-        let result = best.lock().await.clone().map(|(node, _)| node);
+        if best.lock().await.is_none() && !tail_nodes.is_empty() {
+            println!(
+                "[QilinNodeCache] Stage D — Tournament head failed, probing {} fallback candidates...",
+                tail_nodes.len()
+            );
+            let mut tail_tasks = tokio::task::JoinSet::new();
+            for node in tail_nodes {
+                let client = client.clone();
+                let best_ref = best.clone();
+                let cache = cache_ref.clone();
+                let uuid_str = uuid_owned.clone();
+                let score_snapshot = node.tournament_score(now);
+
+                tail_tasks.spawn(async move {
+                    if let Some((updated, latency)) = cache
+                        .probe_node(&uuid_str, &client, node, PROBE_TIMEOUT_SECS)
+                        .await
+                    {
+                        let mut guard = best_ref.lock().await;
+                        let adjusted_score = score_snapshot - (latency as f64 / 1000.0);
+                        if guard.as_ref().is_none_or(|(_, best_lat, best_score)| {
+                            adjusted_score > *best_score
+                                || ((adjusted_score - *best_score).abs() < f64::EPSILON
+                                    && latency < *best_lat)
+                        }) {
+                            *guard = Some((updated, latency, adjusted_score));
+                        }
+                    }
+                });
+            }
+
+            while tail_tasks.join_next().await.is_some() {}
+        }
+
+        let result = best.lock().await.clone().map(|(node, _, _)| node);
         if let Some(ref winner) = result {
             println!(
-                "[QilinNodeCache] ✅ Best node: {} ({}ms, {} hits)",
-                winner.host, winner.avg_latency_ms, winner.hit_count
+                "[QilinNodeCache] ✅ Best node: {} ({}ms avg, {} hits, {:.1}% success)",
+                winner.host,
+                winner.avg_latency_ms,
+                winner.hit_count,
+                winner.success_ratio() * 100.0
             );
         }
 
@@ -327,4 +666,63 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StorageNode;
+
+    #[test]
+    fn cooled_node_scores_below_healthy_node() {
+        let now = 1_700_000_000;
+        let healthy = StorageNode {
+            url: "http://a.onion/test/".to_string(),
+            host: "a.onion".to_string(),
+            last_seen: now,
+            avg_latency_ms: 1_500,
+            hit_count: 4,
+            success_count: 4,
+            failure_count: 1,
+            failure_streak: 0,
+            cooldown_until: 0,
+        };
+        let cooled = StorageNode {
+            url: "http://b.onion/test/".to_string(),
+            host: "b.onion".to_string(),
+            last_seen: now,
+            avg_latency_ms: 1_000,
+            hit_count: 6,
+            success_count: 2,
+            failure_count: 6,
+            failure_streak: 3,
+            cooldown_until: now + 120,
+        };
+
+        assert!(healthy.tournament_score(now) > cooled.tournament_score(now));
+    }
+
+    #[test]
+    fn success_resets_failure_streak() {
+        let mut node = StorageNode {
+            url: "http://a.onion/test/".to_string(),
+            host: "a.onion".to_string(),
+            last_seen: 0,
+            avg_latency_ms: 0,
+            hit_count: 0,
+            success_count: 0,
+            failure_count: 0,
+            failure_streak: 0,
+            cooldown_until: 0,
+        };
+
+        node.record_failure();
+        assert!(node.failure_streak > 0);
+        assert!(node.cooldown_until > 0);
+
+        node.record_success(1_200);
+        assert_eq!(node.failure_streak, 0);
+        assert_eq!(node.cooldown_until, 0);
+        assert_eq!(node.success_count, 1);
+        assert_eq!(node.hit_count, 1);
+    }
 }

@@ -60,7 +60,7 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
         });
 
         // 4. Thread Pool config
-        let max_concurrent = 120; // Will be scaled by AIMD + Politeness later
+        let max_concurrent = frontier.recommended_listing_workers();
         let mut workers = tokio::task::JoinSet::new();
 
         for _ in 0..max_concurrent {

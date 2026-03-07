@@ -60,7 +60,7 @@ Run `Release` in GitHub Actions with input tag like `v0.1.0`.
 
 Windows releases also publish a portable asset:
 - `crawli_<tag>_windows_x64_portable.zip`
-- Contains `crawli.exe` + `bin/win_x64` runtime dependencies (including Tor resources), so it runs without an installer.
+- Contains `crawli.exe` plus any optional legacy runtime payloads that still exist under `src-tauri/bin/win_x64` at build time. The primary runtime path is native Arti and does not require bundled Tor binaries.
 
 ## Browser Fixture Mode
 

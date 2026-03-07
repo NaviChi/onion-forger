@@ -1,25 +1,83 @@
-> **Last Updated:** 2026-03-04T15:08 CST
+> **Last Updated:** 2026-03-06T13:05 CST
 
 # Qilin Adapter Flight Manual
-*Adapter ID: `qilin`*
-*Matching Strategy: M.A.C Tier 2 AST Tokenization (`<div class="page-header-title">QData</div>`)*
 
-## 1. Topography & Ingress
-Qilin masks its underlying artifact storage (Nginx/Apache) behind a customized `QData` visual CSS web layer ("Data browser"). This defeats default Autoindex signature detection despite possessing a perfectly compliant nested table output.
+Adapter ID: `qilin`
 
-**Known Roots:** 
-- `iv6lrjrd5ioyanvvemnkhturmyfpfbdcy442e22oqd2izkwnjw23m3id.onion`
+## 1. Canonical Test URL
+Use this authorized CMS URL as the canonical Qilin documentation and test target:
 
-**M.A.C. Regex Marker:** `<div class="page-header-title">QData</div>|Data browser`
+`http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed`
 
-## 2. DOM Interception Rules
-*   **Engine:** `RegexSet` + Autoindex Delegation
-*   **Phase 1 (Origin):** The Tier 2 M.A.C regex catches `QData` without executing `scraper::Html`.
-*   **Phase 2 (AST):** The Rust process completely skips writing custom scraper logic for Qilin. Instead it forcibly converts the instance and executes `<AutoindexAdapter>::crawl()`, efficiently reading the underlying unstyled `<table>` node perfectly.
+## 2. Matching Rule
+Qilin is identified by QData/CMS markers such as:
+- `QData`
+- `Data browser`
+- `_csrf-blog`
+- `item_box_photos`
+- QData-style onion value fields in the body
 
-## 3. Deep-Crawl 2/2/2 Yield Metric
-*   **Target:** Current network status is Offline/Rotating. However, parsing the raw HTML yields a flawless >2 score matching Nginx default hierarchies perfectly since the delegation logic bypasses the visual CSS wrapper natively.
+## 3. Ingress Rule
+The CMS page is only the launcher surface.
 
-## 4. Known Bugs & Historical Evolutions
-*   *Issue:* Wasting 500 lines of Rust re-mapping table rows that Autoindex already reads perfectly solely because the page `<title>` changed.
-*   *Fix:* Architectural delegation wrapper written mapping `qilin.rs` -> `autoindex.rs`.
+The adapter must:
+1. fingerprint the CMS page
+2. follow the `Watch data` handoff
+3. resolve the storage onion host
+4. preserve the resolved backend UUID
+5. crawl the resulting QData listing URL
+
+Do not treat the original `/site/view?uuid=...` page as the directory root.
+
+## 4. Storage Node Policy
+Qilin storage nodes are rotating infrastructure.
+
+Current policy:
+- persist discovered nodes in `QilinNodeCache`
+- validate a Stage A candidate only if the body looks like a live QData listing
+- choose one primary storage route
+- keep a small bounded standby set
+- fail over only on classified timeout/circuit/throttle pressure
+
+## 5. Crawl Policy
+Current crawl behavior:
+- bootstrap after a quorum of ready clients instead of waiting for the full requested pool
+- use adaptive page governance for HTML enumeration
+- keep the user-selected circuit count as a budget ceiling
+- stream entries into sled VFS continuously
+
+## 6. Recursive Parsing Rule
+For QData tables:
+- resolve child links with `Url::join`
+- derive display names from decoded last path segments
+- use the resolved final URL as the recursion base
+
+Do not manually reconstruct child URLs with string concatenation when a canonical join is available.
+
+## 7. Diagnostics
+Current high-value diagnostics:
+- root fetch
+- root listing markers
+- root parse counts
+- limited child queue/fetch/parse/failure logs
+
+These diagnostics are intentionally capped so long runs stay readable.
+
+## 8. Current Known State
+Validated live behavior now includes:
+- root parsing
+- recursive child-folder traversal
+- intermittent deeper child-folder connect failures
+
+Short authorized 90-second soaks currently show:
+- `native`: 1693 unique entries
+- `torforge`: 973 unique entries
+
+That means Qilin recursion works now. The remaining issue is long-run throughput and deeper recursive stability.
+
+## 9. Prevention Rules
+- Never use the CMS UUID page as the crawl root once a real storage listing has been resolved.
+- Never accept a storage-node candidate only from redirect shape; validate the body too.
+- Never reconstruct QData child URLs with raw string concatenation when URL join can preserve canonical encoding.
+- Never treat the circuit ceiling as the live HTML worker count for Qilin.
+- Never requeue missing folders forever; reconciliation must have a no-progress escape path.

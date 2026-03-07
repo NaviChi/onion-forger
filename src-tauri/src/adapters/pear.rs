@@ -58,7 +58,7 @@ impl CrawlerAdapter for PearAdapter {
             }
         });
 
-        let max_concurrent = 120; // Massive worker-stealer parallel pool
+        let max_concurrent = frontier.recommended_listing_workers();
         let mut workers = tokio::task::JoinSet::new();
 
         let _base_url = current_url.to_string();
@@ -92,10 +92,13 @@ impl CrawlerAdapter for PearAdapter {
                     }
                     impl Drop for TaskGuard {
                         fn drop(&mut self) {
-                            self.counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            self.counter
+                                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
-                    let _guard = TaskGuard { counter: pending_clone.clone() };
+                    let _guard = TaskGuard {
+                        counter: pending_clone.clone(),
+                    };
 
                     let _permit = f.politeness_semaphore.acquire().await.ok();
                     let (_cid, _client) = f.get_client();
@@ -106,22 +109,28 @@ impl CrawlerAdapter for PearAdapter {
                     let mut html = String::new();
                     // active_cid is just used inside the loop
 
+                    let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
+
                     for _attempt in 0..4 {
                         let (current_cid, current_client) = f.get_client();
-                        html = match tokio::time::timeout(
+                        let fetch_result = tokio::time::timeout(
                             std::time::Duration::from_secs(45),
                             current_client.get(&next_url).send(),
                         )
-                        .await
-                        {
-                            Ok(Ok(resp)) if resp.status().is_success() => {
-                                resp.text().await.unwrap_or_default()
-                            }
+                        .await;
+
+                        html = match fetch_result {
                             Ok(Ok(resp)) => {
-                                if resp.status() == 404 {
-                                    break;
+                                if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                                    tokio::time::sleep(delay).await;
                                 }
-                                String::new()
+                                if resp.status().is_success() {
+                                    resp.text().await.unwrap_or_default()
+                                } else if resp.status() == 404 {
+                                    break;
+                                } else {
+                                    String::new()
+                                }
                             }
                             _ => String::new(),
                         };

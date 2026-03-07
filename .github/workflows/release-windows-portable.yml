@@ -67,7 +67,9 @@ jobs:
           }
 
           Copy-Item -Path $exe.FullName -Destination (Join-Path $portableRoot "crawli.exe") -Force
-          Copy-Item -Path "src-tauri/bin/win_x64" -Destination $portableBin -Recurse -Force
+          if (Test-Path "src-tauri/bin/win_x64") {
+            Copy-Item -Path "src-tauri/bin/win_x64" -Destination $portableBin -Recurse -Force
+          }
 
           $zipPath = "portable-assets/crawli_${tag}_windows_x64_portable.zip"
           if (Test-Path $zipPath) {
@@ -88,7 +90,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             gh release create "$tag" `
               --title "Onion Forger $tag" `
-              --notes "Windows portable-only release package."
+              --notes "Windows portable-only native-Arti release package (no bundled Tor binaries)."
           }
 
           gh release upload "$tag" "$env:PORTABLE_ZIP" --clobber

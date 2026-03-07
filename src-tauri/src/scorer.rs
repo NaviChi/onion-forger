@@ -168,6 +168,30 @@ impl CircuitScorer {
         (total_b / total_ms) * 1000.0 / 1_048_576.0 // Convert bytes/ms to MB/s
     }
 
+    /// Phase 45: Select the best circuit for the next download chunk.
+    /// Uses Thompson Sampling scores with Kalman degradation avoidance.
+    pub fn best_circuit_for_url(&self, num_circuits: usize) -> usize {
+        let limit = num_circuits.min(self.capacity);
+        if limit == 0 {
+            return 0;
+        }
+
+        let mut best_cid = 0;
+        let mut best_score = f64::NEG_INFINITY;
+        for cid in 0..limit {
+            // Skip degrading circuits
+            if self.is_degrading(cid) {
+                continue;
+            }
+            let score = self.thompson_score(cid);
+            if score > best_score {
+                best_score = score;
+                best_cid = cid;
+            }
+        }
+        best_cid
+    }
+
     /// How long a circuit should wait before claiming the next URL target.
     /// Fast circuits: 0ms. Slow circuits: up to 1000ms.
     /// This naturally gives more work to faster circuits.

@@ -1,26 +1,16 @@
 use crawli_lib::adapters::{AdapterRegistry, EntryType, FileEntry, SiteFingerprint};
 use crawli_lib::aria_downloader::{self, BatchFileEntry};
 use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
-use crawli_lib::{path_utils, tor};
+use crawli_lib::telemetry_bridge::{self, TelemetryBridgeUpdate};
+use crawli_lib::{path_utils, tor, AppState};
 use reqwest::header::HeaderMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{Event, Listener};
+use tauri::{Event, Listener, Manager};
 
 const DEFAULT_LOCKBIT_URL: &str = "http://lockbit6vhrjaqzsdj6pqalyideigxv4xycfeyunpx35znogiwmojnid.onion/secret/212f70e703d758fbccbda3013a21f5de-f033da37-5fa7-31df-b10c-cc04b8538e85/jobberswarehouse.com/";
-
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchProgressPayload {
-    completed: usize,
-    failed: usize,
-    total: usize,
-    current_file: String,
-    pub speed_mbps: f64,
-    pub downloaded_bytes: u64,
-}
 
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
@@ -78,9 +68,12 @@ fn live_lockbit_pipeline_default_ui_settings() {
         );
 
         let app = tauri::Builder::default()
+            .manage(AppState::default())
             .build(tauri::generate_context!())
             .expect("build tauri app");
         let app_handle = app.handle().clone();
+        let bridge = app.state::<AppState>().telemetry_bridge.clone();
+        telemetry_bridge::spawn_bridge_emitter(app.handle().clone(), bridge);
 
         let completed = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicUsize::new(0));
@@ -96,15 +89,17 @@ fn live_lockbit_pipeline_default_ui_settings() {
         let c_downloaded = downloaded_bytes.clone();
         let c_speed = speed_mbps_x100.clone();
         let c_latest = latest_file.clone();
-        let batch_listener_id = app.listen_any("batch_progress", move |evt: Event| {
-            if let Ok(payload) = serde_json::from_str::<BatchProgressPayload>(evt.payload()) {
-                c_completed.store(payload.completed, Ordering::Relaxed);
-                c_failed.store(payload.failed, Ordering::Relaxed);
-                c_total.store(payload.total, Ordering::Relaxed);
-                c_downloaded.store(payload.downloaded_bytes, Ordering::Relaxed);
-                c_speed.store((payload.speed_mbps * 100.0).max(0.0) as u64, Ordering::Relaxed);
-                if let Ok(mut guard) = c_latest.lock() {
-                    *guard = payload.current_file;
+        let batch_listener_id = app.listen_any("telemetry_bridge_update", move |evt: Event| {
+            if let Ok(update) = serde_json::from_str::<TelemetryBridgeUpdate>(evt.payload()) {
+                if let Some(payload) = update.batch_progress {
+                    c_completed.store(payload.completed, Ordering::Relaxed);
+                    c_failed.store(payload.failed, Ordering::Relaxed);
+                    c_total.store(payload.total, Ordering::Relaxed);
+                    c_downloaded.store(payload.downloaded_bytes, Ordering::Relaxed);
+                    c_speed.store((payload.speed_mbps * 100.0).max(0.0) as u64, Ordering::Relaxed);
+                    if let Ok(mut guard) = c_latest.lock() {
+                        *guard = payload.current_file;
+                    }
                 }
             }
         });
@@ -203,18 +198,21 @@ fn live_lockbit_pipeline_default_ui_settings() {
             daemons: Some(4),
             agnostic_state: false,
             resume: false,
+            resume_index: None,
         };
 
         let daemon_count = active_ports.len().max(1);
+        let arti_clients = guard.get_arti_clients();
         let mut frontier = CrawlerFrontier::new(
             Some(app_handle.clone()),
             url.clone(),
             daemon_count,
             true,
             active_ports,
+            arti_clients,
             options,
         );
-        frontier.swarm_guard = Some(guard);
+        frontier.swarm_guard = Some(std::sync::Arc::new(tokio::sync::Mutex::new(guard)));
 
         println!("[STEP] Fingerprinting and selecting adapter...");
         let fp_start = Instant::now();

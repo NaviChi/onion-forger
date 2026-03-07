@@ -87,7 +87,7 @@ jobs:
           releaseName: Onion Forger ${{ github.event.inputs.tag || github.ref_name }}
           releaseBody: |
             Portable-first multi-platform release artifacts for Onion Forger.
-            - Windows: portable executable zip with bundled runtime dependencies
+            - Windows: portable executable zip for the native-Arti runtime (no bundled Tor binaries)
             - macOS: portable .app bundles
             - Linux: portable tarball + package artifacts
           releaseDraft: false
@@ -112,7 +112,9 @@ jobs:
           }
 
           Copy-Item -Path $exe.FullName -Destination (Join-Path $portableRoot "crawli.exe") -Force
-          Copy-Item -Path "src-tauri/bin/win_x64" -Destination $portableBin -Recurse -Force
+          if (Test-Path "src-tauri/bin/win_x64") {
+            Copy-Item -Path "src-tauri/bin/win_x64" -Destination $portableBin -Recurse -Force
+          }
 
           $zipPath = "portable-assets/crawli_${tag}_windows_x64_portable.zip"
           if (Test-Path $zipPath) {
@@ -155,7 +157,9 @@ jobs:
           mkdir -p "$portable_root/bin"
           cp "$portable_bin" "$portable_root/crawli"
           chmod +x "$portable_root/crawli"
-          cp -R src-tauri/bin/linux_x64 "$portable_root/bin/"
+          if [ -d "src-tauri/bin/linux_x64" ]; then
+            cp -R src-tauri/bin/linux_x64 "$portable_root/bin/"
+          fi
           out="portable-assets/crawli_${tag}_linux_x64_portable.tar.gz"
           tar -czf "$out" -C portable-assets "$(basename "$portable_root")"
           echo "PORTABLE_LINUX_ASSET=$out" >> "$GITHUB_ENV"

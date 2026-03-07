@@ -1,0 +1,16 @@
+{
+  "id": "example_autoindex_plugin",
+  "name": "Example Runtime Autoindex Plugin",
+  "host_pipeline": "autoindex",
+  "known_domains": [
+    "example-runtime.onion"
+  ],
+  "url_contains_any": [
+    "/files",
+    "/leak"
+  ],
+  "body_contains_all": [
+    "Index of /",
+    "Runtime Plugin Marker"
+  ]
+}

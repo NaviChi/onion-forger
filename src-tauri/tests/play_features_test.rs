@@ -195,6 +195,7 @@ async fn feature3_head_probing_simulation() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        Vec::new(),
         CrawlOptions {
             listing: true,
             sizes: true,
@@ -203,6 +204,7 @@ async fn feature3_head_probing_simulation() {
             daemons: None,
             agnostic_state: false,
             resume: false,
+            resume_index: None,
         },
     );
     let (_cid, client) = frontier.get_client();
@@ -235,6 +237,7 @@ async fn feature3_head_probing_simulation() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        Vec::new(),
         CrawlOptions {
             listing: true,
             sizes: false,
@@ -243,6 +246,7 @@ async fn feature3_head_probing_simulation() {
             daemons: None,
             agnostic_state: false,
             resume: false,
+            resume_index: None,
         },
     );
     assert!(!frontier_no_sizes.active_options.sizes);
@@ -555,6 +559,7 @@ async fn feature9_sustained_load_120_workers() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        Vec::new(),
         CrawlOptions {
             listing: true,
             sizes: true,
@@ -563,6 +568,7 @@ async fn feature9_sustained_load_120_workers() {
             daemons: None,
             agnostic_state: false,
             resume: false,
+            resume_index: None,
         },
     ));
 

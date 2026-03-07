@@ -74,6 +74,8 @@ const geomTargets = [
 async function getGeometry(page) {
   return page.evaluate((targets) => {
     const out = {};
+    const scrollX = window.scrollX || window.pageXOffset || 0;
+    const scrollY = window.scrollY || window.pageYOffset || 0;
     for (const target of targets) {
       const nodes = document.querySelectorAll(target.selector);
       const node = typeof target.index === "number" ? nodes[target.index] : nodes[0];
@@ -83,8 +85,8 @@ async function getGeometry(page) {
       }
       const r = node.getBoundingClientRect();
       out[target.key] = {
-        x: Number(r.x.toFixed(2)),
-        y: Number(r.y.toFixed(2)),
+        x: Number((r.x + scrollX).toFixed(2)),
+        y: Number((r.y + scrollY).toFixed(2)),
         width: Number(r.width.toFixed(2)),
         height: Number(r.height.toFixed(2)),
       };
@@ -96,6 +98,7 @@ async function getGeometry(page) {
 function diffGeometry(before, after, tolerancePx) {
   const deltas = [];
   let unchanged = true;
+  const observed = [];
   for (const key of Object.keys(before)) {
     const b = before[key];
     const a = after[key];
@@ -107,6 +110,7 @@ function diffGeometry(before, after, tolerancePx) {
       dWidth: Number((a.width - b.width).toFixed(2)),
       dHeight: Number((a.height - b.height).toFixed(2)),
     };
+    observed.push(delta);
     const maxAbs = Math.max(
       Math.abs(delta.dx),
       Math.abs(delta.dy),
@@ -118,6 +122,28 @@ function diffGeometry(before, after, tolerancePx) {
       deltas.push(delta);
     }
   }
+
+  if (!unchanged && deltas.length > 0) {
+    const [first] = deltas;
+    const isUniformTranslation = deltas.every((delta) => {
+      return (
+        delta.dx === first.dx &&
+        delta.dy === first.dy &&
+        delta.dWidth === 0 &&
+        delta.dHeight === 0 &&
+        first.dWidth === 0 &&
+        first.dHeight === 0
+      );
+    });
+    if (isUniformTranslation) {
+      return {
+        unchanged: true,
+        deltas: [],
+        note: `Uniform scroll translation detected (dx=${first.dx}, dy=${first.dy}).`,
+      };
+    }
+  }
+
   return { unchanged, deltas };
 }
 
@@ -151,6 +177,27 @@ async function isLocatorDisabled(locator) {
     const ariaDisabled = (el.getAttribute("aria-disabled") || "").toLowerCase();
     return ariaDisabled === "true";
   });
+}
+
+async function ensureDynamicControlVisible(page, item) {
+  const tid = item.testId || "";
+  if (
+    tid !== "support-popover" &&
+    tid !== "btn-support-close" &&
+    !tid.startsWith("adapter-row-")
+  ) {
+    return;
+  }
+
+  const popover = page.locator('[data-testid="support-popover"]').first();
+  if ((await popover.count()) > 0) return;
+
+  const supportButton = page.locator('[data-testid="btn-support"]').first();
+  if ((await supportButton.count()) === 0) return;
+  if (await isLocatorDisabled(supportButton)) return;
+
+  await supportButton.click({ timeout: 5000, force: true });
+  await page.waitForTimeout(200);
 }
 
 function interactionPriority(item) {
@@ -308,6 +355,7 @@ async function runOverlayIntegrity() {
           geomDiff: [],
         };
 
+        await ensureDynamicControlVisible(page, item);
         const locator = await resolveLiveLocator(page, item);
         if (!locator) {
           row.status = "SKIP";
@@ -361,6 +409,8 @@ async function runOverlayIntegrity() {
           row.rootCause = `Geometry shifted beyond ${TOLERANCE_PX}px tolerance: ${cmp.deltas
             .map((d) => `${d.key}(dx=${d.dx},dy=${d.dy},dw=${d.dWidth},dh=${d.dHeight})`)
             .join("; ")}`;
+        } else if (cmp.note && row.status === "PASS") {
+          row.rootCause = `${row.rootCause} ${cmp.note}`.trim();
         }
 
         results.push(row);

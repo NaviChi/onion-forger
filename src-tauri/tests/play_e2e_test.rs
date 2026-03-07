@@ -446,6 +446,7 @@ async fn test_politeness_semaphore_bottleneck() {
         4,
         true,
         vec![9051, 9052, 9053, 9054],
+        Vec::new(),
         CrawlOptions {
             listing: true,
             sizes: true,
@@ -454,10 +455,12 @@ async fn test_politeness_semaphore_bottleneck() {
             daemons: None,
             agnostic_state: false,
             resume: false,
+            resume_index: None,
         },
     ));
 
-    // For high-speed onion crawling, semaphore capacity should track circuit pool.
+    // Under the resource governor, the frontier may intentionally keep the
+    // crawl worker ceiling below the raw client pool to preserve download headroom.
     let permits = frontier.politeness_semaphore.available_permits();
     let total_clients = frontier.http_clients.len();
     let worker_target = frontier.worker_target();
@@ -481,9 +484,10 @@ async fn test_politeness_semaphore_bottleneck() {
         println!("   💡 RECOMMENDATION: Increase politeness_semaphore to at least {} for full throughput", total_clients / 2);
     }
 
-    assert_eq!(permits, 120);
     assert_eq!(total_clients, 120);
-    assert_eq!(worker_target, 120);
+    assert_eq!(permits, worker_target);
+    assert!(permits <= total_clients);
+    assert!(permits >= 8);
 }
 
 // ═══════════════════════════════════════════════════════════════

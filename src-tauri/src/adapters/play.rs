@@ -59,7 +59,7 @@ impl CrawlerAdapter for PlayAdapter {
             }
         });
 
-        let max_concurrent = 120; // Massive worker-stealer parallel pool
+        let max_concurrent = frontier.recommended_listing_workers();
         let mut workers = tokio::task::JoinSet::new();
 
         let base_url = current_url.trim_end_matches('/').to_string();
@@ -76,6 +76,7 @@ impl CrawlerAdapter for PlayAdapter {
             let pending_clone = pending.clone();
 
             workers.spawn(async move {
+                let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
                 loop {
                     // Check cancellation before doing work
                     if f.is_cancelled() {
@@ -123,8 +124,12 @@ impl CrawlerAdapter for PlayAdapter {
                         });
 
                         // Fetch the HTML listing page
-                        let html = match client.get(&next_url).send().await {
-                            Ok(resp) => {
+                        let fetch_result = tokio::time::timeout(std::time::Duration::from_secs(45), client.get(&next_url).send()).await;
+                        let html = match fetch_result {
+                            Ok(Ok(resp)) => {
+                                if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                                    tokio::time::sleep(delay).await;
+                                }
                                 if resp.status().is_success() {
                                     match resp.text().await {
                                         Ok(body) => {
@@ -141,7 +146,7 @@ impl CrawlerAdapter for PlayAdapter {
                                     String::new()
                                 }
                             }
-                            Err(_) => {
+                            _ => {
                                 fetch_success = false;
                                 build_fallback_html()
                             }

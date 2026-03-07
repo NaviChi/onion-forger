@@ -1,5 +1,5 @@
-use crawli_lib::ghost_browser::{launch_tor_ghost_browser, extract_rendered_dom};
 use anyhow::Result;
+use crawli_lib::ghost_browser::{extract_rendered_dom, launch_tor_ghost_browser};
 
 fn main() -> Result<()> {
     println!("👻 Booting Ghost Browser Engine...");
@@ -12,7 +12,7 @@ fn main() -> Result<()> {
             return Err(e);
         }
     };
-    
+
     println!("✅ Chrome Sandboxed Engine Online (Proxy: 127.0.0.1:9051)");
 
     let test_url = "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed";
@@ -27,13 +27,17 @@ fn main() -> Result<()> {
             println!("--- HTML DUMP START ---");
             println!("{}", html_string);
             println!("--- HTML DUMP END ---");
-            
-            // Print a small snippet to prove we got the actual data table, 
+
+            // Print a small snippet to prove we got the actual data table,
             // not a blank screen waiting for JS.
             if html_string.contains("data-v-") || html_string.contains("el-table") {
-                println!("Confirmed: Vue/React data table is present in the extracted HTML structure.");
+                println!(
+                    "Confirmed: Vue/React data table is present in the extracted HTML structure."
+                );
             } else {
-                println!("Warning: The rendered HTML seems to be missing the known QData UI elements.");
+                println!(
+                    "Warning: The rendered HTML seems to be missing the known QData UI elements."
+                );
             }
         }
         Err(e) => {

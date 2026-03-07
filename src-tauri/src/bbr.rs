@@ -123,4 +123,16 @@ impl BbrController {
     pub fn current_active(&self) -> usize {
         self.active.load(Ordering::Relaxed)
     }
+
+    /// Dynamically calculates the optimal chunk size based on current network BDP.
+    /// Used by the Downloader for Phase 4.1 chunk sizing.
+    pub fn recommended_chunk_size(&self) -> u64 {
+        let max_bw_bps = self.max_bw_bps.load(Ordering::Relaxed);
+        let min_rtt_ms = self.min_rtt_ms.load(Ordering::Relaxed);
+        let bdp = max_bw_bps * min_rtt_ms;
+        // Target sending 2-4 BDPs worth of data per chunk to ensure the pipe stays full
+        // without bufferbloat. Bound it between 512KB and 50MB.
+        let target_chunk = bdp.saturating_mul(2);
+        target_chunk.clamp(524_288, 52_428_800)
+    }
 }
