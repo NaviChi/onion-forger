@@ -17,6 +17,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinSet;
 
 #[cfg(target_os = "windows")]
+use std::process::Command;
+
+#[cfg(target_os = "windows")]
 fn apply_windows_no_window(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
