@@ -79,6 +79,7 @@ jobs:
         run: npm ci --prefer-offline --no-audit --no-fund
 
       - name: Build and upload release assets
+        if: matrix.platform != 'windows-latest'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -94,6 +95,10 @@ jobs:
           prerelease: false
           includeUpdaterJson: false
           args: ${{ matrix.args }}
+
+      - name: Build Windows binary (no bundle)
+        if: matrix.platform == 'windows-latest'
+        run: npm run tauri -- build --no-bundle --ci
 
       - name: Package portable Windows executable
         if: matrix.platform == 'windows-latest'
@@ -122,6 +127,20 @@ jobs:
           }
           Compress-Archive -Path "$portableRoot/*" -DestinationPath $zipPath
           "PORTABLE_ZIP=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Ensure release exists for Windows portable upload
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.event.inputs.tag || github.ref_name }}"
+          gh release view "$tag" --json tagName > $null 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "$tag" `
+              --title "Onion Forger $tag" `
+              --notes "Portable-first multi-platform release artifacts for Onion Forger."
+          }
 
       - name: Upload portable Windows executable asset
         if: matrix.platform == 'windows-latest'
