@@ -1,6 +1,6 @@
 # OnionForge: AI Engineering & Context Reference
-> **Last Updated:** 2026-03-06T22:15 CST
-> **Version:** 2.1.7
+> **Last Updated:** 2026-03-07T15:37 CST
+> **Version:** 2.2.0
 > **Authors:** Navi (User), Antigravity (AI)
 
 This document serves as the master blueprint for any AI agent tasked with maintaining, extending, or recreating the OnionForge intelligence gathering application. It contains all critical architectural decisions, environment constraints, GUI styling instructions, and API behavioral knowledge required to build this system from scratch without guessing.
@@ -12,6 +12,11 @@ Current repo state note:
 - Piece-mode resume now supports bounded contiguous-span coalescing in `src-tauri/src/aria_downloader.rs`, while preserving the persisted per-piece truth model used for safe restarts.
 - A comprehensive CLI adapter test harness (`examples/adapter_test.rs`) is available for per-adapter live crawl verification. Run `cargo run --example adapter_test -- --help` for usage. It supports `--adapter`, `--all`, `--url` override, `--circuits`, `--timeout-seconds`, `--daemons`, and `--json` modes. The harness automatically classifies zero-entry results into failure categories with suggested remediation actions.
 - Background tasks in Tauri `setup()` MUST use `tauri::async_runtime::spawn`, not `tokio::spawn`. The tokio reactor is not registered on the macOS main thread during `didFinishLaunching`.
+- **Phase 52 (Mega.nz + Torrent):** The system now supports Mega.nz public links and BitTorrent magnet/`.torrent` inputs as first-class features. Two new modules: `mega_handler.rs` (AES-128-CTR via `mega` crate, recursive `Nodes::get_node_by_handle()` tree walking) and `torrent_handler.rs` (bencode parsing via `lava_torrent`, magnet parsing via `magnet_url` v3.0). Both produce canonical `FileEntry` structs. Auto-detection runs in `start_crawl` and via `detect_input_mode` Tauri command. Frontend has permanent Mega.nz / Torrent buttons with auto-detect.
+- **Prevention Rule (PR-MEGA-001):** Never persist Mega.nz encryption keys to disk.
+- **Prevention Rule (PR-TORRENT-001):** Never route BitTorrent traffic through Tor.
+- **Prevention Rule (PR-MEGA-003):** When a dependency crate requires a conflicting major version of a shared crate, use Cargo's `package` rename feature.
+
 
 ---
 
@@ -58,6 +63,9 @@ The app creates exactly `N` native Arti `TorClient`s in-process. The Rust hot pa
 The user inputs a `.onion` URL. The `AdapterRegistry` hits the endpoint to read the HTTP Header and HTML Body (the `SiteFingerprint`). It matches this fingerprint to a specialized adapter (e.g., `qilin.rs`, `play.rs`, `autoindex.rs`).
 The Adapter utilizes `tokio` workers to crawl the site, extracting `FileEntry` objects.
 *   **Prevention Rule:** Some nodes capitalize protocols (`HTTP://`). ALWAYS use `.to_lowercase()` when parsing URLs so the router doesn't accidentally discard safe links.
+*   **Prevention Rule (PR-PARSER-003):** If a target site transitions from a generic autoindex to a custom SPA structure (e.g., LockBit 5.0 transitioning to `<table id="list">`), do NOT modify parsing logic inside shared utility files. You must forcefully detach the site from the generic `AutoindexAdapter` and build a bespoke, deterministic DOM scraper specifically inside its adapter file (e.g., `adapters/lockbit.rs`).
+*   **Prevention Rule (PR-EXPLORER-001):** The `AdaptiveUniversalExplorer` (Tier-4 intelligent fallback) performs speculative prefetch using `JoinSet`. The prefetch MUST BE capped at `max_prefetch = 6` links to avoid overwhelming the concurrent Tor circuits.
+*   **Prevention Rule (PR-EXPLORER-002):** The Universal Explorer uses `TargetLedger` to store learned prefixes. Any previously successful URL prefixes MUST receive a massive heuristic score boost (e.g., `+1000`) for priority discovery to quickly re-traverse known structure on subsequent runs.
 *   **Implementation Note:** Non-Qilin adapters no longer choose their own listing worker count. They must call `frontier.recommended_listing_workers()` so the swarm budget stays aligned across adapters.
 *   **Implementation Note:** `qilin.rs` now runs a local adaptive page governor around directory enumeration. It classifies `429`/`503`, hidden-service circuit failures, generic HTTP failures, and timeouts separately and rebalances active HTML workers every few seconds instead of holding a fixed page-worker ceiling.
 *   **Implementation Note:** `qilin_nodes.rs` is a persistent tournament cache, not a flat mirror list. It stores success/failure/cooldown state per storage host in sled, revalidates sticky winners first, then probes the tournament head before opening fallback candidates.

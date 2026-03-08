@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use crawli_lib::aria_downloader;
-use crawli_lib::aria_downloader::DownloadState;
+use crawli_lib::aria_downloader::{BatchFileEntry, DownloadState};
 use crawli_lib::AppState;
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -56,14 +56,20 @@ async fn main() -> Result<()> {
     println!("[1/5] Starting piece-mode download against local deterministic range server...");
     let control = aria_downloader::activate_download_control()
         .ok_or_else(|| anyhow!("download control already active"))?;
+    let jwt_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let first_pass = tokio::spawn(aria_downloader::start_download(
         app.handle().clone(),
-        url.clone(),
-        output_path.clone(),
+        BatchFileEntry {
+            url: url.clone(),
+            path: output_path.clone(),
+            size_hint: None,
+            jwt_exp: None,
+        },
         4,
         false,
         None,
         control,
+        Arc::clone(&jwt_cache),
     ));
 
     let checkpoint = wait_for_piece_checkpoint(&state_target, Duration::from_secs(45)).await?;
@@ -96,14 +102,20 @@ async fn main() -> Result<()> {
     println!("[3/5] Resuming piece-mode download...");
     let control = aria_downloader::activate_download_control()
         .ok_or_else(|| anyhow!("download control already active before resume"))?;
+    let jwt_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     aria_downloader::start_download(
         app.handle().clone(),
-        url,
-        output_path.clone(),
+        BatchFileEntry {
+            url,
+            path: output_path.clone(),
+            size_hint: None,
+            jwt_exp: None,
+        },
         4,
         false,
         None,
         control,
+        jwt_cache,
     )
     .await?;
     aria_downloader::clear_download_control();

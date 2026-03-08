@@ -45,6 +45,7 @@ const DEFAULT_ARTI_PREEMPTIVE_THRESHOLD: usize = 6;
 const DEFAULT_ARTI_PREEMPTIVE_MIN_EXIT_CIRCS: usize = 1;
 const DEFAULT_ARTI_PREEMPTIVE_PREDICTION_LIFETIME_SECS: u64 = 20 * 60;
 const DEFAULT_ARTI_PREEMPTIVE_PORTS: &[u16] = &[80, 443];
+#[allow(dead_code)]
 const DEFAULT_ARTI_ACTIVE_TARGET_MAX: usize = 24;
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -106,6 +107,7 @@ fn memory_monitor_interval_secs() -> u64 {
         .clamp(5, 120)
 }
 
+#[allow(dead_code)]
 fn adaptive_bootstrap_plan(requested: usize) -> (usize, usize) {
     let budget = crate::resource_governor::recommend_bootstrap_budget(requested, None, None);
     let hard_cap = env_usize("CRAWLI_ARTI_ACTIVE_TARGET_MAX")
@@ -129,7 +131,7 @@ fn preemptive_ports() -> Vec<u16> {
         .unwrap_or_else(|| DEFAULT_ARTI_PREEMPTIVE_PORTS.to_vec())
 }
 
-fn build_tor_config(node_index: usize) -> Result<TorClientConfig> {
+pub fn build_tor_config(node_index: usize) -> Result<TorClientConfig> {
     let state_root = state_root();
 
     let cache_dir = state_root.join(format!("arti/node_{}/cache", node_index));
@@ -408,6 +410,9 @@ async fn probe_client_connectivity(
     probe_port: u16,
 ) -> Result<f64> {
     let tor_client = { client_slot.read().await.clone() };
+    if probe_host.eq_ignore_ascii_case("none") {
+        return Ok(10.0);
+    }
     let mut prefs = arti_client::StreamPrefs::new();
     prefs.connect_to_onion_services(arti_client::config::BoolOrAuto::Explicit(true));
 

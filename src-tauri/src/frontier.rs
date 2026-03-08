@@ -26,6 +26,9 @@ pub struct CrawlOptions {
     pub resume: bool,
     #[serde(default)]
     pub resume_index: Option<String>,
+    /// Optional password for Mega.nz password-protected links (#P! format)
+    #[serde(default)]
+    pub mega_password: Option<String>,
 }
 
 impl Default for CrawlOptions {
@@ -39,6 +42,7 @@ impl Default for CrawlOptions {
             agnostic_state: false,
             resume: false,
             resume_index: None,
+            mega_password: None,
         }
     }
 }
@@ -85,6 +89,9 @@ pub struct CrawlerFrontier {
 
     // Phase 49: Circuit Starvation Failsafe — dead circuits get blacklisted for 60s
     pub circuit_blacklist: DashMap<usize, std::time::Instant>,
+
+    // Phase 58: Universal Explorer Prefix Learning Ledger Integration
+    pub target_paths: Option<crate::target_state::TargetPaths>,
 }
 
 fn sanitize_filename(url: &str) -> String {
@@ -126,6 +133,7 @@ impl CrawlerFrontier {
         _active_ports: Vec<u16>,
         arti_clients: Vec<crate::tor_native::SharedTorClient>,
         options: CrawlOptions,
+        target_paths: Option<crate::target_state::TargetPaths>,
     ) -> Self {
         if num_daemons == 0 {
             num_daemons = 4;
@@ -323,6 +331,7 @@ impl CrawlerFrontier {
             wal_tx,
             delta_new_files: AtomicUsize::new(0),
             circuit_blacklist: DashMap::new(),
+            target_paths,
         }
     }
 
@@ -538,5 +547,10 @@ impl CrawlerFrontier {
                 }
             }
         }
+    }
+
+    /// Accessor for the persistent Target Ledger pathing logic
+    pub fn target_paths(&self) -> Option<&crate::target_state::TargetPaths> {
+        self.target_paths.as_ref()
     }
 }

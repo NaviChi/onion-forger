@@ -1,4 +1,22 @@
-> **Last Updated:** 2026-03-06T02:12 CST
+> **Last Updated:** 2026-03-07T15:37 CST
+
+## Phase 52: Mega.nz + Torrent Integration Recommendation (2026-03-07)
+
+**Status: Phase 52A+52B+52C Implemented — Backend + Frontend + Integration Tests**
+
+Recommendations now active:
+- Mega.nz and BitTorrent downloads must operate over clearnet, never through Tor. Both protocols have their own encryption (AES-128-CTR for Mega, BitTorrent protocol encryption) and routing Tor traffic through them would cause severe performance degradation.
+- Auto-detection should be instant (synchronous on keystroke) and input-field-centric. Users should never need to select a mode manually before pasting a URL.
+- Mega.nz decryption keys exist only in the URL fragment (`#key`). Never persist them to disk or log them to telemetry.
+- `.torrent` files must be size-guarded (≤10MB) to prevent resource exhaustion attacks via crafted torrent files.
+- When a dependency crate requires a different major version of a shared dependency, use Cargo's `package` rename feature. Never attempt to unify version constraints when APIs are incompatible.
+- Future Phase 52D should use `librqbit` for the actual BitTorrent piece download engine. Current magnet support is listing-only.
+
+Next recommended steps (Phase 52D):
+- Integrate `librqbit` for real BitTorrent piece-mode downloads with progress tracking
+- Add Mega.nz download progress integration with the existing batch telemetry bridge
+- Consider adding `.torrent` file drag-and-drop support in the frontend
+
 
 Version: 1.0.8
 Updated: 2026-03-06
@@ -381,3 +399,27 @@ We rolled out the complete military-grade predictive pacing suite inside `qilin_
 
 **Prevention Rule Enforced:**
 `PR-UNIFIED-ARCH-001`: Subcomponents must never drop down to rudimentary "sleep and fetch" execution. If a new module is built, it MUST instantiate `DdosGuard` (for EKF pacing) or `BbrController` (for sizing).
+
+### Phase 51F: Multi-Client Parallel Crawling
+**Architecture Implementation:**
+A dedicated `MultiClientPool` was engineered to instantiate and isolate multiple independent Arti `TorClient`s concurrently (default: 4 clients for a 4 GB RAM bound).
+- **Load-Balancer Bypass**: By routing concurrent worker requests through fundamentally distinct Tor exit nodes and Guard relays via isolated client instances, load-balancer affinity throttling and single-client Guard-relay congestion are bypassed entirely.
+- **Resource Harmony**: This connects seamlessly to the Phase 51E Resource Governor to ensure raw memory usage per active client does not exceed container ceilings.
+- **Circuit Healing**: Complete client rotation requests flow through the pre-existing smart healing engine to destroy and regenerate fully tainted client stacks when hard IP-blocks are encountered.
+
+**Key Prevention Rules (Enforced and Logged):**
+- **PR-MULTICLIENT-001:** Never exceed 4 active TorClients on 4 GB RAM VMs to prevent NT Kernel OOM exhaustion. This boundary is rigidly enforced by the new Resource Governor instantiation constraints.
+- **PR-MULTICLIENT-002:** Client rotations must strictly utilize the shared healing engine to prevent "orphan" clients and silent memory leaks.
+
+## Phase 58: DragonForce Iframe & Downloader JWT Expiry Resolution (2026-03-07)
+
+### Sub-Domain Routing Constraint (`fsguest...onion` Iframe)
+*   **Problem:** The DragonForce Next.js wrapper (`dragonforxx...onion`) secures its file allocation table inside an isolated Tor iframe subset (`fsguest...onion`). The `arti_client`'s native multiplexing treats the subdomain as an untrusted hop and drops the circuit connection.
+*   **Aerospace Solution (Stream Isolation Decoupling):** The `ArtiClient` must be explicitly configured to permit multi-domain traversal within the *same* circuit session when tracking `iframe src=` targets. If `StreamIsolation` boundaries cannot be natively bridged, an out-of-process `SOCKS5` Daemon sidecar (e.g., `127.0.0.1:9050`) must be used for DragonForce specifically, as standalone daemons handle dynamic `.onion` jumps natively without terminating the TCP application socket.
+
+### Downloader Token Refresh (`JWT Expiry`)
+*   **Problem:** We have successfully integrated JWT decoding into the crawler's (`FileEntry`) `jwt_exp` payload. However, large downloads may sit in the active queue for hours. When `aria_downloader.rs` attempts to pull a file, the Token will return an HTTP 403 Forbidden.
+*   **HFT Solution (Stateful Token Refresh):**
+    *   **Pre-Flight Expiry Check:** Before establishing the `GET Range` HTTP stream, the downloader must evaluate `entry.jwt_exp < SystemTime::now()`.
+    *   **Parent-Node Hydration:** If the token is dead, the downloader must *intercept* the pull and recursively issue a lightweight `GET` request back to the file's parent directory (`/?path=/parent/folder`). Extracting the fresh HTML yields an entirely new encrypted JWT. 
+    *   **In-Flight Substitution:** The downloader physically mutates the `entry.raw_url` with the fresh token and resumes the chunk transfer seamlessly.

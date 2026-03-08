@@ -1,4 +1,25 @@
-> **Last Updated:** 2026-03-06T22:15 CST
+> **Last Updated:** 2026-03-07T15:37 CST
+
+## Phase 52(M/T): Mega.nz + Torrent Integration (2026-03-07)
+Implemented in this pass:
+- **`mega_handler.rs`:** Mega.nz link detection (new + legacy + co.nz), URL parsing, recursive node-tree traversal via `Nodes::get_node_by_handle()`, and `mega_crawl()` producing canonical `FileEntry` structs.
+- **`torrent_handler.rs`:** `.torrent` file parsing (`lava_torrent`), magnet URI parsing (`magnet_url` v3.0 accessor API), `detect_input_mode()` combined routing, and `torrent_files_to_entries()` directory reconstruction.
+- **`lib.rs` wiring:** `start_crawl` auto-routes Mega/Torrent inputs before adapter selection. New `detect_input_mode` Tauri command registered.
+- **Frontend (App.tsx):** `inputMode` state, URL auto-detect on `onChange`, permanent `Cloud`/`Magnet` toolbar buttons, mode-aware labels.
+- **CSS (App.css):** `.tool-btn.active` glow.
+- **Cargo.toml:** Added `mega` v0.8, `reqwest_mega` (v0.12 renamed), `lava_torrent` v0.11, `magnet-url` v3.0.
+- **Integration tests:** `tests/mega_torrent_test.rs` — 25 test cases.
+
+Validated behavior:
+- `cargo test --lib` → 51/51 pass
+- `cargo test --test mega_torrent_test` → 25/25 pass
+- `npm run build` → 0 errors
+
+New files:
+- `src-tauri/src/mega_handler.rs`
+- `src-tauri/src/torrent_handler.rs`
+- `src-tauri/tests/mega_torrent_test.rs`
+
 
 Version: 1.0.19
 Updated: 2026-03-06
@@ -616,3 +637,47 @@ We rolled out the complete military-grade predictive pacing suite inside `qilin_
 
 **Prevention Rule Enforced:**
 `PR-UNIFIED-ARCH-001`: Subcomponents must never drop down to rudimentary "sleep and fetch" execution. If a new module is built, it MUST instantiate `DdosGuard` (for EKF pacing) or `BbrController` (for sizing).
+
+### Phase 51F: Multi-Client Parallel Crawling
+**Architecture Implementation:**
+A dedicated `MultiClientPool` was engineered to instantiate and isolate multiple independent Arti `TorClient`s concurrently (default: 4 clients for a 4 GB RAM bound).
+- **Load-Balancer Bypass**: By routing concurrent worker requests through fundamentally distinct Tor exit nodes and Guard relays via isolated client instances, load-balancer affinity throttling and single-client Guard-relay congestion are bypassed entirely.
+- **Resource Harmony**: This connects seamlessly to the Phase 51E Resource Governor to ensure raw memory usage per active client does not exceed container ceilings.
+- **Circuit Healing**: Complete client rotation requests flow through the pre-existing smart healing engine to destroy and regenerate fully tainted client stacks when hard IP-blocks are encountered.
+
+**Key Prevention Rules (Enforced and Logged):**
+- **PR-MULTICLIENT-001:** Never exceed 4 active TorClients on 4 GB RAM VMs to prevent NT Kernel OOM exhaustion. This boundary is rigidly enforced by the new Resource Governor instantiation constraints.
+- **PR-MULTICLIENT-002:** Client rotations must strictly utilize the shared healing engine to prevent "orphan" clients and silent memory leaks.
+
+
+### Phase 51G: MultiClientPool Pre-Heating
+**Architecture Upgrade:**
+It was discovered that during high-load deployment, unleashing 60+ concurrent crawling workers onto a completely fresh ``MultiClientPool`` resulted in complete HS Descriptor path-building stalling due to Arti internal rate limiting and `.onion` descriptor resolution congestion. This would silently manifest as blanket HTTP 45s timeouts on all workers. 
+
+To surgically solve this, a `Concurrent Pre-heating` phase was introduced to `qilin.rs`. Before releasing the workers, a dedicated async task spawns on each isolated TorClient in the pool to dispatch exactly *one* connection to the resolved storage mirror. This forces the Arti instances to independently safely build their Tor Consensus, Microdescriptors, and cache the target `Rendezvous circuits` in advance. Once all complete (typically ~10-15s), the workers are unleashed to find pre-warmed network routing paths, pushing the scraping speed to maximum capacity without triggering Tor network drops.
+
+## 17. LockBit 5.0 Leak Site SPA Extractor Fix
+*   **Context:** `lockbit24peg...onion` failed to extract files. Analysis revealed the `LockBitAdapter` relied blindly on the generic `AutoindexAdapter`, but LockBit had changed its frontend DOM to a custom SPA structure containing `<table id="list">` and `tr.item` rows without traditional standard Nginx `href` indices.
+*   **HFT Solution (Custom DOM Determinism & Offline Fallback Tracking):**
+    *   **Isolated Scraper Engine:** Decoupled `LockBitAdapter` from `AutoindexAdapter`. Created a deterministic `parse_lockbit_dom` scraper specifically scanning for the custom LockBit `tr.item` rows alongside exact byte conversion for strings like `15.2 MB`.
+    *   **Robust `Url::join` Root Resolution:** Fixed critical infinite-recursion defects where manual string formatting resulted in dynamically expanding URLs (`/123/123/123/`) by transitioning strictly to Rust's native `url::Url::join` logic.
+    *   **Offline Mock Simulation Test:** Introduced `build_fallback_html()` directly inside the `adapters/lockbit.rs` file. When the Tor client triggers `client error (Connect)` due to the hidden service going completely offline, the system safely triggers the mock HTML fallback mechanism. The `test_e2e_lockbit.rs` integration binary utilizes this to validate full tree extraction robustness seamlessly without flaky timeouts.
+
+## Section 18: Adaptive Universal Explorer (Phase 60)
+
+### Overview
+Integrated a Tier-4 intelligent fallback adapter (`universal_explorer.rs`) at the tail of the M.A.C. (Multi-Adapter Cascade). When no specialized adapter matches a target's `SiteFingerprint`, the Explorer takes over and heuristically discovers site structure by following hyperlinks.
+
+### Architecture
+- **ScoredLink BinaryHeap**: Links are scored based on URL path keywords (`/file`, `/data`, `/archive`) and anchor text signals (`download`, `file`). High-value extensions (`.zip`, `.rar`, `.7z`, `.sql`) receive bonus scores.
+- **Assassin JoinSet Prefetch**: Top 6 scored children are speculatively pre-fetched in parallel via `tokio::task::JoinSet` to warm up Tor circuits. After the first response, remaining tasks are aborted to conserve bandwidth.
+- **TargetLedger Learning**: `learned_prefixes` stored in the persistent JSON ledger award a `+1000` score boost on subsequent crawl runs, ensuring known-good paths are prioritized instantly.
+
+### Integration Points
+- `target_state.rs`: Added `TargetLedger::get_learned_prefix_boost(&self, url)` method.
+- `adapters/mod.rs`: Added `AdapterRegistry::with_explorer_context(ledger)` builder pattern — preserves backward compatibility with 6 existing CLI binaries.
+- `lib.rs`: `execute_crawl_attempt` now accepts `Arc<TargetLedger>` and chains the explorer context before adapter determination.
+
+### Bugs Fixed During Integration
+1. **`scraper::Html` not `Send`**: `Html::parse_document` returns a type that is `!Send`, violating `async_trait`'s `Send` bound when held across `.await`. Fixed by confining all DOM operations to a synchronous scope block, ensuring `Html` is dropped before any `JoinSet` `.await`.
+2. **`host_str()` borrow-of-closure-parameter**: `Url::parse(root).ok().and_then(|u| u.host_str())` attempted to return a reference to closure-owned data. Fixed by cloning to owned `String` before comparison.

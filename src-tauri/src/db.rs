@@ -173,6 +173,7 @@ impl SledVfs {
                             seen_dirs.insert(dir_name.clone());
                             let virtual_dir_path = format!("{}{}", prefix, dir_name);
                             entries.push(FileEntry {
+                                jwt_exp: None,
                                 path: virtual_dir_path,
                                 size_bytes: None,
                                 entry_type: crate::adapters::EntryType::Folder,

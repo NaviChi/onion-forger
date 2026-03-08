@@ -205,7 +205,9 @@ async fn feature3_head_probing_simulation() {
             agnostic_state: false,
             resume: false,
             resume_index: None,
+            mega_password: None,
         },
+        None,
     );
     let (_cid, client) = frontier.get_client();
 
@@ -247,7 +249,9 @@ async fn feature3_head_probing_simulation() {
             agnostic_state: false,
             resume: false,
             resume_index: None,
+            mega_password: None,
         },
+        None,
     );
     assert!(!frontier_no_sizes.active_options.sizes);
     println!("  ✅ sizes=false correctly propagated — HEAD probing will be skipped");
@@ -276,6 +280,7 @@ async fn feature4_folder_entry_emission() {
     entries.push(FileEntry {
         path: format!("/{}", dir),
         size_bytes: None,
+        jwt_exp: None,
         entry_type: EntryType::Folder,
         raw_url: "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp"
             .to_string(),
@@ -286,6 +291,7 @@ async fn feature4_folder_entry_emission() {
         entries.push(FileEntry {
             path: format!("/{}/2 Sally Personal.part{:02}.rar", dir, i),
             size_bytes: Some(if i == 11 { 60844542 } else { 524288000 }),
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: format!(
                 "http://play.onion/FALOp/2%20Sally%20Personal.part{:02}.rar",
@@ -381,24 +387,28 @@ async fn feature6_full_scaffold_sanitized() {
         FileEntry {
             path: "/FALOp".to_string(),
             size_bytes: None,
+            jwt_exp: None,
             entry_type: EntryType::Folder,
             raw_url: "http://play.onion/FALOp".to_string(),
         },
         FileEntry {
             path: "/FALOp/2%20Sally%20Personal.part01.rar".to_string(),
             size_bytes: Some(524288000),
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/FALOp/2%20Sally%20Personal.part01.rar".to_string(),
         },
         FileEntry {
             path: "/FALOp/file<with>bad?chars.rar".to_string(),
             size_bytes: Some(100),
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/FALOp/file<with>bad?chars.rar".to_string(),
         },
         FileEntry {
             path: "/FALOp/CON".to_string(),
             size_bytes: None,
+            jwt_exp: None,
             entry_type: EntryType::Folder,
             raw_url: "http://play.onion/FALOp/CON".to_string(),
         },
@@ -466,6 +476,7 @@ async fn feature7_manifest_decoded_paths() {
     let entries = vec![FileEntry {
         path: "/FALOp/2%20Sally%20Personal.part01.rar".to_string(),
         size_bytes: Some(524288000),
+        jwt_exp: None,
         entry_type: EntryType::File,
         raw_url: "http://play.onion/FALOp/2%20Sally%20Personal.part01.rar".to_string(),
     }];
@@ -507,6 +518,7 @@ async fn feature8_resume_safety() {
     let entries = vec![FileEntry {
         path: "/FALOp/test_resume.rar".to_string(),
         size_bytes: Some(1000),
+        jwt_exp: None,
         entry_type: EntryType::File,
         raw_url: "http://play.onion/test_resume.rar".to_string(),
     }];
@@ -569,7 +581,9 @@ async fn feature9_sustained_load_120_workers() {
             agnostic_state: false,
             resume: false,
             resume_index: None,
+            mega_password: None,
         },
+        None,
     ));
 
     let start = Instant::now();
@@ -645,6 +659,7 @@ async fn feature10_edge_cases_comprehensive() {
         FileEntry {
             path: "/FALOp/données_confidentielles.zip".to_string(),
             size_bytes: Some(1024),
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/FALOp/donn%C3%A9es_confidentielles.zip".to_string(),
         },
@@ -652,6 +667,7 @@ async fn feature10_edge_cases_comprehensive() {
         FileEntry {
             path: "/FALOp/机密文件.pdf".to_string(),
             size_bytes: Some(2048),
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/FALOp/%E6%9C%BA%E5%AF%86%E6%96%87%E4%BB%B6.pdf".to_string(),
         },
@@ -659,6 +675,7 @@ async fn feature10_edge_cases_comprehensive() {
         FileEntry {
             path: "/a/b/c/d/e/f/deep_file.log".to_string(),
             size_bytes: Some(42),
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/a/b/c/d/e/f/deep_file.log".to_string(),
         },
@@ -666,6 +683,7 @@ async fn feature10_edge_cases_comprehensive() {
         FileEntry {
             path: "".to_string(),
             size_bytes: None,
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/".to_string(),
         },
@@ -673,6 +691,7 @@ async fn feature10_edge_cases_comprehensive() {
         FileEntry {
             path: "/FALOp/empty.bin".to_string(),
             size_bytes: None,
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/FALOp/empty.bin".to_string(),
         },
@@ -680,6 +699,7 @@ async fn feature10_edge_cases_comprehensive() {
         FileEntry {
             path: "/<>:\"?*".to_string(),
             size_bytes: None,
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/<>:\"?*".to_string(),
         },
@@ -687,6 +707,7 @@ async fn feature10_edge_cases_comprehensive() {
         FileEntry {
             path: "/FALOp/zero_byte.txt".to_string(),
             size_bytes: Some(0),
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/FALOp/zero_byte.txt".to_string(),
         },
@@ -769,6 +790,7 @@ async fn full_pipeline_benchmark_all_features() {
     entries.push(FileEntry {
         path: format!("/{}", dir_name),
         size_bytes: None,
+        jwt_exp: None,
         entry_type: EntryType::Folder,
         raw_url: fp.url.clone(),
     });
@@ -777,6 +799,7 @@ async fn full_pipeline_benchmark_all_features() {
         entries.push(FileEntry {
             path: format!("/{}/{}", dir_name, path_utils::sanitize_path(name)),
             size_bytes: *size,
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: format!("http://play.onion/FALOp/{}", encoded),
         });

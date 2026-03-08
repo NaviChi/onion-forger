@@ -8,6 +8,13 @@ use tokio::sync::mpsc;
 #[derive(Default)]
 pub struct DragonForceAdapter;
 
+impl DragonForceAdapter {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[allow(dead_code)]
 fn recursive_extract_json(
     val: &serde_json::Value,
     entries: &mut Vec<FileEntry>,
@@ -53,6 +60,7 @@ fn recursive_extract_json(
                     );
 
                     entries.push(FileEntry {
+                        jwt_exp: None,
                         path: path.clone(),
                         size_bytes,
                         entry_type: if is_dir {
@@ -78,7 +86,41 @@ fn recursive_extract_json(
     }
 }
 
+fn extract_jwt_expiry(url: &str) -> Option<u64> {
+    use base64::Engine;
+    if let Some(token_start) = url.find("token=") {
+        let token_str = &url[token_start + 6..];
+        let jwt = token_str.split('&').next().unwrap_or("");
+        let parts: Vec<&str> = jwt.split('.').collect();
+        if parts.len() == 3 {
+            let payload = parts[1];
+            let mut padded_payload = payload.to_string();
+            if padded_payload.len() % 4 != 0 {
+                padded_payload.push_str(&"=".repeat(4 - padded_payload.len() % 4));
+            }
+            if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&padded_payload))
+            {
+                if let Ok(json_str) = String::from_utf8(decoded) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        return value.get("exp").and_then(|v| v.as_u64());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> Vec<FileEntry> {
+    let html_len = html.len();
+    let start_idx = html_len.saturating_sub(4000);
+    println!(
+        "[DEBUG DRAGONFORCE PARSER] Raw HTML end ({} bytes): {}",
+        html_len,
+        &html[start_idx..]
+    );
     let mut entries = Vec::new();
 
     if html.contains("<iframe") {
@@ -96,6 +138,7 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
                 };
 
                 entries.push(FileEntry {
+                    jwt_exp: None,
                     path: "/_bridge".to_string(),
                     size_bytes: None,
                     entry_type: EntryType::Folder,
@@ -106,33 +149,36 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
         }
     }
 
-    let token = if let Some(t_idx) = current_url.find("token=") {
-        current_url[t_idx + 6..].split('&').next().unwrap_or("")
-    } else {
-        ""
-    };
-
-    // Explicitly grab the `path=` param from the `current_url` so our recursion doesn't reset to root (`/`) when traversing nested JSON nodes sent from the server.
-    let current_path = if let Some(p_idx) = current_url.find("path=") {
-        urlencoding::decode(current_url[p_idx + 5..].split('&').next().unwrap_or(""))
-            .unwrap_or(std::borrow::Cow::Borrowed(""))
-            .into_owned()
-    } else {
-        String::new()
-    };
-
     let document = Html::parse_document(html);
 
-    let script_selector = Selector::parse("script#__NEXT_DATA__").unwrap();
-    if let Some(script) = document.select(&script_selector).next() {
-        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&script.inner_html()) {
-            recursive_extract_json(&json_val, &mut entries, current_path, host, token);
+    let next_data_selector = Selector::parse(r#"script#__NEXT_DATA__"#).unwrap();
+    if let Some(next_data) = document.select(&next_data_selector).next() {
+        let payload = next_data.text().collect::<Vec<_>>().join("");
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&payload) {
+            let token = current_url
+                .split("token=")
+                .nth(1)
+                .and_then(|value| value.split('&').next())
+                .unwrap_or("");
+            let current_path = current_url
+                .split("path=")
+                .nth(1)
+                .and_then(|value| value.split('&').next())
+                .map(|value| {
+                    urlencoding::decode(value)
+                        .unwrap_or(std::borrow::Cow::Borrowed(value))
+                        .into_owned()
+                })
+                .unwrap_or_default();
+
+            recursive_extract_json(&json, &mut entries, current_path, host, token);
             if !entries.is_empty() {
                 return entries;
             }
         }
     }
 
+    // Modern static DragonForce UI
     let item_selector = Selector::parse(".item").unwrap();
     let link_selector = Selector::parse("a.text-pointer-animations").unwrap();
     let size_selector = Selector::parse("div.size").unwrap();
@@ -142,7 +188,6 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
             let is_dir = link.value().classes().any(|c| c == "dir");
             let href = link.value().attr("href").unwrap_or("");
 
-            // Skip back link
             if href.starts_with("javascript:") {
                 continue;
             }
@@ -150,30 +195,31 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
             let raw_url = format!("http://{}{}", host, href);
 
             // Extract the path from the href
-            // href is like: /?path=RJZ-APP1/G/01%20RJZ&token=...
+            // href format: /?path=RJZ-APP1/G/01%20RJZ&token=...
             // or /download?path=RJZ-APP1/...&token=...
             let mut extracted_path = String::new();
             if let Some(path_start) = href.find("path=") {
                 let after_path = &href[path_start + 5..];
                 if let Some(path_end) = after_path.find("&token=") {
                     let encoded_path = &after_path[..path_end];
-
-                    // Robust URL decode instead of just replace("%20")
                     extracted_path = urlencoding::decode(encoded_path)
                         .unwrap_or(std::borrow::Cow::Borrowed(encoded_path))
+                        .to_string();
+                } else {
+                    extracted_path = urlencoding::decode(after_path)
+                        .unwrap_or(std::borrow::Cow::Borrowed(after_path))
                         .to_string();
                 }
             }
 
             if extracted_path.is_empty() {
-                continue; // Could not parse path
+                continue;
             }
 
             let path = format!("/{}", extracted_path.trim_start_matches('/'));
 
             let mut size_bytes = None;
             if !is_dir {
-                // Try to parse the exact byte size from `<b>...</b> (bytes)`
                 if let Some(size_div) = item.select(&size_selector).next() {
                     let text = size_div.text().collect::<Vec<_>>().join("");
                     if let Some(start) = text.find('(') {
@@ -186,7 +232,10 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
                 }
             }
 
+            let jwt_exp = extract_jwt_expiry(&raw_url);
+
             entries.push(FileEntry {
+                jwt_exp,
                 path,
                 size_bytes,
                 entry_type: if is_dir {
@@ -206,6 +255,106 @@ pub fn parse_dragonforce_fsguest(html: &str, host: &str, current_url: &str) -> V
 impl CrawlerAdapter for DragonForceAdapter {
     async fn can_handle(&self, fingerprint: &SiteFingerprint) -> bool {
         fingerprint.body.contains("fsguest") || fingerprint.body.contains("token=")
+    }
+
+    async fn refresh_jwt(
+        &self,
+        entry: &FileEntry,
+        client: &crate::arti_client::ArtiClient,
+    ) -> anyhow::Result<Option<FileEntry>> {
+        // Find the `path=` param.
+        let path_start = match entry.raw_url.find("path=") {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let after_path = &entry.raw_url[path_start + 5..];
+
+        let mut encoded_path = after_path;
+        if let Some(token_idx) = after_path.find("&token=") {
+            encoded_path = &after_path[..token_idx];
+        }
+
+        let decoded = urlencoding::decode(encoded_path)
+            .unwrap_or(std::borrow::Cow::Borrowed(encoded_path))
+            .to_string();
+
+        // Extract parent directory.
+        let mut parent_path = "/".to_string();
+        if let Some(last_slash) = decoded.rfind('/') {
+            if last_slash > 0 {
+                parent_path = decoded[..last_slash].to_string();
+            }
+        }
+
+        // Construct parent URL.
+        let host = if let Ok(u) = url::Url::parse(&entry.raw_url) {
+            u.host_str().unwrap_or("").to_string()
+        } else {
+            return Ok(None);
+        };
+
+        // We do a fresh GET to the root `/?path=/parent` to force a NextNode regeneration.
+        // E.g., http://fsguest...onion/?path=/parent/directory
+        let fetch_url = format!(
+            "http://{}/?path={}",
+            host,
+            urlencoding::encode(&parent_path)
+        );
+
+        println!(
+            "[DEBUG DRAGONFORCE] Refreshing JWT Token for {}. Upstream parent: {}",
+            entry.path, fetch_url
+        );
+
+        let resp = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.get(&fetch_url).send(),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                println!("[CRIT DRAGONFORCE REFRESH] HTTP client error: {}", e);
+                return Ok(None);
+            }
+            Err(_) => {
+                println!("[CRIT DRAGONFORCE REFRESH] Artifact path discovery timeout.");
+                return Ok(None);
+            }
+        };
+
+        if !resp.status().is_success() {
+            println!(
+                "[CRIT DRAGONFORCE REFRESH] Non-success status: {}",
+                resp.status()
+            );
+            return Ok(None);
+        }
+
+        let html = match resp.text().await {
+            Ok(txt) => txt,
+            Err(_) => return Ok(None),
+        };
+
+        // Parse children of the parent. We only want our specific file/folder back.
+        let newly_parsed = parse_dragonforce_fsguest(&html, &host, &fetch_url);
+
+        for mut child in newly_parsed {
+            if child.path == entry.path {
+                println!(
+                    "[DEBUG DRAGONFORCE] Successfully refreshed Token for: {}",
+                    entry.path
+                );
+                child.size_bytes = entry.size_bytes; // Preserve original explicit size if parsed.
+                return Ok(Some(child));
+            }
+        }
+
+        println!(
+            "[CRIT DRAGONFORCE REFRESH] Could not find {} inside the upstream parent html dump.",
+            entry.path
+        );
+        Ok(None)
     }
 
     async fn crawl(
@@ -249,12 +398,51 @@ impl CrawlerAdapter for DragonForceAdapter {
                 }
             }
         });
+        let multi_clients = frontier.active_options.circuits.unwrap_or_else(|| {
+            std::env::var("CRAWLI_MULTI_CLIENTS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(4)
+        });
+        let _ = app.emit(
+            "log",
+            format!(
+                "[DragonForce] Bootstrapping MultiClientPool with {} independent TorClients...",
+                multi_clients
+            ),
+        );
+        let multi_pool = Arc::new(
+            crate::multi_client_pool::MultiClientPool::new(multi_clients)
+                .await
+                .unwrap(),
+        );
+
+        let _ = app.emit("log", "[DragonForce] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors...".to_string());
+        let mut preheats = Vec::new();
+        for i in 0..multi_clients {
+            let tor_arc = multi_pool.get_client(i).await;
+            let preheat_client = crate::arti_client::ArtiClient::new((*tor_arc).clone(), None);
+            let target_heat_url = current_url.to_string();
+            preheats.push(tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(55),
+                    preheat_client.get(&target_heat_url).send(),
+                )
+                .await;
+            }));
+        }
+        futures::future::join_all(preheats).await;
+        let _ = app.emit(
+            "log",
+            "[DragonForce] Pre-heating complete. Unleashing workers.".to_string(),
+        );
 
         let max_concurrent = frontier.recommended_listing_workers();
         let mut workers = tokio::task::JoinSet::new();
 
-        for _ in 0..max_concurrent {
+        for worker_idx in 0..max_concurrent {
             let f = frontier.clone();
+            let pool_clone = multi_pool.clone();
             let q_clone = queue.clone();
             let ui_tx_clone = ui_tx.clone();
             let discovered_ref = all_discovered_entries.clone();
@@ -296,8 +484,22 @@ impl CrawlerAdapter for DragonForceAdapter {
                         String::new()
                     };
 
+                    if let Some(exp) = extract_jwt_expiry(&next_url) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if exp <= now + 30 {
+                            println!(
+                                "[JWT EXPIRED] Skipping {}. Token exp: {}, Now: {}",
+                                next_url, exp, now
+                            );
+                            continue;
+                        }
+                    }
+
                     let _permit = f.politeness_semaphore.acquire().await.ok();
-                    let (cid, _client) = f.get_client();
+                    let (cid, _) = f.get_client(); // Kept to acquire a cid for politeness delays
 
                     let delay = f.scorer.yield_delay(cid);
                     if delay > std::time::Duration::ZERO {
@@ -312,16 +514,33 @@ impl CrawlerAdapter for DragonForceAdapter {
                     let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
 
                     for _ in 0..4 {
-                        let (current_cid, current_client) = f.get_client();
+                        let (current_cid, _) = f.get_client();
                         active_cid = current_cid;
+
+                        let is_fsguest = next_url.contains("fsguest");
+                        let tor_arc = if is_fsguest {
+                            pool_clone.get_client(worker_idx).await
+                        } else {
+                            pool_clone.get_client(0).await
+                        };
+                        let current_client =
+                            crate::arti_client::ArtiClient::new((*tor_arc).clone(), None);
 
                         let req = current_client.get(&next_url).send();
                         if let Ok(Ok(resp)) =
                             tokio::time::timeout(std::time::Duration::from_secs(45), req).await
                         {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            {
                                 tokio::time::sleep(delay).await;
                             }
+
+                            println!(
+                                "[DEBUG DRAGONFORCE] Fetch status for {}: {}",
+                                next_url,
+                                resp.status()
+                            );
+
                             if resp.status().is_success() {
                                 if let Ok(Ok(body)) = tokio::time::timeout(
                                     std::time::Duration::from_secs(45),
@@ -337,6 +556,11 @@ impl CrawlerAdapter for DragonForceAdapter {
                             } else if resp.status() == 404 {
                                 break;
                             }
+                        } else {
+                            println!(
+                                "[DEBUG DRAGONFORCE] Timeout or client error connecting to {}",
+                                next_url
+                            );
                         }
                         f.record_failure(active_cid);
                     }

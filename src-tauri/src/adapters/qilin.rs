@@ -932,8 +932,53 @@ impl CrawlerAdapter for QilinAdapter {
             parsed_url.host_str().unwrap_or("")
         );
 
-        for _ in 0..max_concurrent {
+        let multi_clients = frontier.active_options.circuits.unwrap_or_else(|| {
+            std::env::var("CRAWLI_MULTI_CLIENTS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(4)
+        });
+        let _ = app.emit(
+            "log",
+            format!(
+                "[Qilin] Bootstrapping MultiClientPool with {} independent TorClients...",
+                multi_clients
+            ),
+        );
+        let multi_pool = Arc::new(
+            crate::multi_client_pool::MultiClientPool::new(multi_clients)
+                .await
+                .unwrap(),
+        );
+
+        let _ = app.emit(
+            "log",
+            "[Qilin] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors..."
+                .to_string(),
+        );
+        let mut preheats = Vec::new();
+        for i in 0..multi_clients {
+            let tor_arc = multi_pool.get_client(i).await;
+            let preheat_client = crate::arti_client::ArtiClient::new((*tor_arc).clone(), None);
+            let target_heat_url = actual_seed_url.clone();
+            preheats.push(tokio::spawn(async move {
+                // Try fetching to cache the .onion descriptor, ignore errors as building the circuit is the only goal
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(55),
+                    preheat_client.get(&target_heat_url).send(),
+                )
+                .await;
+            }));
+        }
+        futures::future::join_all(preheats).await;
+        let _ = app.emit(
+            "log",
+            "[Qilin] Pre-heating complete. Unleashing workers.".to_string(),
+        );
+
+        for worker_idx in 0..max_concurrent {
             let f = frontier.clone();
+            let pool_clone = multi_pool.clone();
             let q_clone = queue.clone();
             let retry_q_clone = retry_queue.clone();
             let degraded_retry_q_clone = degraded_retry_queue.clone();
@@ -1083,7 +1128,12 @@ impl CrawlerAdapter for QilinAdapter {
                     let (cid, client) = if let Some((cid, client)) = &worker_client {
                         (*cid, client.clone())
                     } else {
-                        let (cid, client) = f.get_client();
+                        let tor_arc = pool_clone.get_client(worker_idx).await;
+                        let cid = worker_idx;
+                        let client = crate::arti_client::ArtiClient::new(
+                            (*tor_arc).clone(),
+                            None,
+                        );
                         worker_client = Some((cid, client.clone()));
                         (cid, client)
                     };
@@ -1142,7 +1192,7 @@ impl CrawlerAdapter for QilinAdapter {
                     if let Ok(Ok(resp)) = resp_result {
                         let elapsed_ms = start_time.elapsed().as_millis() as u64;
                         let status = resp.status();
-                        
+
                         if let Some(delay) = ddos.record_response(status.as_u16()) {
                             tokio::time::sleep(delay).await;
                         }
@@ -1391,7 +1441,7 @@ impl CrawlerAdapter for QilinAdapter {
                                         if is_dir {
                                             let sanitized_name = path_utils::sanitize_path(&clean_name);
                                             let full_path = format!("{}{}", nested_path, sanitized_name);
-                                            local_files.push(FileEntry {
+                                            local_files.push(FileEntry { jwt_exp: None,
                                                 path: full_path,
                                                 size_bytes: None,
                                                 entry_type: EntryType::Folder,
@@ -1403,7 +1453,7 @@ impl CrawlerAdapter for QilinAdapter {
                                             let size_bytes = if raw_size == "-" { None } else { path_utils::parse_size(raw_size) };
                                             let sanitized_name = path_utils::sanitize_path(&clean_name);
                                             let full_path = format!("{}{}", nested_path, sanitized_name);
-                                            local_files.push(FileEntry {
+                                            local_files.push(FileEntry { jwt_exp: None,
                                                 path: full_path,
                                                 size_bytes,
                                                 entry_type: EntryType::File,
@@ -1422,7 +1472,7 @@ impl CrawlerAdapter for QilinAdapter {
                                        if is_dir {
                                            let sanitized_name = path_utils::sanitize_path(&filename);
                                            let full_path = format!("{}{}", nested_path, sanitized_name);
-                                           local_files.push(FileEntry {
+                                           local_files.push(FileEntry { jwt_exp: None,
                                                path: full_path,
                                                size_bytes: None,
                                                entry_type: EntryType::Folder,
@@ -1432,7 +1482,7 @@ impl CrawlerAdapter for QilinAdapter {
                                        } else {
                                            let sanitized_name = path_utils::sanitize_path(&filename);
                                            let full_path = format!("{}{}", nested_path, sanitized_name);
-                                           local_files.push(FileEntry {
+                                           local_files.push(FileEntry { jwt_exp: None,
                                                path: full_path,
                                                size_bytes: parsed_size,
                                                entry_type: EntryType::File,
@@ -1453,7 +1503,7 @@ impl CrawlerAdapter for QilinAdapter {
                                         if raw_href.starts_with("/uploads/") {
                                             let file_url = format!("{}{}", domain_clone, raw_href);
                                             let file_path = path_utils::sanitize_path(&raw_href);
-                                            local_files.push(FileEntry {
+                                            local_files.push(FileEntry { jwt_exp: None,
                                                 path: format!("/{}", file_path),
                                                 size_bytes: None,
                                                 entry_type: EntryType::File,
@@ -1858,7 +1908,7 @@ impl CrawlerAdapter for QilinAdapter {
                             if let Ok(Ok(resp)) = resp_result {
                                 let elapsed_ms = start_time.elapsed().as_millis() as u64;
                                 let status = resp.status();
-                                
+
                                 if let Some(delay) = ddos.record_response(status.as_u16()) {
                                     tokio::time::sleep(delay).await;
                                 }
@@ -2064,7 +2114,7 @@ impl CrawlerAdapter for QilinAdapter {
                                                 if is_dir {
                                                     let sanitized_name = path_utils::sanitize_path(&clean_name);
                                                     let full_path = format!("{}{}", nested_path, sanitized_name);
-                                                    local_files.push(FileEntry {
+                                                    local_files.push(FileEntry { jwt_exp: None,
                                                         path: full_path,
                                                         size_bytes: None,
                                                         entry_type: EntryType::Folder,
@@ -2076,7 +2126,7 @@ impl CrawlerAdapter for QilinAdapter {
                                                     let size_bytes = if raw_size == "-" { None } else { path_utils::parse_size(raw_size) };
                                                     let sanitized_name = path_utils::sanitize_path(&clean_name);
                                                     let full_path = format!("{}{}", nested_path, sanitized_name);
-                                                    local_files.push(FileEntry {
+                                                    local_files.push(FileEntry { jwt_exp: None,
                                                         path: full_path,
                                                         size_bytes,
                                                         entry_type: EntryType::File,
@@ -2094,7 +2144,7 @@ impl CrawlerAdapter for QilinAdapter {
                                                if is_dir {
                                                    let sanitized_name = path_utils::sanitize_path(&filename);
                                                    let full_path = format!("{}{}", nested_path, sanitized_name);
-                                                   local_files.push(FileEntry {
+                                                   local_files.push(FileEntry { jwt_exp: None,
                                                        path: full_path,
                                                        size_bytes: None,
                                                        entry_type: EntryType::Folder,
@@ -2104,7 +2154,7 @@ impl CrawlerAdapter for QilinAdapter {
                                                } else {
                                                    let sanitized_name = path_utils::sanitize_path(&filename);
                                                    let full_path = format!("{}{}", nested_path, sanitized_name);
-                                                   local_files.push(FileEntry {
+                                                   local_files.push(FileEntry { jwt_exp: None,
                                                        path: full_path,
                                                        size_bytes: parsed_size,
                                                        entry_type: EntryType::File,
@@ -2124,7 +2174,7 @@ impl CrawlerAdapter for QilinAdapter {
                                                 if raw_href.starts_with("/uploads/") {
                                                     let file_url = format!("{}{}", domain_clone, raw_href);
                                                     let file_path = path_utils::sanitize_path(&raw_href);
-                                                    local_files.push(FileEntry {
+                                                    local_files.push(FileEntry { jwt_exp: None,
                                                         path: format!("/{}", file_path),
                                                         size_bytes: None,
                                                         entry_type: EntryType::File,

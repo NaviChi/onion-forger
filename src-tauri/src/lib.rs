@@ -1,25 +1,32 @@
 pub mod adapters;
 pub mod aria_downloader;
+#[cfg(feature = "azure")]
+pub mod azure_connectivity;
 pub mod bbr;
 pub mod bft_quorum;
 pub mod binary_telemetry;
 pub mod db;
 pub mod frontier;
 pub mod ghost_browser;
+pub mod index_generator;
 pub mod io_vanguard;
 pub mod kalman;
+pub mod mega_handler; // Phase 52: Mega.nz public folder support
+pub mod multi_client_pool;
 #[allow(dead_code)]
 pub mod multipath; // Experimental lab engine; production downloads use aria_downloader.
 pub mod path_utils;
 pub mod resource_governor;
 pub mod runtime_metrics;
 pub mod scorer;
+pub mod speculative_prefetch;
 pub mod subtree_heatmap;
 pub mod target_state;
 pub mod telemetry_bridge;
 pub mod tor;
 pub mod tor_native;
 pub mod tor_runtime; // Phase 45: Parallel chunk downloading
+pub mod torrent_handler; // Phase 52: BitTorrent .torrent + magnet support // Phase 53: Optional Azure + Intranet enterprise
 
 use std::sync::Arc;
 use tauri::Emitter;
@@ -35,6 +42,9 @@ pub struct AppState {
     pub telemetry: runtime_metrics::RuntimeTelemetry,
     pub telemetry_bridge: telemetry_bridge::TelemetryBridge,
     pub swarm_guard: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>>>,
+    /// Phase 53: Azure connectivity state (only compiled with `--features azure`)
+    #[cfg(feature = "azure")]
+    pub azure: tokio::sync::Mutex<azure_connectivity::AzureConnectivityState>,
 }
 
 impl Default for AppState {
@@ -47,6 +57,8 @@ impl Default for AppState {
             telemetry: runtime_metrics::RuntimeTelemetry::default(),
             telemetry_bridge: telemetry_bridge::TelemetryBridge::default(),
             swarm_guard: tokio::sync::Mutex::new(None),
+            #[cfg(feature = "azure")]
+            azure: tokio::sync::Mutex::new(azure_connectivity::AzureConnectivityState::default()),
         }
     }
 }
@@ -286,6 +298,7 @@ async fn execute_crawl_attempt(
     target_paths: &target_state::TargetPaths,
     app: &tauri::AppHandle,
     vfs: &db::SledVfs,
+    ledger: std::sync::Arc<crate::target_state::TargetLedger>,
 ) -> Result<CrawlAttemptResult, String> {
     let is_onion = url.contains(".onion");
     let support_dir = output_root.join("temp_onionforge_forger");
@@ -294,7 +307,6 @@ async fn execute_crawl_attempt(
         .map_err(|e| format!("Failed to create support directory: {e}"))?;
 
     let mut swarm_guard = None;
-    let mut active_ports = Vec::new();
     let mut arti_clients = Vec::new();
 
     if is_onion {
@@ -303,10 +315,12 @@ async fn execute_crawl_attempt(
             let guard = guard_arc.lock().await;
             arti_clients = guard.get_arti_clients();
             if !arti_clients.is_empty() {
-                active_ports = tor::detect_active_managed_tor_ports();
                 swarm_guard = Some(guard_arc.clone());
                 pre_warmed = true;
-                println!("[Crawli Bootstrap] Using pre-warmed Phantom Swarm ({} clients)", arti_clients.len());
+                println!(
+                    "[Crawli Bootstrap] Using pre-warmed Phantom Swarm ({} clients)",
+                    arti_clients.len()
+                );
             }
         }
 
@@ -332,7 +346,6 @@ async fn execute_crawl_attempt(
                     );
                     arti_clients = guard.get_arti_clients();
                     swarm_guard = Some(std::sync::Arc::new(tokio::sync::Mutex::new(guard)));
-                    active_ports = ports;
                 }
                 Err(e) => return Err(format!("Failed to start Tor Swarm: {}", e)),
             }
@@ -353,9 +366,10 @@ async fn execute_crawl_attempt(
         url.to_string(),
         daemon_count,
         is_onion,
-        active_ports,
+        Vec::new(), // explicit ports removed, handled internally
         arti_clients,
         options.clone(),
+        Some(target_paths.clone()),
     );
     println!(
         "[Crawli Bootstrap] frontier initialized: clients={} daemons={} onion={}",
@@ -452,7 +466,7 @@ async fn execute_crawl_attempt(
     };
 
     if let Some(name) = looks_like_direct_artifact(url, is_binary) {
-        let registry = adapters::AdapterRegistry::new();
+        let registry = adapters::AdapterRegistry::new().with_explorer_context(ledger.clone());
         if let Some(adapter) = registry.determine_adapter(&fingerprint).await {
             app.emit(
                 "crawl_log",
@@ -473,6 +487,7 @@ async fn execute_crawl_attempt(
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
         let entry = adapters::FileEntry {
+            jwt_exp: None,
             path: name.clone(),
             size_bytes: size,
             entry_type: adapters::EntryType::File,
@@ -508,7 +523,7 @@ async fn execute_crawl_attempt(
         });
     }
 
-    let registry = adapters::AdapterRegistry::new();
+    let registry = adapters::AdapterRegistry::new().with_explorer_context(ledger.clone());
     let Some(adapter) = registry.determine_adapter(&fingerprint).await else {
         return Err("No known adapter matched this sites architecture.".to_string());
     };
@@ -661,6 +676,7 @@ async fn scaffold_download_from_vfs(
                             url: entry.raw_url.clone(),
                             path: safe_target,
                             size_hint: entry.size_bytes,
+                            jwt_exp: entry.jwt_exp,
                         });
                         total_bytes_hint =
                             total_bytes_hint.saturating_add(entry.size_bytes.unwrap_or(0));
@@ -834,6 +850,7 @@ async fn scaffold_download_from_entries_with_plan(
                             url: entry.raw_url.clone(),
                             path: safe_target,
                             size_hint: entry.size_bytes,
+                            jwt_exp: entry.jwt_exp,
                         },
                     );
                     total_bytes_hint =
@@ -992,6 +1009,21 @@ async fn start_crawl(
     output_dir: String,
     app: tauri::AppHandle,
 ) -> Result<CrawlSessionResult, String> {
+    // Phase 52: Auto-detect Mega.nz and Torrent inputs — route directly
+    if mega_handler::is_mega_link(&url) {
+        return mega_handler::mega_crawl(
+            &url,
+            &output_dir,
+            options.download,
+            options.mega_password.as_deref(),
+            app,
+        )
+        .await;
+    }
+    if torrent_handler::is_magnet_link(&url) || torrent_handler::is_torrent_file(&url) {
+        return torrent_handler::torrent_crawl(&url, &output_dir, options.download, app).await;
+    }
+
     let state = app.state::<AppState>();
     let telemetry = state.telemetry.clone();
     let vfs = state.vfs.clone();
@@ -1044,8 +1076,21 @@ async fn start_crawl(
             .unwrap_or_default();
         }
 
-        let attempt_result =
-            execute_crawl_attempt(&url, &options, &output_root, &target_paths, &app, &vfs).await?;
+        let active_ledger = std::sync::Arc::new(ledger.clone());
+        let attempt_result = match execute_crawl_attempt(
+            &url,
+            &options,
+            &output_root,
+            &target_paths,
+            &app,
+            &vfs,
+            active_ledger,
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(e) => return Err(e.to_string()),
+        };
         let current_entries = vfs.iter_entries().await.map_err(|e| e.to_string())?;
         let raw_this_run_count = current_entries.len();
         let telemetry_snapshot = state.telemetry.snapshot_counters();
@@ -1136,6 +1181,12 @@ async fn start_crawl(
         .map_err(|e| e.to_string())?;
         target_state::write_best_listings(&target_paths, &authoritative_entries, &url)
             .map_err(|e| e.to_string())?;
+
+        let _ = crate::index_generator::generate_index_html(
+            &target_paths.target_identity.target_key,
+            &target_paths.target_dir.join("index.html"),
+            &target_paths.stable_best_listing_path,
+        );
         ledger.best_snapshot_version = ledger.best_snapshot_version.saturating_add(1);
     }
 
@@ -1394,6 +1445,7 @@ async fn scaffold_download(
                         url: entry.raw_url.clone(),
                         path: safe_target,
                         size_hint: entry.size_bytes,
+                        jwt_exp: entry.jwt_exp,
                     });
                 } else {
                     if !full_path.exists() {
@@ -1722,14 +1774,22 @@ async fn initiate_download(app: tauri::AppHandle, args: DownloadArgs) -> Result<
     let fail_path = safe_target_str.clone();
 
     tokio::spawn(async move {
+        let jwt_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>> =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let dummy_entry = aria_downloader::BatchFileEntry {
+            url,
+            path: safe_target_str,
+            size_hint: None,
+            jwt_exp: None,
+        };
         let result = aria_downloader::start_download(
             app_clone.clone(),
-            url,
-            safe_target_str,
+            dummy_entry,
             connections,
             force_tor,
             Some(output_root.to_string_lossy().to_string()),
             control,
+            jwt_cache,
         )
         .await;
 
@@ -1775,7 +1835,9 @@ fn stop_active_download(app: tauri::AppHandle) -> Result<bool, String> {
 
 #[tauri::command]
 async fn pre_resolve_onion(url: String, app: tauri::AppHandle) -> Result<(), String> {
-    if !url.contains(".onion") { return Ok(()); }
+    if !url.contains(".onion") {
+        return Ok(());
+    }
     let state = app.state::<AppState>();
     if let Some(guard_arc) = state.swarm_guard.lock().await.clone() {
         tauri::async_runtime::spawn(async move {
@@ -1788,11 +1850,51 @@ async fn pre_resolve_onion(url: String, app: tauri::AppHandle) -> Result<(), Str
                 };
                 let token = ::arti_client::IsolationToken::new();
                 let arti = arti_client::ArtiClient::new((*tor_client).clone(), Some(token));
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), arti.head(&url).send()).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    arti.head(&url).send(),
+                )
+                .await;
             }
         });
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn get_subtree_heatmap(target_key: String) -> Result<serde_json::Value, String> {
+    let target_dir = crate::canonical_output_root("")
+        .unwrap_or_default()
+        .join("targets")
+        .join(&target_key);
+    let heatmap_path = target_dir
+        .join("temp_onionforge_forger")
+        .join("subtree_heatmap.json");
+
+    if heatmap_path.exists() {
+        if let Ok(content) = tokio::fs::read_to_string(&heatmap_path).await {
+            if let Ok(json) = serde_json::from_str(&content) {
+                return Ok(json);
+            }
+        }
+    }
+    Ok(serde_json::json!({}))
+}
+
+#[tauri::command]
+async fn open_folder_os(path: String) -> Result<(), String> {
+    open::that(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_telemetry_enabled(enabled: bool) {
+    crate::binary_telemetry::TELEMETRY_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Phase 52: Returns the detected input mode for the frontend auto-detect badge.
+#[tauri::command]
+fn detect_input_mode(input: String) -> String {
+    torrent_handler::detect_input_mode(&input).to_string()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1815,7 +1917,8 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
                 if let Ok((guard, _)) = tor::bootstrap_tor_cluster(handle.clone(), 4).await {
-                    *state.swarm_guard.lock().await = Some(Arc::new(tokio::sync::Mutex::new(guard)));
+                    *state.swarm_guard.lock().await =
+                        Some(Arc::new(tokio::sync::Mutex::new(guard)));
                 }
             });
             Ok(())
@@ -1832,7 +1935,24 @@ pub fn run() {
             get_vfs_children,
             get_adapter_support_catalog,
             ingest_vfs_entries,
-            pre_resolve_onion
+            pre_resolve_onion,
+            get_subtree_heatmap,
+            open_folder_os,
+            set_telemetry_enabled,
+            detect_input_mode,
+            // Phase 53: Azure + Intranet enterprise commands (feature-gated)
+            #[cfg(feature = "azure")]
+            azure_connectivity::configure_azure_storage,
+            #[cfg(feature = "azure")]
+            azure_connectivity::test_azure_connection,
+            #[cfg(feature = "azure")]
+            azure_connectivity::enable_azure_storage,
+            #[cfg(feature = "azure")]
+            azure_connectivity::disable_azure_storage,
+            #[cfg(feature = "azure")]
+            azure_connectivity::toggle_intranet_server,
+            #[cfg(feature = "azure")]
+            azure_connectivity::get_azure_status
         ])
         .on_window_event(|_window, event| {
             if let tauri::WindowEvent::Destroyed = event {

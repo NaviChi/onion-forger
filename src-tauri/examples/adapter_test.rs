@@ -21,7 +21,6 @@
 ///   # JSON output
 ///   cargo run --example adapter_test -- --all --json
 ///
-
 use crawli_lib::adapters::{AdapterRegistry, EntryType, FileEntry, SiteFingerprint};
 use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
 use crawli_lib::telemetry_bridge;
@@ -45,20 +44,39 @@ fn canonical_test_urls() -> HashMap<&'static str, &'static str> {
     let mut m = HashMap::new();
     m.insert("qilin",       "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed");
     m.insert("lockbit",     "http://lockbit24pegjquuwbmwjlvyivmyaujf33kvlepcxyncnugm3zw73myd.onion/secret/123b67de858b6adc5dfdcfb2f6c4e8f7-caaf85ce-6aa7-370d-ba0c-25944d2230e3/manuaco.pt/unpack/");
-    m.insert("dragonforce", "http://dragonforxxbp3awc7mzs5dkswrua3znqyx5roefmi4smjrsdi22xwqd.onion/www.rjzavoral.com");
+    m.insert(
+        "dragonforce",
+        "http://dragonforxxbp3awc7mzs5dkswrua3znqyx5roefmi4smjrsdi22xwqd.onion/www.rjzavoral.com",
+    );
     m.insert("worldleaks",  "https://worldleaksartrjm3c6vasllvgacbi5u3mgzkluehrzhk2jz4taufuid.onion/companies/9255855374/storage");
-    m.insert("abyss",       "http://vmmefm7ktazj2bwtmy46o3wxhk42tctasyyqv6ymuzlivszteyhkkyad.onion/iamdesign.rar");
+    m.insert(
+        "abyss",
+        "http://vmmefm7ktazj2bwtmy46o3wxhk42tctasyyqv6ymuzlivszteyhkkyad.onion/iamdesign.rar",
+    );
     m.insert("alphalocker", "http://3v4zoso2ghne47usnhyoe4dsezmfqhfv5v5iuep4saic5nnfpc6phrad.onion/gazomet.pl%20&%20cgas.pl/Files/");
     m.insert("inc_ransom",  "http://incblog6qu4y4mm4zvw5nrmue6qbwtgjsxpw6b7ixzssu36tsajldoad.onion/blog/disclosures/698d5c538f1d14b7436dd63b");
-    m.insert("pear",        "http://m3wwhkus4dxbnxbtihexlyd2cv63qrvex6jiebc4vqe22kg2z3udebid.onion/sdeb.org/");
-    m.insert("play",        "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp");
+    m.insert(
+        "pear",
+        "http://m3wwhkus4dxbnxbtihexlyd2cv63qrvex6jiebc4vqe22kg2z3udebid.onion/sdeb.org/",
+    );
+    m.insert(
+        "play",
+        "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp",
+    );
     m
 }
 
 fn all_adapter_ids() -> Vec<&'static str> {
     vec![
-        "qilin", "lockbit", "dragonforce", "worldleaks",
-        "abyss", "alphalocker", "inc_ransom", "pear", "play",
+        "qilin",
+        "lockbit",
+        "dragonforce",
+        "worldleaks",
+        "abyss",
+        "alphalocker",
+        "inc_ransom",
+        "pear",
+        "play",
     ]
 }
 
@@ -90,18 +108,22 @@ impl std::fmt::Display for FailureClass {
 impl FailureClass {
     fn suggested_action(&self) -> &'static str {
         match self {
-            FailureClass::EndpointUnreachable(_) =>
-                "Endpoint appears unreachable — verify in Tor Browser, then retry later",
-            FailureClass::RateLimited(_) =>
-                "Endpoint throttling/blocking — reduce circuits or try later",
-            FailureClass::ParserEmpty(_) =>
-                "Adapter matched but parsed 0 entries — possible adapter regression or site change",
-            FailureClass::Timeout(_) =>
-                "Crawl exceeded time limit — increase --timeout-seconds or check Tor health",
-            FailureClass::RedirectLoop(_) =>
-                "Endpoint returned repeated redirects — check URL or site status",
-            FailureClass::Other(_) =>
-                "Unexpected error — inspect diagnostic logs for root cause",
+            FailureClass::EndpointUnreachable(_) => {
+                "Endpoint appears unreachable — verify in Tor Browser, then retry later"
+            }
+            FailureClass::RateLimited(_) => {
+                "Endpoint throttling/blocking — reduce circuits or try later"
+            }
+            FailureClass::ParserEmpty(_) => {
+                "Adapter matched but parsed 0 entries — possible adapter regression or site change"
+            }
+            FailureClass::Timeout(_) => {
+                "Crawl exceeded time limit — increase --timeout-seconds or check Tor health"
+            }
+            FailureClass::RedirectLoop(_) => {
+                "Endpoint returned repeated redirects — check URL or site status"
+            }
+            FailureClass::Other(_) => "Unexpected error — inspect diagnostic logs for root cause",
         }
     }
 
@@ -122,10 +144,14 @@ fn classify_error(error_msg: &str) -> FailureClass {
     if lower.contains("timed out") || lower.contains("timeout") {
         return FailureClass::EndpointUnreachable(error_msg.to_string());
     }
-    if lower.contains("connection refused") || lower.contains("reset") || lower.contains("broken pipe") {
+    if lower.contains("connection refused")
+        || lower.contains("reset")
+        || lower.contains("broken pipe")
+    {
         return FailureClass::EndpointUnreachable(error_msg.to_string());
     }
-    if lower.contains("hidden service") || lower.contains("descriptor") || lower.contains("circuit") {
+    if lower.contains("hidden service") || lower.contains("descriptor") || lower.contains("circuit")
+    {
         return FailureClass::EndpointUnreachable(error_msg.to_string());
     }
     if lower.contains("connect") && lower.contains("error") {
@@ -213,7 +239,11 @@ impl AdapterTestResult {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn compute_max_depth(entries: &[FileEntry]) -> usize {
-    entries.iter().map(|e| e.path.matches('/').count()).max().unwrap_or(0)
+    entries
+        .iter()
+        .map(|e| e.path.matches('/').count())
+        .max()
+        .unwrap_or(0)
 }
 
 // ─── CLI Argument Parsing ────────────────────────────────────────────────────
@@ -243,23 +273,41 @@ fn parse_args() -> CliArgs {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--adapter" | "-a" => { i += 1; cli.adapter = args.get(i).cloned(); }
-            "--url" | "-u" => { i += 1; cli.url = args.get(i).cloned(); }
+            "--adapter" | "-a" => {
+                i += 1;
+                cli.adapter = args.get(i).cloned();
+            }
+            "--url" | "-u" => {
+                i += 1;
+                cli.url = args.get(i).cloned();
+            }
             "--all" => cli.all = true,
             "--circuits" | "-c" => {
                 i += 1;
-                cli.circuits = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_CIRCUITS);
+                cli.circuits = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_CIRCUITS);
             }
             "--timeout-seconds" | "-t" => {
                 i += 1;
-                cli.timeout_seconds = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_TIMEOUT_SECS);
+                cli.timeout_seconds = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_TIMEOUT_SECS);
             }
             "--daemons" | "-d" => {
                 i += 1;
-                cli.daemons = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_TOR_DAEMONS);
+                cli.daemons = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_TOR_DAEMONS);
             }
             "--json" | "-j" => cli.json_output = true,
-            "--help" | "-h" => { print_usage(); std::process::exit(0); }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
             _ => {}
         }
         i += 1;
@@ -282,9 +330,18 @@ fn print_usage() {
     eprintln!("  --adapter, -a <ID>       Test a specific adapter (e.g. qilin, lockbit)");
     eprintln!("  --url, -u <URL>          Override the canonical test URL");
     eprintln!("  --all                    Test ALL adapters sequentially");
-    eprintln!("  --circuits, -c <N>       Tor circuits (default: {})", DEFAULT_CIRCUITS);
-    eprintln!("  --timeout-seconds, -t    Max seconds per adapter (default: {})", DEFAULT_TIMEOUT_SECS);
-    eprintln!("  --daemons, -d <N>        Tor daemons (default: {})", DEFAULT_TOR_DAEMONS);
+    eprintln!(
+        "  --circuits, -c <N>       Tor circuits (default: {})",
+        DEFAULT_CIRCUITS
+    );
+    eprintln!(
+        "  --timeout-seconds, -t    Max seconds per adapter (default: {})",
+        DEFAULT_TIMEOUT_SECS
+    );
+    eprintln!(
+        "  --daemons, -d <N>        Tor daemons (default: {})",
+        DEFAULT_TOR_DAEMONS
+    );
     eprintln!("  --json, -j               Output results as JSON");
     eprintln!("  --help, -h               Show this help\n");
     eprintln!("AVAILABLE ADAPTERS:");
@@ -339,6 +396,7 @@ async fn run_adapter_test(
         agnostic_state: false,
         resume: false,
         resume_index: None,
+        mega_password: None,
     };
 
     let daemon_count = active_ports.len().max(arti_clients.len()).max(1);
@@ -351,12 +409,17 @@ async fn run_adapter_test(
         active_ports.to_vec(),
         arti_clients.to_vec(),
         options,
+        None,
     );
 
     let test_start = Instant::now();
 
     // ─── Phase 1: High-Frequency Tournament Selection ────────────────────
-    log_phase(adapter_id, "TOURNAMENT", "Spinning 60 parallel isolated circuits to find the fastest Tor path...");
+    log_phase(
+        adapter_id,
+        "TOURNAMENT",
+        "Spinning 60 parallel isolated circuits to find the fastest Tor path...",
+    );
     let _tournament_start = Instant::now();
 
     let mut race_tasks = tokio::task::JoinSet::new();
@@ -365,11 +428,11 @@ async fn run_adapter_test(
     for i in 0..60 {
         let (cid, client) = frontier.get_client();
         let target_url_clone = test_url.to_string();
-        
+
         use rand::Rng;
-        
-        let my_jitter = if i == 0 || i == 1 { 
-            0 
+
+        let my_jitter = if i == 0 || i == 1 {
+            0
         } else if i % 2 == 1 {
             accumulated_jitter_ms
         } else {
@@ -388,27 +451,33 @@ async fn run_adapter_test(
                 Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECS),
                 // Use GET over HEAD since many misconfigured nginx Tor sites drop HTTP HEAD payloads
                 client.get(&target_url_clone).send(),
-            ).await;
+            )
+            .await;
             (i, cid, client, start.elapsed().as_millis(), res)
         });
     }
 
     let mut winners = Vec::new();
     while let Some(res) = race_tasks.join_next().await {
-        if let Ok((i, cid, client, latency, Ok(Ok(resp)))) = res {
+        if let Ok((_i, cid, client, latency, Ok(Ok(resp)))) = res {
             winners.push((cid, client, latency, resp.status().as_u16()));
-            log_phase(adapter_id, "TOURNAMENT", &format!("✓ Circuit C-{} won! Latency: {}ms", cid, latency));
+            log_phase(
+                adapter_id,
+                "TOURNAMENT",
+                &format!("✓ Circuit C-{} won! Latency: {}ms", cid, latency),
+            );
             if winners.len() >= 3 {
                 break;
             }
         }
     }
-    
+
     // Abort the slower 7 remaining circuits instantly
     race_tasks.abort_all();
 
     if winners.is_empty() {
-        let fc = FailureClass::EndpointUnreachable(format!("All 60 tournament circuits failed."));
+        let fc =
+            FailureClass::EndpointUnreachable("All 60 tournament circuits failed.".to_string());
         log_phase(adapter_id, "TOURNAMENT", &format!("✗ FAILED: {}", fc));
         result.failure_class = Some(fc);
         return result;
@@ -417,32 +486,47 @@ async fn run_adapter_test(
     // ─── Phase 2: Fingerprint Acquisition (Using Fastest Winner) ─────────
     let (fastest_cid, fastest_client, fastest_latency, _) = winners.remove(0);
     frontier.record_success(fastest_cid, 0, fastest_latency as u64);
-    result.diagnostic_notes.push(format!("Tournament Winner: Circuit {} in {}ms", fastest_cid, fastest_latency));
+    result.diagnostic_notes.push(format!(
+        "Tournament Winner: Circuit {} in {}ms",
+        fastest_cid, fastest_latency
+    ));
 
-    log_phase(adapter_id, "FP", &format!("Acquiring site fingerprint via fastest circuit C-{}...", fastest_cid));
+    log_phase(
+        adapter_id,
+        "FP",
+        &format!(
+            "Acquiring site fingerprint via fastest circuit C-{}...",
+            fastest_cid
+        ),
+    );
     let fp_start = Instant::now();
 
     let mut fingerprint_ok: Option<SiteFingerprint> = None;
 
-    let req_result = tokio::time::timeout(
-        Duration::from_secs(30),
-        fastest_client.get(test_url).send(),
-    ).await;
+    let req_result =
+        tokio::time::timeout(Duration::from_secs(30), fastest_client.get(test_url).send()).await;
 
     match req_result {
         Ok(Ok(resp)) => {
             let status = resp.status().as_u16();
             let headers = resp.headers().clone();
 
-            let content_type = headers.get("content-type")
+            let content_type = headers
+                .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown");
-            let server_header = headers.get("server")
+            let server_header = headers
+                .get("server")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown");
-            log_phase(adapter_id, "FP", &format!(
-                "HTTP {} | Content-Type: {} | Server: {}", status, content_type, server_header
-            ));
+            log_phase(
+                adapter_id,
+                "FP",
+                &format!(
+                    "HTTP {} | Content-Type: {} | Server: {}",
+                    status, content_type, server_header
+                ),
+            );
 
             let is_binary = !content_type.starts_with("text/")
                 && !content_type.contains("json")
@@ -471,7 +555,11 @@ async fn run_adapter_test(
             };
 
             if !body.is_empty() {
-                frontier.record_success(fastest_cid, body.len() as u64, fp_start.elapsed().as_millis() as u64);
+                frontier.record_success(
+                    fastest_cid,
+                    body.len() as u64,
+                    fp_start.elapsed().as_millis() as u64,
+                );
                 result.fingerprint_status = Some(status);
                 result.fingerprint_body_len = Some(body.len());
                 result.successful_requests += 1;
@@ -499,10 +587,16 @@ async fn run_adapter_test(
     let fingerprint = match fingerprint_ok {
         Some(fp) => {
             result.fingerprint_elapsed_secs = fp_start.elapsed().as_secs_f64();
-            log_phase(adapter_id, "FP", &format!(
-                "✓ Fingerprint acquired in {:.2}s (HTTP {}, {} bytes body)",
-                result.fingerprint_elapsed_secs, fp.status, fp.body.len()
-            ));
+            log_phase(
+                adapter_id,
+                "FP",
+                &format!(
+                    "✓ Fingerprint acquired in {:.2}s (HTTP {}, {} bytes body)",
+                    result.fingerprint_elapsed_secs,
+                    fp.status,
+                    fp.body.len()
+                ),
+            );
             fp
         }
         None => {
@@ -513,7 +607,9 @@ async fn run_adapter_test(
             ));
             log_phase(adapter_id, "FP", &format!("✗ FAILED: {}", fc));
             result.diagnostic_notes.push(format!("Fingerprint: {}", fc));
-            result.diagnostic_notes.push(format!("→ {}", fc.suggested_action()));
+            result
+                .diagnostic_notes
+                .push(format!("→ {}", fc.suggested_action()));
             result.failure_class = Some(fc);
             result.elapsed_secs = test_start.elapsed().as_secs_f64();
             return result;
@@ -521,7 +617,11 @@ async fn run_adapter_test(
     };
 
     // ─── Phase 3: Adapter Detection ──────────────────────────────────────
-    log_phase(adapter_id, "MATCH", "Running multi-tier adapter classification...");
+    log_phase(
+        adapter_id,
+        "MATCH",
+        "Running multi-tier adapter classification...",
+    );
     let registry = AdapterRegistry::new();
     let adapter = match registry.determine_adapter(&fingerprint).await {
         Some(a) => {
@@ -532,12 +632,14 @@ async fn run_adapter_test(
         }
         None => {
             let body_preview = &fingerprint.body[..fingerprint.body.len().min(300)];
-            let fc = FailureClass::ParserEmpty(
-                "No adapter matched the fingerprint".to_string()
-            );
+            let fc = FailureClass::ParserEmpty("No adapter matched the fingerprint".to_string());
             log_phase(adapter_id, "MATCH", &format!("✗ {}", fc));
-            result.diagnostic_notes.push(format!("Body preview: {}", body_preview));
-            result.diagnostic_notes.push(format!("→ {}", fc.suggested_action()));
+            result
+                .diagnostic_notes
+                .push(format!("Body preview: {}", body_preview));
+            result
+                .diagnostic_notes
+                .push(format!("→ {}", fc.suggested_action()));
             result.failure_class = Some(fc);
             result.elapsed_secs = test_start.elapsed().as_secs_f64();
             return result;
@@ -545,16 +647,22 @@ async fn run_adapter_test(
     };
 
     // ─── Phase 4: Live Crawl ─────────────────────────────────────────────
-    log_phase(adapter_id, "CRAWL", &format!(
-        "Starting live crawl ({}s limit, {} circuits)...", timeout_seconds, circuits
-    ));
+    log_phase(
+        adapter_id,
+        "CRAWL",
+        &format!(
+            "Starting live crawl ({}s limit, {} circuits)...",
+            timeout_seconds, circuits
+        ),
+    );
     let crawl_start = Instant::now();
     let frontier_arc = Arc::new(frontier);
 
     let crawl_result = tokio::time::timeout(
         Duration::from_secs(timeout_seconds),
         adapter.crawl(test_url, frontier_arc.clone(), app_handle.clone()),
-    ).await;
+    )
+    .await;
 
     let crawl_elapsed = crawl_start.elapsed().as_secs_f64();
     result.elapsed_secs = test_start.elapsed().as_secs_f64();
@@ -562,36 +670,63 @@ async fn run_adapter_test(
 
     match crawl_result {
         Ok(Ok(files)) => {
-            result.total_files = files.iter().filter(|e| matches!(e.entry_type, EntryType::File)).count();
-            result.total_folders = files.iter().filter(|e| matches!(e.entry_type, EntryType::Folder)).count();
+            result.total_files = files
+                .iter()
+                .filter(|e| matches!(e.entry_type, EntryType::File))
+                .count();
+            result.total_folders = files
+                .iter()
+                .filter(|e| matches!(e.entry_type, EntryType::Folder))
+                .count();
             result.total_entries = files.len();
             result.total_size_bytes = files.iter().filter_map(|e| e.size_bytes).sum();
             result.max_depth = compute_max_depth(&files);
             result.entries_per_second = if crawl_elapsed > 0.0 {
                 result.total_entries as f64 / crawl_elapsed
-            } else { 0.0 };
+            } else {
+                0.0
+            };
 
             if result.total_entries > 0 {
                 result.status = TestStatus::Success;
-                log_phase(adapter_id, "CRAWL", &format!(
+                log_phase(
+                    adapter_id,
+                    "CRAWL",
+                    &format!(
                     "✓ SUCCESS: {} entries ({} files, {} folders) depth={} in {:.2}s — {:.2} ent/s",
                     result.total_entries, result.total_files, result.total_folders,
                     result.max_depth, crawl_elapsed, result.entries_per_second,
-                ));
+                ),
+                );
                 // Log first few entries as sample
                 for (i, entry) in files.iter().take(5).enumerate() {
-                    let type_tag = match entry.entry_type { EntryType::File => "FILE", EntryType::Folder => "DIR " };
-                    let size_str = entry.size_bytes.map_or("?".to_string(), |b| format!("{}", b));
-                    log_phase(adapter_id, "CRAWL", &format!(
-                        "  [{}] {} {} ({}B)", i + 1, type_tag, entry.path, size_str
-                    ));
+                    let type_tag = match entry.entry_type {
+                        EntryType::File => "FILE",
+                        EntryType::Folder => "DIR ",
+                    };
+                    let size_str = entry
+                        .size_bytes
+                        .map_or("?".to_string(), |b| format!("{}", b));
+                    log_phase(
+                        adapter_id,
+                        "CRAWL",
+                        &format!("  [{}] {} {} ({}B)", i + 1, type_tag, entry.path, size_str),
+                    );
                 }
                 if files.len() > 5 {
-                    log_phase(adapter_id, "CRAWL", &format!("  ... and {} more entries", files.len() - 5));
+                    log_phase(
+                        adapter_id,
+                        "CRAWL",
+                        &format!("  ... and {} more entries", files.len() - 5),
+                    );
                 }
             } else {
                 // ─── Zero-Entry Diagnosis ──────────────────────────
-                log_phase(adapter_id, "DIAG", "⚠ Crawl returned 0 entries — diagnosing...");
+                log_phase(
+                    adapter_id,
+                    "DIAG",
+                    "⚠ Crawl returned 0 entries — diagnosing...",
+                );
 
                 let fc = if result.fingerprint_status == Some(200) {
                     result.diagnostic_notes.push(format!(
@@ -609,7 +744,9 @@ async fn run_adapter_test(
                         result.fingerprint_status.unwrap_or(0)
                     ))
                 };
-                result.diagnostic_notes.push(format!("→ {}", fc.suggested_action()));
+                result
+                    .diagnostic_notes
+                    .push(format!("→ {}", fc.suggested_action()));
                 result.failure_class = Some(fc);
             }
         }
@@ -617,8 +754,12 @@ async fn run_adapter_test(
             let error_msg = e.to_string();
             let fc = classify_error(&error_msg);
             log_phase(adapter_id, "CRAWL", &format!("✗ ERROR: {}", fc));
-            result.diagnostic_notes.push(format!("Crawl error: {}", error_msg));
-            result.diagnostic_notes.push(format!("→ {}", fc.suggested_action()));
+            result
+                .diagnostic_notes
+                .push(format!("Crawl error: {}", error_msg));
+            result
+                .diagnostic_notes
+                .push(format!("→ {}", fc.suggested_action()));
             result.failure_class = Some(fc);
         }
         Err(_) => {
@@ -630,20 +771,30 @@ async fn run_adapter_test(
                 result.total_entries = visited;
                 result.entries_per_second = if crawl_elapsed > 0.0 {
                     visited as f64 / crawl_elapsed
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 let fc = FailureClass::Timeout(format!(
-                    "Hit {}s limit — visited={} processed={}", timeout_seconds, visited, processed
+                    "Hit {}s limit — visited={} processed={}",
+                    timeout_seconds, visited, processed
                 ));
                 log_phase(adapter_id, "CRAWL", &format!("◐ PARTIAL: {}", fc));
-                result.diagnostic_notes.push(format!("Increase --timeout-seconds to allow more discovery"));
-                result.diagnostic_notes.push(format!("→ {}", fc.suggested_action()));
+                result
+                    .diagnostic_notes
+                    .push("Increase --timeout-seconds to allow more discovery".to_string());
+                result
+                    .diagnostic_notes
+                    .push(format!("→ {}", fc.suggested_action()));
                 result.failure_class = Some(fc);
             } else {
                 let fc = FailureClass::Timeout(format!(
-                    "Crawl timed out after {}s with no results", timeout_seconds
+                    "Crawl timed out after {}s with no results",
+                    timeout_seconds
                 ));
                 log_phase(adapter_id, "CRAWL", &format!("✗ FAILED: {}", fc));
-                result.diagnostic_notes.push(format!("→ {}", fc.suggested_action()));
+                result
+                    .diagnostic_notes
+                    .push(format!("→ {}", fc.suggested_action()));
                 result.failure_class = Some(fc);
             }
         }
@@ -661,7 +812,7 @@ fn log_phase(_adapter_id: &str, phase: &str, message: &str) {
 }
 
 fn print_divider(ch: char, width: usize) {
-    println!("{}", std::iter::repeat(ch).take(width).collect::<String>());
+    println!("{}", std::iter::repeat_n(ch, width).collect::<String>());
 }
 
 // ─── Summary Table ───────────────────────────────────────────────────────────
@@ -674,38 +825,75 @@ fn print_summary_table(results: &[AdapterTestResult]) {
 
     println!(
         "  {:<16} {:<28} {:<9} {:>7} {:>7} {:>7} {:>5} {:>8} {:>8} {:<10} {:<40}",
-        "ADAPTER", "MATCHED", "STATUS", "TOTAL", "FILES", "DIRS", "DEPTH",
-        "TIME", "ENT/s", "CATEGORY", "NEXT STEP"
+        "ADAPTER",
+        "MATCHED",
+        "STATUS",
+        "TOTAL",
+        "FILES",
+        "DIRS",
+        "DEPTH",
+        "TIME",
+        "ENT/s",
+        "CATEGORY",
+        "NEXT STEP"
     );
     print_divider('─', 150);
 
     for r in results {
-        let fail_tag = r.failure_class.as_ref()
+        let fail_tag = r
+            .failure_class
+            .as_ref()
             .map(|fc| fc.category_tag().to_string())
             .unwrap_or_else(|| "—".to_string());
-        let next_step = r.failure_class.as_ref()
+        let next_step = r
+            .failure_class
+            .as_ref()
             .map(|fc| {
                 let a = fc.suggested_action();
-                if a.len() > 38 { format!("{}...", &a[..35]) } else { a.to_string() }
+                if a.len() > 38 {
+                    format!("{}...", &a[..35])
+                } else {
+                    a.to_string()
+                }
             })
             .unwrap_or_else(|| "—".to_string());
         let name = r.matched_adapter.as_deref().unwrap_or("—");
-        let name_disp = if name.len() > 26 { format!("{}...", &name[..23]) } else { name.to_string() };
+        let name_disp = if name.len() > 26 {
+            format!("{}...", &name[..23])
+        } else {
+            name.to_string()
+        };
 
         println!(
             "  {:<16} {:<28} {:<9} {:>7} {:>7} {:>7} {:>5} {:>7.1}s {:>8.2} {:<10} {:<40}",
-            r.adapter_id, name_disp, format!("{}", r.status),
-            r.total_entries, r.total_files, r.total_folders, r.max_depth,
-            r.elapsed_secs, r.entries_per_second,
-            fail_tag, next_step,
+            r.adapter_id,
+            name_disp,
+            format!("{}", r.status),
+            r.total_entries,
+            r.total_files,
+            r.total_folders,
+            r.max_depth,
+            r.elapsed_secs,
+            r.entries_per_second,
+            fail_tag,
+            next_step,
         );
     }
 
     print_divider('─', 150);
 
-    let total_success = results.iter().filter(|r| r.status == TestStatus::Success).count();
-    let total_partial = results.iter().filter(|r| r.status == TestStatus::Partial).count();
-    let total_failed = results.iter().filter(|r| r.status == TestStatus::Failed).count();
+    let total_success = results
+        .iter()
+        .filter(|r| r.status == TestStatus::Success)
+        .count();
+    let total_partial = results
+        .iter()
+        .filter(|r| r.status == TestStatus::Partial)
+        .count();
+    let total_failed = results
+        .iter()
+        .filter(|r| r.status == TestStatus::Failed)
+        .count();
     let total_entries: usize = results.iter().map(|r| r.total_entries).sum();
 
     println!();
@@ -716,14 +904,18 @@ fn print_summary_table(results: &[AdapterTestResult]) {
 
 fn print_detailed_diagnostics(results: &[AdapterTestResult]) {
     let has_diagnostics = results.iter().any(|r| !r.diagnostic_notes.is_empty());
-    if !has_diagnostics { return; }
+    if !has_diagnostics {
+        return;
+    }
 
     println!();
     println!("  DETAILED DIAGNOSTICS");
     print_divider('─', 80);
 
     for r in results {
-        if r.diagnostic_notes.is_empty() { continue; }
+        if r.diagnostic_notes.is_empty() {
+            continue;
+        }
         println!();
         println!("  ┌── {} ({}) ──", r.adapter_id, r.status);
         for note in &r.diagnostic_notes {
@@ -766,13 +958,18 @@ fn main() {
         // Determine which adapters to test
         let canonical = canonical_test_urls();
         let adapters_to_test: Vec<(String, String)> = if cli.all {
-            all_adapter_ids().iter().map(|id| {
-                let url = canonical.get(id).unwrap_or(&"").to_string();
-                (id.to_string(), url)
-            }).collect()
+            all_adapter_ids()
+                .iter()
+                .map(|id| {
+                    let url = canonical.get(id).unwrap_or(&"").to_string();
+                    (id.to_string(), url)
+                })
+                .collect()
         } else {
             let id = cli.adapter.as_deref().unwrap();
-            let url = cli.url.clone()
+            let url = cli
+                .url
+                .clone()
                 .unwrap_or_else(|| canonical.get(id).unwrap_or(&"").to_string());
             if url.is_empty() {
                 eprintln!("ERROR: No canonical URL for '{}'. Use --url.", id);
@@ -781,7 +978,14 @@ fn main() {
             vec![(id.to_string(), url)]
         };
 
-        println!("  Adapters:  {}", adapters_to_test.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", "));
+        println!(
+            "  Adapters:  {}",
+            adapters_to_test
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         println!("  Circuits:  {}", cli.circuits);
         println!("  Timeout:   {}s per adapter", cli.timeout_seconds);
         println!("  Daemons:   {}", cli.daemons);
@@ -793,18 +997,25 @@ fn main() {
 
         println!("[TOR] Bootstrapping {}-daemon arti swarm...", cli.daemons);
         let tor_start = Instant::now();
-        let (guard, active_ports) = match tor::bootstrap_tor_cluster(app_handle.clone(), cli.daemons).await {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("[TOR] FATAL: Bootstrap failed: {}", e);
-                eprintln!("[TOR] Check network connectivity and arti state directory permissions.");
-                std::process::exit(1);
-            }
-        };
+        let (guard, active_ports) =
+            match tor::bootstrap_tor_cluster(app_handle.clone(), cli.daemons).await {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("[TOR] FATAL: Bootstrap failed: {}", e);
+                    eprintln!(
+                        "[TOR] Check network connectivity and arti state directory permissions."
+                    );
+                    std::process::exit(1);
+                }
+            };
         let tor_elapsed = tor_start.elapsed().as_secs_f64();
         let arti_clients = guard.get_arti_clients();
-        println!("[TOR] ✓ Ready in {:.2}s — {} live client(s), {} port(s)\n",
-            tor_elapsed, arti_clients.len(), active_ports.len());
+        println!(
+            "[TOR] ✓ Ready in {:.2}s — {} live client(s), {} port(s)\n",
+            tor_elapsed,
+            arti_clients.len(),
+            active_ports.len()
+        );
 
         let mut all_results: Vec<AdapterTestResult> = Vec::new();
 
@@ -812,15 +1023,26 @@ fn main() {
         for (idx, (adapter_id, url)) in adapters_to_test.iter().enumerate() {
             println!();
             print_divider('─', 100);
-            println!("  [{}/{}] Testing adapter: {}", idx + 1, adapters_to_test.len(), adapter_id);
+            println!(
+                "  [{}/{}] Testing adapter: {}",
+                idx + 1,
+                adapters_to_test.len(),
+                adapter_id
+            );
             println!("  URL: {}", url);
             print_divider('─', 100);
 
             let result = run_adapter_test(
-                adapter_id, url,
-                &app_handle, &arti_clients, &active_ports,
-                cli.circuits, cli.daemons, cli.timeout_seconds,
-            ).await;
+                adapter_id,
+                url,
+                &app_handle,
+                &arti_clients,
+                &active_ports,
+                cli.circuits,
+                cli.daemons,
+                cli.timeout_seconds,
+            )
+            .await;
 
             // Print per-adapter summary line
             println!();
@@ -829,11 +1051,16 @@ fn main() {
                 TestStatus::Partial => "◐",
                 TestStatus::Failed => "✗",
             };
-            println!("  {} {} | {} entries ({} files, {} folders) | depth {} | {:.2}s | {:.2} ent/s",
-                status_icon, result.status,
-                result.total_entries, result.total_files,
-                result.total_folders, result.max_depth,
-                result.elapsed_secs, result.entries_per_second,
+            println!(
+                "  {} {} | {} entries ({} files, {} folders) | depth {} | {:.2}s | {:.2} ent/s",
+                status_icon,
+                result.status,
+                result.total_entries,
+                result.total_files,
+                result.total_folders,
+                result.max_depth,
+                result.elapsed_secs,
+                result.entries_per_second,
             );
             if let Some(ref fc) = result.failure_class {
                 println!("    [{}] {}", fc.category_tag(), fc);

@@ -175,6 +175,7 @@ async fn main() -> Result<()> {
                 agnostic_state: false,
                 resume: false,
                 resume_index: None,
+                mega_password: None,
             },
             output_dir.to_string_lossy().to_string(),
             app.handle().clone(),
@@ -316,7 +317,7 @@ fn parse_args() -> Result<SoakConfig> {
     let mut duration_secs = 300u64;
     let mut mode = "listing-plus-one-large-file".to_string();
     let mut circuits_ceiling = 120usize;
-    let mut daemons = 12usize;
+    let mut daemons = 1usize; // Rely on MultiClientPool for scaling
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {

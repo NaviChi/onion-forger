@@ -1,4 +1,59 @@
-> **Last Updated:** 2026-03-06T20:38 CST
+> **Last Updated:** 2026-03-07T15:52 CST
+
+## Phase 52D: Download Engine (2026-03-07)
+
+### Issues Found
+1. `mega_crawl` double file-creation: async `tokio::fs::File::create` then sync `std::fs::File::create`
+2. librqbit `default-features=false` → missing sha1 implementation panic
+3. `sha1-ring` not a top-level librqbit feature (it's `rust-tls`)
+4. `LiveStats.peers` doesn't exist — nested in `snapshot`
+5. `Speed.human_readable` doesn't exist — `Speed` implements `Display`
+
+### Fixes
+1. Single `std::fs::File::create` + `AllowStdIo` wrapper
+2. Changed to `features = ["rust-tls"]`
+3. Same as #2
+4. Removed `peers` from progress JSON
+5. Used `format!("{}", live.download_speed)` via Display
+
+### Prevention Rules
+- PR-LIBRQBIT-001: Always use `rust-tls` feature — provides sha1-ring + rustls
+- PR-LIBRQBIT-002: `LiveStats` fields: `snapshot`, `download_speed`, `upload_speed`, `time_remaining`
+- PR-MEGA-004: Never create download target twice — single `std::fs::File::create` + `AllowStdIo`
+
+### Validation
+- `cargo test --lib` → 51/51 pass
+- `cargo test --test mega_torrent_test` → 25/25 pass
+- `npm run build` → 0 errors
+
+## Phase 52: Mega.nz + Torrent Integration Backend (2026-03-07)
+
+### Issues Found
+1. **Reqwest Version Mismatch** — The `mega` crate v0.8.0 internally depends on `reqwest` v0.12, but Crawli uses `reqwest` v0.13. Constructing `mega::Client::builder().build(reqwest::Client::new())` failed with `the trait HttpClient is not implemented for reqwest::Client` because two separate `reqwest` versions were in the dependency tree.
+2. **Mega Client API Signature Error** — `Client::builder().build()` requires an `HttpClient` argument (not zero args as initially assumed from docs). The `HttpClient` trait is impl'd for `reqwest::Client` (0.12), not exported publicly.
+3. **Mega Node Children API Mismatch** — `Node::children()` returns `&[String]` (handles), not `&[Node]`. Recursive tree walking required `Nodes::get_node_by_handle()` lookups.
+4. **Torrent info_hash Return Type** — `lava_torrent::Torrent::info_hash()` returns `String`, not `Vec<u8>`. Code was calling `.iter()` on a String which failed compilation.
+5. **Magnet URL v3.0 API Change** — `magnet_url` v3.0 uses accessor methods (`hash()`, `display_name()`, `trackers()`) not struct fields (`xt`, `dn`, `tr`).
+
+### Fixes Implemented
+1. **Renamed Dependency** — Added `reqwest_mega = { package = "reqwest", version = "0.12" }` in `Cargo.toml` to provide the correct reqwest version for `mega::HttpClient` trait.
+2. **Correct Client Construction** — `mega::Client::builder().build(reqwest_mega::Client::new())` now passes the v0.12 reqwest Client.
+3. **Recursive Node Walking** — `walk_node_tree()` in `mega_handler.rs` iterates `node.children()` (handle strings) and resolves each via `nodes.get_node_by_handle()`.
+4. **Direct String Hash** — `torrent.info_hash()` result used directly as `String`.
+5. **Accessor Method Migration** — All `Magnet` field access rewritten to use `hash()`, `display_name()`, `trackers()`.
+
+### Validation
+- `cargo test --lib` → 51/51 pass
+- `cargo test --test mega_torrent_test` → 25/25 pass
+- `npm run build` → 0 errors
+
+### Prevention Rules
+- **PR-MEGA-001:** Never persist Mega.nz encryption keys to disk.
+- **PR-MEGA-002:** Fail-fast if the decryption key segment is missing from a Mega.nz URL.
+- **PR-TORRENT-001:** Never route BitTorrent traffic through Tor.
+- **PR-TORRENT-002:** Reject `.torrent` files larger than 10MB as a guard against attack vectors.
+- **PR-MEGA-003:** When a dependency crate requires a different major version of a shared crate (e.g., reqwest), use Cargo's `package` rename feature to avoid type mismatch across versions.
+
 
 ## Phase 53B: Qilin Adapter Panic Fix in Resource Governor (2026-03-06)
 
@@ -790,3 +845,32 @@ We rolled out the complete military-grade predictive pacing suite inside `qilin_
 
 **Prevention Rule Enforced:**
 `PR-UNIFIED-ARCH-001`: Subcomponents must never drop down to rudimentary "sleep and fetch" execution. If a new module is built, it MUST instantiate `DdosGuard` (for EKF pacing) or `BbrController` (for sizing).
+
+### Phase 51F: Multi-Client Parallel Crawling
+**Architecture Implementation:**
+A dedicated `MultiClientPool` was engineered to instantiate and isolate multiple independent Arti `TorClient`s concurrently (default: 4 clients for a 4 GB RAM bound).
+- **Load-Balancer Bypass**: By routing concurrent worker requests through fundamentally distinct Tor exit nodes and Guard relays via isolated client instances, load-balancer affinity throttling and single-client Guard-relay congestion are bypassed entirely.
+- **Resource Harmony**: This connects seamlessly to the Phase 51E Resource Governor to ensure raw memory usage per active client does not exceed container ceilings.
+- Circuit Healing: Complete client rotation requests flow through the pre-existing smart healing engine to destroy and regenerate fully tainted client stacks when hard IP-blocks are encountered.
+
+## Phase 58: Qilin Connection Timeouts & Adaptive Universal Explorer (2026-03-07)
+
+### Issues Found
+1. **Per-Worker IsolationToken Stampede:** Qilin workers instantiated new `IsolationToken::new()` for every ArtiClient within the worker loop. This prevented Tor circuit reuse across workers, causing a massive circuit-build stampede against `.onion` CMS nodes that registered as a layer-7 DDoS attack, locking out the daemon.
+2. **Explicit Onion Flag Interference:** Setting `connect_to_onion_services(true)` explicitly in `StreamPrefs` during Arti HTTP connector instantiation actually broke `.onion` resolution when combined with global allow rules.
+3. **Clearnet Probes Severing Onion Circuits:** Aerospace Healing tore down perfectly healthy `.onion` network circuits simply because the clearnet probe (`check.torproject.org`) failed to resolve over the same exit constraint.
+
+### Fixes Implemented
+1. **Multiplexed Circuit Pooling:** Removed per-worker `IsolationToken` instantiations in Qilin so the 20 workers correctly share and reuse the same established circuits natively.
+2. **Implicit Onion Routing:** Reverted the explicit `connect_to_onion_services(true)` flag in `arti_connector.rs`. Tor auto-routes onions correctly when permitted globally.
+3. **Probe Bypasses for Hidden Services:** Modified `tor_native.rs` to completely bypass Aerospace Healing health-probe checks when routing to domains that do not require clearnet exit nodes (`CRAWLI_TOR_HEALTH_PROBE_HOST=none`), preserving hidden-service stability.
+4. **Adaptive Universal Explorer Scaffolded:** Designed a Tier-4 fallback explorer inside `explorer.rs` that applies heuristic link scoring (boosting `/storage`, `.zip`, etc.) to heuristically detect Nginx, CMS redirects, and Next.js SPAs without hardcoded parsers.
+
+### Prevention Rules
+- **P58-1:** When using `ArtiClient` concurrently via `clone()`, NEVER instantiate a new `IsolationToken` per worker request loop unless you explicitly want to mandate a brand new, unique Tor circuit for every single outbound HTTP request.
+- **P58-2:** Do not explicitly force `connect_to_onion_services` on per-stream preferences if the global client builder already permits them; it triggers strict overrides that can drop legitimate traffic.
+- **P58-3:** Tor Circuit Health Probes MUST respect the exit-node dependency of the target. `check.torproject.org` requires a clearnet exit node; `.onion` services do not. Failing a clearnet probe must NOT tear down an internal hidden service circuit.
+
+**Key Prevention Rules (Enforced and Logged):**
+- **PR-MULTICLIENT-001:** Never exceed 4 active TorClients on 4 GB RAM VMs to prevent NT Kernel OOM exhaustion. This boundary is rigidly enforced by the new Resource Governor instantiation constraints.
+- **PR-MULTICLIENT-002:** Client rotations must strictly utilize the shared healing engine to prevent "orphan" clients and silent memory leaks.

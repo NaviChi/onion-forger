@@ -31,6 +31,7 @@ fn simulate_play_crawl(listing: bool, sizes: bool) -> Vec<FileEntry> {
         files.push(FileEntry {
             path: format!("/FALOp/{}", filename),
             size_bytes: size,
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: format!(
                 "http://b3pzp6qwelgeygmzn6awkduym6s4gxh6htwxuxeydrziwzlx63zergyd.onion/FALOp/{}",
@@ -348,30 +349,35 @@ async fn test_play_download_mixed_entries_deep_nesting() {
         FileEntry {
             path: "/target_company".to_string(),
             size_bytes: None,
+            jwt_exp: None,
             entry_type: EntryType::Folder,
             raw_url: "http://play.onion/target_company".to_string(),
         },
         FileEntry {
             path: "/target_company/financials".to_string(),
             size_bytes: None,
+            jwt_exp: None,
             entry_type: EntryType::Folder,
             raw_url: "http://play.onion/target_company/financials".to_string(),
         },
         FileEntry {
             path: "/target_company/financials/2026/Q1/report.xlsx".to_string(),
             size_bytes: Some(45_000),
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/target_company/financials/2026/Q1/report.xlsx".to_string(),
         },
         FileEntry {
             path: "/target_company/empty_evidence_folder".to_string(),
             size_bytes: None,
+            jwt_exp: None,
             entry_type: EntryType::Folder,
             raw_url: "http://play.onion/target_company/empty_evidence_folder".to_string(),
         },
         FileEntry {
             path: "".to_string(), // Edge case: empty path
             size_bytes: None,
+            jwt_exp: None,
             entry_type: EntryType::File,
             raw_url: "http://play.onion/".to_string(),
         },
@@ -456,7 +462,9 @@ async fn test_politeness_semaphore_bottleneck() {
             agnostic_state: false,
             resume: false,
             resume_index: None,
+            mega_password: None,
         },
+        None,
     ));
 
     // Under the resource governor, the frontier may intentionally keep the

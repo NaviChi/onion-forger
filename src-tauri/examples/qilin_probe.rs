@@ -37,6 +37,7 @@ async fn main() {
         ports.clone(),
         arti_clients,
         opts,
+        None,
     ));
 
     let qilin_adapter = QilinAdapter;

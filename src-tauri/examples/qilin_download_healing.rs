@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use crawli_lib::aria_downloader;
-use crawli_lib::aria_downloader::DownloadState;
+use crawli_lib::aria_downloader::{BatchFileEntry, DownloadState};
 use crawli_lib::AppState;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -35,14 +36,20 @@ async fn main() -> Result<()> {
     println!("[1/4] Starting download and forcing a pause...");
     let control = aria_downloader::activate_download_control()
         .ok_or_else(|| anyhow!("download control already active"))?;
+    let jwt_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let download_task = tokio::spawn(aria_downloader::start_download(
         app.handle().clone(),
-        config.url.clone(),
-        config.output_path.clone(),
+        BatchFileEntry {
+            url: config.url.clone(),
+            path: config.output_path.clone(),
+            size_hint: None,
+            jwt_exp: None,
+        },
         config.circuits,
         true,
         None,
         control,
+        Arc::clone(&jwt_cache),
     ));
 
     let mut waited = 0u64;
@@ -105,14 +112,20 @@ async fn main() -> Result<()> {
     println!("[2/4] Resuming download...");
     let control = aria_downloader::activate_download_control()
         .ok_or_else(|| anyhow!("download control already active before resume"))?;
+    let jwt_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let second_result = aria_downloader::start_download(
         app.handle().clone(),
-        config.url.clone(),
-        config.output_path.clone(),
+        BatchFileEntry {
+            url: config.url.clone(),
+            path: config.output_path.clone(),
+            size_hint: None,
+            jwt_exp: None,
+        },
         config.circuits,
         true,
         None,
         control,
+        jwt_cache,
     )
     .await;
     aria_downloader::clear_download_control();

@@ -9,7 +9,6 @@
 ///
 /// Or for a specific adapter:
 ///   BENCHMARK_ADAPTER=dragonforce cargo test --test adapter_benchmark_test -- --nocapture --ignored
-
 use crawli_lib::adapters::{AdapterRegistry, EntryType, SiteFingerprint};
 use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
 use crawli_lib::telemetry_bridge;
@@ -124,19 +123,18 @@ fn load_test_database() -> TestDatabase {
         .join("benchmark_test_db.json");
     let data = std::fs::read_to_string(&db_path)
         .unwrap_or_else(|e| panic!("Failed to read test database at {:?}: {}", db_path, e));
-    serde_json::from_str(&data)
-        .unwrap_or_else(|e| panic!("Failed to parse test database: {}", e))
+    serde_json::from_str(&data).unwrap_or_else(|e| panic!("Failed to parse test database: {}", e))
 }
 
 fn diagnose_result(result: &BenchmarkResult) -> String {
     if result.status == "ERROR" {
-        if result.error_message.contains("timeout")
-            || result.error_message.contains("timed out")
-        {
-            return "NETWORK: Tor circuit timeout — site may be down or Tor network congested".to_string();
+        if result.error_message.contains("timeout") || result.error_message.contains("timed out") {
+            return "NETWORK: Tor circuit timeout — site may be down or Tor network congested"
+                .to_string();
         }
         if result.error_message.contains("hidden service") {
-            return "NETWORK: Hidden service descriptor not found — .onion may be offline".to_string();
+            return "NETWORK: Hidden service descriptor not found — .onion may be offline"
+                .to_string();
         }
         if result.error_message.contains("connection refused")
             || result.error_message.contains("reset")
@@ -373,10 +371,11 @@ async fn run_single_benchmark(
         agnostic_state: false,
         resume: false,
         resume_index: None,
+        mega_password: None,
     };
 
     let daemon_count = active_ports.len().max(1);
-    let frontier = CrawlerFrontier::new(
+    let mut frontier = CrawlerFrontier::new(
         Some(app_handle.clone()),
         test_url.url.clone(),
         daemon_count,
@@ -384,6 +383,7 @@ async fn run_single_benchmark(
         active_ports.to_vec(),
         arti_clients.to_vec(),
         options,
+        None,
     );
 
     // Phase 1: Fingerprint the target
@@ -464,8 +464,7 @@ async fn run_single_benchmark(
         }
         Err(_) => {
             result.status = "ERROR".to_string();
-            result.error_message =
-                format!("Fingerprint timed out after {}s", fp_timeout.as_secs());
+            result.error_message = format!("Fingerprint timed out after {}s", fp_timeout.as_secs());
             result.fingerprint_secs = fp_start.elapsed().as_secs_f64();
             result.diagnosis = diagnose_result(&result);
             return result;

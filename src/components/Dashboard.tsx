@@ -1,6 +1,7 @@
-import { Network, Cpu, Database, CloudDownload, TerminalSquare } from "lucide-react";
+import { Network, Cpu, Database, CloudDownload, TerminalSquare, Cloud } from "lucide-react";
 import "./Dashboard.css";
 import { VibeLoader } from "./VibeLoader";
+import { VfsTreeView } from "./VfsTreeView";
 
 interface DashboardProps {
   isCrawling: boolean;
@@ -42,6 +43,7 @@ interface DashboardProps {
   };
   logs: string[];
   vfsCount: number;
+  vfsRefreshTrigger: number;
   downloadProgress: Record<string, any>;
   elapsed: number;
   downloadElapsed: number;
@@ -79,6 +81,7 @@ interface DashboardProps {
     plannedFileCount: number;
     failureManifestPath: string;
   } | null;
+  onAzureClick?: () => void;
 }
 
 export function Dashboard({
@@ -89,12 +92,14 @@ export function Dashboard({
   downloadBatchStatus,
   logs,
   vfsCount,
+  vfsRefreshTrigger,
   downloadProgress,
   elapsed,
   downloadElapsed,
   resourceMetrics,
   crawlRunStatus,
   downloadResumePlan,
+  onAzureClick,
 }: DashboardProps) {
   let phase = "IDLE";
   let networkStatus = "Standby";
@@ -268,6 +273,18 @@ export function Dashboard({
         </div>
       </div>
 
+      {/* Phase 53: Azure Connectivity */}
+      {onAzureClick && (
+        <div className="dash-card" style={{ cursor: 'pointer' }} onClick={onAzureClick} data-testid="azure-connectivity-btn">
+          <div className="dash-icon"><Cloud size={24} /></div>
+          <div className="dash-info">
+            <div className="dash-title">AZURE CONNECTIVITY</div>
+            <div className="dash-value" style={{ fontSize: '0.85rem' }}>Enterprise Cloud + Intranet</div>
+            <div className="dash-sub">Click to configure Azure Storage or Intranet access</div>
+          </div>
+        </div>
+      )}
+
       <div className="dash-card resource-card" data-testid="crawl-baseline-card">
         <div className="dash-icon"><Database size={24} /></div>
         <div className="dash-info">
@@ -330,6 +347,20 @@ export function Dashboard({
               {crawlStatus.deltaNewFiles !== undefined ? ` | Delta New: ${crawlStatus.deltaNewFiles.toLocaleString()}` : ""}
             </div>
           )}
+        </div>
+      </div>
+
+      <div className="dash-card vfs-tree-card" style={{ gridColumn: "1 / -1", height: "400px", padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+        <div className="dash-info" style={{ width: "100%", padding: "16px", borderBottom: "1px solid var(--border-color)", flexShrink: 0 }}>
+          <div className="dash-title">VFS TARGET TREE</div>
+        </div>
+        <div style={{ flex: 1, overflow: "hidden" }}>
+          <VfsTreeView
+            triggerRefresh={vfsRefreshTrigger}
+            targetKey={crawlRunStatus?.targetKey || null}
+            stableCurrentListingPath={crawlRunStatus?.stableCurrentListingPath || null}
+            outputDir={downloadBatchStatus.outputDir}
+          />
         </div>
       </div>
     </div>

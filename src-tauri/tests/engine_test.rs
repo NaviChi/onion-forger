@@ -114,6 +114,7 @@ async fn test_frontier_initialization() {
         vec![9051, 9052, 9053, 9054],
         vec![],
         options,
+        None, // Persistent ledger bound
     );
 
     // Validate connection pool size: 4 daemons * 30 circuits = 120
@@ -147,6 +148,7 @@ async fn test_frontier_clearnet_initialization() {
         vec![],
         vec![],
         options,
+        None, // No persistent ledger for test stubs
     );
 
     // Clearnet: 1 client per daemon (breaks after first), minimum 1
@@ -172,6 +174,7 @@ async fn test_onion_listing_worker_target_stays_pinned_after_failures() {
         agnostic_state: false,
         resume: false,
         resume_index: None,
+        mega_password: None,
     };
     let frontier = CrawlerFrontier::new(
         None,
@@ -181,6 +184,7 @@ async fn test_onion_listing_worker_target_stays_pinned_after_failures() {
         vec![9051, 9052, 9053, 9054],
         vec![],
         options,
+        None, // Persistent ledger bound
     );
 
     // Force AIMD failure path repeatedly; onion listing mode should still keep full fanout.
@@ -216,6 +220,7 @@ async fn test_frontier_fresh_crawl_ignores_stale_wal_by_default() {
         vec![9051],
         vec![],
         CrawlOptions::default(),
+        None, // Persistent ledger bound
     );
     assert_eq!(
         frontier.visited_count(),
@@ -236,6 +241,7 @@ async fn test_bloom_filter_dedup() {
         vec![9051],
         vec![],
         CrawlOptions::default(),
+        None, // Persistent ledger bound
     );
 
     assert!(frontier.mark_visited("http://example.onion/page1"));
@@ -255,6 +261,7 @@ async fn test_client_round_robin() {
         vec![9051, 9052, 9053, 9054],
         vec![],
         CrawlOptions::default(),
+        None,
     );
 
     for _ in 0..240 {
@@ -435,7 +442,9 @@ async fn test_crawl_options_propagation() {
             agnostic_state: false,
             resume: false,
             resume_index: None,
+            mega_password: None,
         },
+        None, // Persistent ledger bound
     );
     assert!(!frontier.active_options.listing);
     assert!(!frontier.active_options.sizes);
@@ -458,7 +467,9 @@ async fn test_crawl_options_propagation() {
             agnostic_state: false,
             resume: false,
             resume_index: None,
+            mega_password: None,
         },
+        None, // Persistent ledger bound
     );
     assert!(frontier2.active_options.listing);
     assert!(frontier2.active_options.sizes);
@@ -477,6 +488,7 @@ async fn test_high_volume_bloom_filter_stress() {
         vec![9051, 9052, 9053, 9054],
         vec![],
         CrawlOptions::default(),
+        None,
     );
 
     // Insert 100,000 unique URLs
@@ -522,6 +534,7 @@ async fn test_concurrent_worker_simulation() {
         vec![9051, 9052, 9053, 9054],
         vec![],
         CrawlOptions::default(),
+        None, // Persistent ledger bound
     ));
 
     let start = Instant::now();

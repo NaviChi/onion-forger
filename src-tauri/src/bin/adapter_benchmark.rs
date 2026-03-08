@@ -12,13 +12,12 @@
 ///
 /// Custom duration (seconds):
 ///   BENCHMARK_DURATION=60 cargo run --bin adapter-benchmark
-
 use crawli_lib::adapters::{AdapterRegistry, EntryType, SiteFingerprint};
 use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
 use crawli_lib::telemetry_bridge;
 use crawli_lib::{tor, AppState};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tauri::Manager;
 
 fn default_benchmark_duration() -> u64 {
@@ -116,19 +115,22 @@ fn load_test_database() -> TestDatabase {
         .join("benchmark_test_db.json");
     let data = std::fs::read_to_string(&db_path)
         .unwrap_or_else(|e| panic!("Failed to read test database at {:?}: {}", db_path, e));
-    serde_json::from_str(&data)
-        .unwrap_or_else(|e| panic!("Failed to parse test database: {}", e))
+    serde_json::from_str(&data).unwrap_or_else(|e| panic!("Failed to parse test database: {}", e))
 }
 
 fn diagnose_result(result: &BenchmarkResult) -> String {
     if result.status == "ERROR" {
         if result.error_message.contains("timeout") || result.error_message.contains("timed out") {
-            return "NETWORK: Tor circuit timeout — site may be down or Tor network congested".to_string();
+            return "NETWORK: Tor circuit timeout — site may be down or Tor network congested"
+                .to_string();
         }
         if result.error_message.contains("hidden service") {
-            return "NETWORK: Hidden service descriptor not found — .onion may be offline".to_string();
+            return "NETWORK: Hidden service descriptor not found — .onion may be offline"
+                .to_string();
         }
-        if result.error_message.contains("connection refused") || result.error_message.contains("reset") {
+        if result.error_message.contains("connection refused")
+            || result.error_message.contains("reset")
+        {
             return "SERVER: Connection refused/reset — target server is likely down".to_string();
         }
         return format!("UNKNOWN: {}", result.error_message);
@@ -338,6 +340,7 @@ async fn run_single_benchmark(
         agnostic_state: false,
         resume: false,
         resume_index: None,
+        mega_password: None,
     };
 
     let daemon_count = active_ports.len().max(1);
@@ -349,6 +352,7 @@ async fn run_single_benchmark(
         active_ports.to_vec(),
         arti_clients.to_vec(),
         options,
+        None, // missing target ledger bound
     );
 
     // Phase 1: Fingerprint the target
@@ -375,7 +379,11 @@ async fn run_single_benchmark(
                     let headers: http::HeaderMap = resp.headers().clone();
                     match tokio::time::timeout(Duration::from_secs(30), resp.text()).await {
                         Ok(Ok(body)) => {
-                            frontier.record_success(retry_cid, body.len() as u64, fp_start.elapsed().as_millis() as u64);
+                            frontier.record_success(
+                                retry_cid,
+                                body.len() as u64,
+                                fp_start.elapsed().as_millis() as u64,
+                            );
                             return Ok(SiteFingerprint {
                                 url: test_url.url.clone(),
                                 status,
@@ -401,7 +409,9 @@ async fn run_single_benchmark(
             result.fingerprint_secs = fp_start.elapsed().as_secs_f64();
             println!(
                 "  [FP] Fingerprint obtained in {:.2}s (status={}, body_len={})",
-                result.fingerprint_secs, fp.status, fp.body.len()
+                result.fingerprint_secs,
+                fp.status,
+                fp.body.len()
             );
             fp
         }
@@ -438,7 +448,10 @@ async fn run_single_benchmark(
     };
 
     // Phase 3: Run the crawl with time limit
-    println!("  [CRAWL] Starting {}-second benchmark crawl...", benchmark_duration);
+    println!(
+        "  [CRAWL] Starting {}-second benchmark crawl...",
+        benchmark_duration
+    );
     let crawl_start = Instant::now();
     let frontier_arc = Arc::new(frontier);
 
@@ -452,24 +465,42 @@ async fn run_single_benchmark(
 
     match crawl_result {
         Ok(Ok(files)) => {
-            result.total_files = files.iter().filter(|e| matches!(e.entry_type, EntryType::File)).count();
-            result.total_folders = files.iter().filter(|e| matches!(e.entry_type, EntryType::Folder)).count();
+            result.total_files = files
+                .iter()
+                .filter(|e| matches!(e.entry_type, EntryType::File))
+                .count();
+            result.total_folders = files
+                .iter()
+                .filter(|e| matches!(e.entry_type, EntryType::Folder))
+                .count();
             result.total_entries = files.len();
             result.total_size_bytes = files.iter().filter_map(|e| e.size_bytes).sum();
 
-            result.status = if result.total_entries > 0 { "OK" } else { "ZERO" }.to_string();
+            result.status = if result.total_entries > 0 {
+                "OK"
+            } else {
+                "ZERO"
+            }
+            .to_string();
 
             result.entries_per_second = if result.crawl_duration_secs > 0.0 {
                 result.total_entries as f64 / result.crawl_duration_secs
-            } else { 0.0 };
+            } else {
+                0.0
+            };
 
             result.bytes_per_second = if result.crawl_duration_secs > 0.0 {
                 result.total_size_bytes as f64 / result.crawl_duration_secs
-            } else { 0.0 };
+            } else {
+                0.0
+            };
 
             println!(
                 "  [CRAWL] Complete: {} entries ({} files, {} folders) in {:.2}s",
-                result.total_entries, result.total_files, result.total_folders, result.crawl_duration_secs,
+                result.total_entries,
+                result.total_files,
+                result.total_folders,
+                result.crawl_duration_secs,
             );
         }
         Ok(Err(e)) => {
@@ -488,7 +519,10 @@ async fn run_single_benchmark(
                 );
             } else {
                 result.status = "TIMEOUT".to_string();
-                result.error_message = format!("Crawl timed out after {}s with no results", benchmark_duration);
+                result.error_message = format!(
+                    "Crawl timed out after {}s with no results",
+                    benchmark_duration
+                );
             }
         }
     }

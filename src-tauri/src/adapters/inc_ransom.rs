@@ -245,7 +245,8 @@ impl CrawlerAdapter for IncRansomAdapter {
                         f.record_success(cid, 4096, start_time.elapsed().as_millis() as u64);
 
                         if let Ok(resp) = &resp_result {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            {
                                 tokio::time::sleep(delay).await;
                             }
                         }
@@ -282,6 +283,7 @@ impl CrawlerAdapter for IncRansomAdapter {
                                                 );
 
                                                 new_files.push(FileEntry {
+                                                    jwt_exp: None,
                                                     path: file_path.clone(),
                                                     size_bytes: if f.active_options.sizes {
                                                         entry.size

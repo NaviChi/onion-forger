@@ -1,4 +1,25 @@
-> **Last Updated:** 2026-03-06T16:40 CST
+> **Last Updated:** 2026-03-07T15:37 CST
+
+## Phase 52B: Mega.nz + Torrent Frontend Integration (2026-03-07)
+
+### Issues Found
+- No UI affordance for Mega.nz or BitTorrent input — users had to know these were supported
+- Input field gave no feedback when a non-onion link was pasted
+- No visual distinction between active protocol modes
+
+### Fixes Implemented
+- Added permanent **Mega.nz** and **Torrent** toolbar buttons with `Cloud` and `Magnet` Lucide icons
+- Added `inputMode` React state (`onion | mega | torrent`) with auto-detect on URL `onChange`
+- Input label dynamically switches to `MEGA.NZ` / `TORRENT` / `Target Source` based on detected mode
+- Placeholder text changes per mode (mega URL pattern vs magnet URI pattern)
+- Added `.tool-btn.active` CSS with glowing cyan accent for active mode indication
+- Mode auto-detect rules: `mega.nz/` or `mega.co.nz/` → mega; `magnet:?` → torrent; else → onion
+
+### Prevention Rules
+**19. New download modes must have always-visible toolbar buttons, not hidden settings.**
+**20. Auto-detect must run synchronously on every input keystroke — no debounce — for instant mode feedback.**
+**21. Mode-specific placeholder text must guide users toward correct URL format for each protocol.**
+
 
 ## Phase 1.0.8: Target Baseline Status and Failure-First Queue Visibility (2026-03-06)
 

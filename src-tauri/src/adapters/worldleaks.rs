@@ -66,8 +66,6 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
         for _ in 0..max_concurrent {
             let f = frontier.clone();
             let q_clone = queue.clone();
-            let ui_tx_clone = ui_tx.clone();
-            let discovered_ref = all_discovered_entries.clone();
             let pending_clone = pending.clone();
 
             workers.spawn(async move {
@@ -87,55 +85,91 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
                         }
                     };
 
-                    // Advanced Politeness Throttle
-                    let _permit = f.politeness_semaphore.acquire().await.ok();
-
-                    // Round Robin Persistent Client
-                    let (cid, _client) = f.get_client();
-
-                    let start_time = std::time::Instant::now();
-
-                    // Emulated network fetch
-                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-
-                    f.record_success(cid, 1024, start_time.elapsed().as_millis() as u64);
-
-                    // Emulating parsed discoveries (In reality we client.get(&next_url).await...)
-                    let mut new_files = Vec::new();
-                    let items_to_find = rand::random::<u8>() % 5;
-
-                    for i in 0..items_to_find {
-                        let dummy_url = format!("{next_url}/node_{i}");
-                        if f.mark_visited(&dummy_url) {
-                            // Add back to queue to recurse inside
-                            pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            q_clone.push(dummy_url.clone());
-
-                            let entry = super::FileEntry {
-                                path: format!(
-                                    "/Target Server/{}",
-                                    dummy_url.replace("http://", "")
-                                ),
-                                size_bytes: Some(1024 * (i as u64 + 1)),
-                                entry_type: super::EntryType::File,
-                                raw_url: dummy_url,
-                            };
-                            new_files.push(entry);
+                    struct TaskGuard {
+                        counter: Arc<std::sync::atomic::AtomicUsize>,
+                    }
+                    impl Drop for TaskGuard {
+                        fn drop(&mut self) {
+                            self.counter
+                                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
+                    let _guard = TaskGuard {
+                        counter: pending_clone.clone(),
+                    };
 
-                    // Send to IPC batcher
-                    for file in &new_files {
-                        let _ = ui_tx_clone.send(file.clone()).await;
+                    // Advanced Politeness Throttle
+                    let _permit = f.politeness_semaphore.acquire().await.ok();
+                    let (cid, _client) = f.get_client();
+                    let start_time = std::time::Instant::now();
+
+                    let mut fetch_success = false;
+                    let mut bytes_downloaded = 0;
+                    let mut html = String::new();
+                    let mut active_cid = cid;
+                    let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
+
+                    for _ in 0..4 {
+                        let (current_cid, current_client) = f.get_client();
+                        active_cid = current_cid;
+
+                        let req = current_client.get(&next_url).send();
+                        if let Ok(Ok(resp)) =
+                            tokio::time::timeout(std::time::Duration::from_secs(45), req).await
+                        {
+                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            {
+                                tokio::time::sleep(delay).await;
+                            }
+
+                            println!(
+                                "[DEBUG WORLDLEAKS] Fetch status for {}: {}",
+                                next_url,
+                                resp.status()
+                            );
+
+                            if resp.status().is_success() {
+                                if let Ok(Ok(body)) = tokio::time::timeout(
+                                    std::time::Duration::from_secs(45),
+                                    resp.text(),
+                                )
+                                .await
+                                {
+                                    bytes_downloaded += body.len() as u64;
+                                    html = body;
+                                    fetch_success = true;
+                                    break;
+                                }
+                            } else if resp.status() == 404 {
+                                break;
+                            }
+                        } else {
+                            println!(
+                                "[DEBUG WORLDLEAKS] Timeout or client error connecting to {}",
+                                next_url
+                            );
+                        }
+                        f.record_failure(active_cid);
                     }
 
-                    // Save internally
-                    if !new_files.is_empty() {
-                        let mut lock = discovered_ref.lock().await;
-                        lock.extend(new_files);
+                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                    if fetch_success {
+                        f.record_success(active_cid, bytes_downloaded, elapsed_ms);
+                    } else {
+                        f.record_failure(active_cid);
                     }
 
-                    pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    if fetch_success && !html.is_empty() {
+                        let html_len = html.len();
+                        let start_idx = html_len.saturating_sub(4000);
+                        println!(
+                            "[DEBUG WORLDLEAKS PARSER] Raw HTML end ({} bytes): {}",
+                            html_len,
+                            &html[start_idx..]
+                        );
+
+                        // We will add the actual HTML parsing here later
+                    }
                 }
             });
         }

@@ -252,6 +252,7 @@ async fn run_single_adapter(
         resume: false,
         agnostic_state: false,
         resume_index: None,
+        mega_password: None,
     };
     let daemon_count = if is_onion {
         active_ports.len().max(1)
@@ -269,9 +270,10 @@ async fn run_single_adapter(
         url.to_string(),
         daemon_count,
         is_onion,
-        active_ports,
+        Vec::new(), // explicit ports removed, handled internally
         arti_clients,
         options.clone(),
+        None,
     );
     frontier.swarm_guard = swarm_guard;
     let frontier_arc = Arc::new(frontier);

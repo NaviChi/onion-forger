@@ -20,8 +20,7 @@ pub struct AbyssAdapter;
 
 /// Known archive extensions for direct-file detection
 const ARCHIVE_EXTENSIONS: &[&str] = &[
-    ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz",
-    ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz",
+    ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz",
 ];
 
 /// Check if a URL points to a direct downloadable archive
@@ -78,21 +77,23 @@ fn parse_abyss_listing(html: &str, base_url: &str) -> Vec<FileEntry> {
                 }
 
                 // Build absolute URL
-                let child_url = if raw_href.starts_with("http://") || raw_href.starts_with("https://") {
-                    raw_href.to_string()
-                } else {
-                    let encoded = path_utils::url_encode(&clean_name);
-                    if is_dir {
-                        format!("{}/{}/", base_url.trim_end_matches('/'), encoded)
+                let child_url =
+                    if raw_href.starts_with("http://") || raw_href.starts_with("https://") {
+                        raw_href.to_string()
                     } else {
-                        format!("{}/{}", base_url.trim_end_matches('/'), encoded)
-                    }
-                };
+                        let encoded = path_utils::url_encode(&clean_name);
+                        if is_dir {
+                            format!("{}/{}/", base_url.trim_end_matches('/'), encoded)
+                        } else {
+                            format!("{}/{}", base_url.trim_end_matches('/'), encoded)
+                        }
+                    };
 
                 // Try to extract size from the line (after </a>)
                 let size = extract_size_from_line(line);
 
                 entries.push(FileEntry {
+                    jwt_exp: None,
                     path: format!("/{}", path_utils::sanitize_path(&clean_name)),
                     size_bytes: size,
                     entry_type: if is_dir {
@@ -165,7 +166,10 @@ impl CrawlerAdapter for AbyssAdapter {
         // CASE 1: Direct archive download URL
         if is_direct_archive_url(current_url) {
             let filename = extract_filename_from_url(current_url);
-            let _ = app.emit("log", format!("[Abyss] Direct archive detected: {}", filename));
+            let _ = app.emit(
+                "log",
+                format!("[Abyss] Direct archive detected: {}", filename),
+            );
 
             // Probe for file size via HEAD request
             let (cid, client) = frontier.get_client();
@@ -189,6 +193,7 @@ impl CrawlerAdapter for AbyssAdapter {
             }
 
             let entry = FileEntry {
+                jwt_exp: None,
                 path: format!("/{}", path_utils::sanitize_path(&filename)),
                 size_bytes,
                 entry_type: EntryType::File,
@@ -296,7 +301,8 @@ impl CrawlerAdapter for AbyssAdapter {
                         )
                         .await
                         {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            {
                                 tokio::time::sleep(delay).await;
                             }
                             if resp.status().is_success() {
@@ -336,10 +342,11 @@ impl CrawlerAdapter for AbyssAdapter {
 
                     // Parse the page for links
                     let base_url_clone = next_url.clone();
-                    let parsed_entries =
-                        tokio::task::spawn_blocking(move || parse_abyss_listing(&html, &base_url_clone))
-                            .await
-                            .unwrap_or_default();
+                    let parsed_entries = tokio::task::spawn_blocking(move || {
+                        parse_abyss_listing(&html, &base_url_clone)
+                    })
+                    .await
+                    .unwrap_or_default();
 
                     let mut new_files = Vec::new();
                     for entry in parsed_entries {
@@ -379,9 +386,7 @@ impl CrawlerAdapter for AbyssAdapter {
     }
 
     fn known_domains(&self) -> Vec<&'static str> {
-        vec![
-            "vmmefm7ktazj2bwtmy46o3wxhk42tctasyyqv6ymuzlivszteyhkkyad.onion",
-        ]
+        vec!["vmmefm7ktazj2bwtmy46o3wxhk42tctasyyqv6ymuzlivszteyhkkyad.onion"]
     }
 
     fn regex_marker(&self) -> Option<&'static str> {

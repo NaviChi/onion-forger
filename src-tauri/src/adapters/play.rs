@@ -117,6 +117,7 @@ impl CrawlerAdapter for PlayAdapter {
 
                         // Emit parent folder entry
                         new_files.push(FileEntry {
+                            jwt_exp: None,
                             path: format!("/{}", dir_name),
                             size_bytes: None,
                             entry_type: EntryType::Folder,
@@ -124,10 +125,16 @@ impl CrawlerAdapter for PlayAdapter {
                         });
 
                         // Fetch the HTML listing page
-                        let fetch_result = tokio::time::timeout(std::time::Duration::from_secs(45), client.get(&next_url).send()).await;
+                        let fetch_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(45),
+                            client.get(&next_url).send(),
+                        )
+                        .await;
                         let html = match fetch_result {
                             Ok(Ok(resp)) => {
-                                if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                                if let Some(delay) =
+                                    ddos_guard.record_response(resp.status().as_u16())
+                                {
                                     tokio::time::sleep(delay).await;
                                 }
                                 if resp.status().is_success() {
@@ -177,6 +184,7 @@ impl CrawlerAdapter for PlayAdapter {
 
                             if parsed_entry.2 {
                                 new_files.push(FileEntry {
+                                    jwt_exp: None,
                                     path: display_path,
                                     size_bytes: None,
                                     entry_type: EntryType::Folder,
@@ -204,6 +212,7 @@ impl CrawlerAdapter for PlayAdapter {
                             };
 
                             new_files.push(FileEntry {
+                                jwt_exp: None,
                                 path: display_path,
                                 size_bytes: size,
                                 entry_type: EntryType::File,

@@ -66,6 +66,7 @@ pub struct DownloadBudget {
     pub small_file_parallelism: usize,
     pub initial_active_cap: usize,
     pub tournament_cap: usize,
+    pub micro_swarm_circuits: usize,
     pub pressure: GovernorPressure,
 }
 
@@ -450,6 +451,14 @@ pub fn recommend_download_budget(
         small_file_parallelism,
         initial_active_cap,
         tournament_cap,
+        micro_swarm_circuits: apply_pressure_to_budget(
+            8,
+            2,
+            12,
+            pressure.total_pressure,
+            matches!(profile.storage_class, StorageClass::Nvme),
+        )
+        .max(1),
         pressure,
     }
 }

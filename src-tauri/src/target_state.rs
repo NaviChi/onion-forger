@@ -79,6 +79,22 @@ pub struct TargetLedger {
     pub best_snapshot_version: usize,
     pub last_outcome: Option<String>,
     pub runs: Vec<CrawlRunRecord>,
+    pub learned_prefixes: Vec<String>,
+    /// Phase 53: Optional Azure Storage config for this target (feature-gated)
+    #[serde(default)]
+    pub azure_config: Option<serde_json::Value>,
+}
+
+impl TargetLedger {
+    /// FIX M-3: Pure sync — no I/O needed, `async` was unnecessary
+    pub fn get_learned_prefix_boost(&self, url: &str) -> i32 {
+        for prefix in &self.learned_prefixes {
+            if url.starts_with(prefix) {
+                return 1000;
+            }
+        }
+        0
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -154,9 +170,18 @@ pub fn derive_target_identity(url: &str) -> TargetIdentity {
 pub fn target_paths(output_root: &Path, target_url: &str) -> Result<TargetPaths> {
     let identity = derive_target_identity(target_url);
     let support_root = output_root.join("temp_onionforge_forger");
-    let target_dir = support_root.join("targets").join(&identity.target_key);
+    let target_dir = output_root.join("targets").join(&identity.target_key);
+    let current_dir = target_dir.join("current");
+    let best_dir = target_dir.join("best");
     let history_dir = target_dir.join("crawl_history");
+
+    std::fs::create_dir_all(&current_dir)?;
+    std::fs::create_dir_all(&best_dir)?;
     std::fs::create_dir_all(&history_dir)?;
+
+    // Create downloads directory to ensure it exists
+    let downloads_dir = output_root.join("downloads").join(&identity.target_key);
+    std::fs::create_dir_all(&downloads_dir)?;
 
     Ok(TargetPaths {
         target_identity: identity.clone(),
@@ -168,14 +193,10 @@ pub fn target_paths(output_root: &Path, target_url: &str) -> Result<TargetPaths>
         best_snapshot_path: target_dir.join("crawl_best_entries.json"),
         failure_manifest_path: target_dir.join("download_failures.json"),
         latest_resume_plan_path: target_dir.join("download_resume_plan.json"),
-        stable_current_listing_path: output_root
-            .join(format!("{}__crawl_current.txt", identity.target_key)),
-        stable_current_dirs_listing_path: output_root
-            .join(format!("{}__crawl_current_dirs.txt", identity.target_key)),
-        stable_best_listing_path: output_root
-            .join(format!("{}__crawl_best.txt", identity.target_key)),
-        stable_best_dirs_listing_path: output_root
-            .join(format!("{}__crawl_best_dirs.txt", identity.target_key)),
+        stable_current_listing_path: current_dir.join("listing_canonical.json"),
+        stable_current_dirs_listing_path: current_dir.join("listing_windows.txt"),
+        stable_best_listing_path: best_dir.join("listing_canonical.json"),
+        stable_best_dirs_listing_path: best_dir.join("listing_windows.txt"),
     })
 }
 
@@ -215,6 +236,8 @@ pub fn load_or_default_ledger(paths: &TargetPaths) -> Result<TargetLedger> {
         best_snapshot_version: 1,
         last_outcome: None,
         runs: Vec::new(),
+        learned_prefixes: Vec::new(),
+        azure_config: None,
     })
 }
 
@@ -298,7 +321,7 @@ pub fn write_current_and_history_listings(
         .join(format!("{}__canonical.txt", timestamp));
     let history_dirs_path = paths.history_dir.join(format!("{}__dirs.txt", timestamp));
     let canonical =
-        render_canonical_listing(target_url, &paths.target_identity.target_key, entries);
+        serde_json::to_string_pretty(&sorted_entries(entries)).unwrap_or_else(|_| "[]".to_string());
     let dirs = render_dir_listing(target_url, &paths.target_identity.target_key, entries);
 
     std::fs::write(&paths.stable_current_listing_path, canonical.as_bytes())?;
@@ -320,7 +343,7 @@ pub fn write_best_listings(
     target_url: &str,
 ) -> Result<()> {
     let canonical =
-        render_canonical_listing(target_url, &paths.target_identity.target_key, entries);
+        serde_json::to_string_pretty(&sorted_entries(entries)).unwrap_or_else(|_| "[]".to_string());
     let dirs = render_dir_listing(target_url, &paths.target_identity.target_key, entries);
     std::fs::write(&paths.stable_best_listing_path, canonical.as_bytes())?;
     std::fs::write(&paths.stable_best_dirs_listing_path, dirs.as_bytes())?;
@@ -491,34 +514,7 @@ pub fn reconcile_failure_manifest(
     Ok(next_records)
 }
 
-fn render_canonical_listing(target_url: &str, target_key: &str, entries: &[FileEntry]) -> String {
-    let sorted_entries = sorted_entries(entries);
-    let mut content = String::new();
-    content.push_str(&format!("CRAWL LISTING FOR: {}\n", target_url));
-    content.push_str(&format!("TARGET KEY: {}\n", target_key));
-    content.push_str(&format!(
-        "CRAWL INDEX COMPLETED AT: {}\n",
-        chrono::Local::now().to_rfc2822()
-    ));
-    content.push_str(&format!("TOTAL ENTRIES: {}\n", sorted_entries.len()));
-    content
-        .push_str("========================================================================\n\n");
-
-    for entry in sorted_entries {
-        let type_str = if matches!(entry.entry_type, EntryType::Folder) {
-            "[DIR]"
-        } else {
-            "[FILE]"
-        };
-        let size_str = entry
-            .size_bytes
-            .map(|size| format!("{} bytes", size))
-            .unwrap_or_else(|| "Unknown size".to_string());
-        content.push_str(&format!("{:<7} {} ({})\n", type_str, entry.path, size_str));
-    }
-
-    content
-}
+// canonical logic moved to pure JSON.
 
 fn render_dir_listing(target_url: &str, target_key: &str, entries: &[FileEntry]) -> String {
     let sorted_entries = sorted_entries(entries);
@@ -689,6 +685,7 @@ mod tests {
 
     fn entry(path: &str, size: Option<u64>) -> FileEntry {
         FileEntry {
+            jwt_exp: None,
             path: path.to_string(),
             size_bytes: size,
             entry_type: if path.ends_with('/') {

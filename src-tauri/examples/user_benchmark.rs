@@ -1,27 +1,31 @@
 use crawli_lib::adapters::qilin::QilinAdapter;
 use crawli_lib::adapters::{CrawlerAdapter, EntryType};
 use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
+use crawli_lib::AppState;
 use std::sync::Arc;
 use tauri::Builder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app = Builder::default().build(tauri::generate_context!())?;
+    let app = Builder::default()
+        .manage(AppState::default())
+        .build(tauri::generate_context!())?;
     let target = "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed".to_string();
 
     let options = CrawlOptions {
         listing: true,
         sizes: true,
         download: false,
-        circuits: Some(60), // Use 60 circuits
-        daemons: Some(5),   // Use 5 daemons
+        circuits: Some(96), // Use 96 circuits (8 daemons × 12)
+        daemons: Some(8),   // Use 8 daemons
         agnostic_state: false,
         resume: false,
         resume_index: None,
+        mega_password: None,
     };
 
     println!("Bootstrapping Tor cluster...");
-    let tor_daemons = 5;
+    let tor_daemons = 8;
     let (_swarm, ports) =
         crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), tor_daemons).await?;
     println!("Tor cluster bootstrapped on ports: {:?}", ports);
@@ -47,11 +51,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Qilin crawl on: {}", target);
     let start_time = std::time::Instant::now();
 
-    let mut tor_ports = Vec::with_capacity(60);
+    let num_circuits = 96;
+    let mut tor_ports = Vec::with_capacity(num_circuits);
     if ports.is_empty() {
-        tor_ports = vec![0; 60];
+        tor_ports = vec![0; num_circuits];
     } else {
-        for i in 0..60 {
+        for i in 0..num_circuits {
             tor_ports.push(ports[i % ports.len()]);
         }
     }
@@ -59,11 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frontier = Arc::new(CrawlerFrontier::new(
         Some(app.handle().clone()),
         target.clone(),
-        60,    // circuits
-        false, // force_tor
+        num_circuits, // circuits
+        false,        // force_tor
         tor_ports,
         Vec::new(),
         options,
+        None,
     ));
 
     let adapter = QilinAdapter;

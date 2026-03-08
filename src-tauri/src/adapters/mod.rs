@@ -21,6 +21,7 @@ pub enum EntryType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
+    pub jwt_exp: Option<u64>,
     pub path: String, // Relative path starting with /
     pub size_bytes: Option<u64>,
     pub entry_type: EntryType,
@@ -44,7 +45,7 @@ pub trait CrawlerAdapter: Send + Sync {
     /// Examine the site fingerprint and determine if this adapter can handle its DOM/Headers.
     async fn can_handle(&self, fingerprint: &SiteFingerprint) -> bool;
 
-    /// Extract items from the given URL using the Frontier's Tor engine.
+    /// Extrac items from the given URL using the Frontier's Tor engine.
     /// Periodically emits progress back to the Tauri App to keep the UI responsive.
     async fn crawl(
         &self,
@@ -52,6 +53,16 @@ pub trait CrawlerAdapter: Send + Sync {
         frontier: std::sync::Arc<crate::frontier::CrawlerFrontier>,
         app: AppHandle,
     ) -> anyhow::Result<Vec<FileEntry>>;
+
+    /// Optional hook to fetch a fresh JWT token for an expired FileEntry.
+    /// By default, returns Ok(None) meaning JWT refresh is unsupported or unnecessary.
+    async fn refresh_jwt(
+        &self,
+        _entry: &FileEntry,
+        _client: &crate::arti_client::ArtiClient,
+    ) -> anyhow::Result<Option<FileEntry>> {
+        Ok(None)
+    }
 
     /// Adapter name, for logging
     fn name(&self) -> &'static str;
@@ -69,9 +80,11 @@ pub trait CrawlerAdapter: Send + Sync {
 }
 
 pub mod abyss;
+pub mod adapter_pipeline_trait;
 pub mod alphalocker;
 pub mod autoindex;
 pub mod dragonforce;
+pub mod explorer;
 pub mod inc_ransom;
 pub mod lockbit;
 pub mod nu;
@@ -79,8 +92,9 @@ pub mod pear;
 pub mod play;
 pub mod plugin_host;
 pub mod qilin;
-pub mod qilin_nodes;
 pub mod qilin_ddos_guard;
+pub mod qilin_nodes;
+pub mod universal_explorer;
 pub mod worldleaks;
 
 pub fn support_catalog() -> Vec<AdapterSupportInfo> {
@@ -218,6 +232,15 @@ pub fn support_catalog() -> Vec<AdapterSupportInfo> {
             tested_for: vec!["Fallback adapter match (engine_test)"],
             notes: "Default catch-all fallback when specialized adapters do not match.",
         },
+        AdapterSupportInfo {
+            id: "universal_explorer",
+            name: "Adaptive Universal Explorer",
+            support_level: "Tier-4 Intelligent Fallback",
+            matching_strategy: "Accepts all unmatched fingerprints — heuristic link scoring + speculative JoinSet prefetch",
+            sample_urls: vec!["any unrecognized .onion URL"],
+            tested_for: vec!["Compilation verification (cargo check --lib)"],
+            notes: "Intelligent fallback that discovers structure on-the-fly via BinaryHeap scored traversal and learns winning paths in the TargetLedger.",
+        },
     ]
 }
 
@@ -237,6 +260,17 @@ impl Default for AdapterRegistry {
 impl AdapterRegistry {
     pub fn new() -> Self {
         Self::with_plugin_dir(None)
+    }
+
+    pub fn with_explorer_context(
+        mut self,
+        ledger: std::sync::Arc<crate::target_state::TargetLedger>,
+    ) -> Self {
+        self.adapters.push((
+            "universal_explorer".to_string(),
+            Box::new(universal_explorer::AdaptiveUniversalExplorer::new(ledger)),
+        ));
+        self
     }
 
     pub fn with_plugin_dir(plugin_dir: Option<&std::path::Path>) -> Self {
@@ -276,10 +310,9 @@ impl AdapterRegistry {
         registry
             .adapters
             .push(("lockbit".to_string(), Box::new(lockbit::LockBitAdapter)));
-        registry.adapters.push((
-            "abyss".to_string(),
-            Box::new(abyss::AbyssAdapter),
-        ));
+        registry
+            .adapters
+            .push(("abyss".to_string(), Box::new(abyss::AbyssAdapter)));
         registry.adapters.push((
             "alphalocker".to_string(),
             Box::new(alphalocker::AlphaLockerAdapter),
@@ -290,6 +323,7 @@ impl AdapterRegistry {
         registry
             .adapters
             .push(("nu_server".to_string(), Box::new(nu::NuServerAdapter)));
+        // FIX C-1: Old explorer.rs de-registered — universal_explorer.rs replaces it via with_explorer_context()
 
         for entry in plugin_host::load_runtime_plugins(plugin_dir, &mut registry.domain_cache) {
             registry.adapters.push(entry);
@@ -322,8 +356,6 @@ impl AdapterRegistry {
         &self,
         fingerprint: &SiteFingerprint,
     ) -> Option<&dyn CrawlerAdapter> {
-        use futures::StreamExt;
-
         // 1. FAST PATH (M.A.C Tier 1): Check O(1) known domain database mapped to the specific adapter
         if let Ok(parsed_url) = reqwest::Url::parse(&fingerprint.url) {
             if let Some(domain) = parsed_url.domain() {
@@ -365,20 +397,12 @@ impl AdapterRegistry {
             }
         }
 
-        let mut concurrent_checks = futures::stream::FuturesUnordered::new();
+        // FIX C-2: Sequential ordered iteration instead of FuturesUnordered race.
+        // This guarantees specialized adapters (registered first) are always tried
+        // before catch-all fallbacks like universal_explorer.
         for adapter in candidates_to_check {
-            concurrent_checks.push(async move {
-                if adapter.can_handle(fingerprint).await {
-                    Some(adapter.as_ref())
-                } else {
-                    None
-                }
-            });
-        }
-
-        while let Some(res) = concurrent_checks.next().await {
-            if res.is_some() {
-                return res;
+            if adapter.can_handle(fingerprint).await {
+                return Some(adapter.as_ref());
             }
         }
 

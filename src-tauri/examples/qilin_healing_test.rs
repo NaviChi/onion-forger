@@ -13,6 +13,7 @@ async fn main() -> Result<()> {
         agnostic_state: false,
         resume: false,
         resume_index: None,
+        mega_password: None,
     };
 
     let frontier = CrawlerFrontier::new(
@@ -23,6 +24,7 @@ async fn main() -> Result<()> {
         vec![9051],
         Vec::new(),
         options,
+        None,
     );
 
     println!("Qilin healing smoke test");

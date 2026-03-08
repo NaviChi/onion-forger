@@ -13,6 +13,7 @@ async fn main() -> Result<()> {
         agnostic_state: false,
         resume: false,
         resume_index: None,
+        mega_password: None,
     };
 
     let frontier = CrawlerFrontier::new(
@@ -23,6 +24,7 @@ async fn main() -> Result<()> {
         (9051..=9062).collect(),
         Vec::new(),
         options,
+        None,
     );
 
     println!("=== FULL SCALE QILIN CRAWLER DIAGNOSTIC ===");

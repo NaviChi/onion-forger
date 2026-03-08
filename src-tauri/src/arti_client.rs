@@ -38,9 +38,15 @@ impl ArtiClient {
             .unwrap()
             .https_or_http()
             .enable_http1()
+            .enable_http2()
             .wrap_connector(arti_connector);
 
-        let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
+        let client = Client::builder(hyper_util::rt::TokioExecutor::new())
+            .http2_only(false)
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(15)))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(32)
+            .build(https);
 
         Self::Tor {
             client,
@@ -218,7 +224,7 @@ impl ArtiRequestBuilder {
                     if !accumulated_cookies.is_empty() {
                         req = req.header(http::header::COOKIE, accumulated_cookies.join("; "));
                     }
-                    
+
                     let req_obj = req
                         .body(http_body_util::Full::new(body_bytes.clone()))
                         .map_err(|e| anyhow!("Failed to build request: {}", e))?;

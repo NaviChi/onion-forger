@@ -3,10 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { VFSExplorer, FileEntry } from "./components/VFSExplorer";
 import { Dashboard } from "./components/Dashboard";
+import { AzureConnectivityModal } from "./components/AzureConnectivityModal";
 import { VibeLoader } from "./components/VibeLoader";
 import { downloadDir, join } from "@tauri-apps/api/path";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp } from "lucide-react";
+import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp, Cloud, Magnet } from "lucide-react";
 import { FIXTURE_RESOURCE_METRICS, VFS_FIXTURE_STATS, isVfsFixtureMode } from "./fixtures/vfsFixture";
 
 import "./App.css";
@@ -411,6 +412,12 @@ function App() {
   const isTauriRuntime = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
   const isFixtureMode = !isTauriRuntime && isVfsFixtureMode();
   const [url, setUrl] = useState("");
+  const [inputMode, setInputMode] = useState<"onion" | "mega" | "torrent">("onion");
+  const [megaPassword, setMegaPassword] = useState("");
+  const [megaProgress, setMegaProgress] = useState<{ index: number; total: number; file: string; status: string; completed: number; failed: number; skipped: number } | null>(null);
+  const [torrentProgress, setTorrentProgress] = useState<{ downloaded_bytes: number; total_bytes: number; progress_pct: string; download_speed: string; status: string } | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [showAzureModal, setShowAzureModal] = useState(false);
   const [isCrawling, setIsCrawling] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [vfsStats, setVfsStats] = useState({ files: 0, folders: 0, size: 0, totalNodes: 0 });
@@ -457,8 +464,8 @@ function App() {
     listing: true,
     sizes: true,
     download: false,
-    circuits: 120,
-    daemons: 0,
+    circuits: 6,
+    daemons: 1,
     agnosticState: false,
     resume: false,
     resumeIndex: undefined as string | undefined
@@ -923,6 +930,27 @@ function App() {
           showToast("success", "Download Interrupted", `${event.payload.reason} for ${displayPath}`);
         })
       );
+
+      // Phase 52E: Mega/Torrent progress listeners
+      unlistenPromises.push(
+        listen<any>("mega_download_progress", (event) => {
+          setMegaProgress(event.payload);
+          if (event.payload.status === "done" || event.payload.status === "error") {
+            // Clear progress card after last file completes
+            if (event.payload.index >= event.payload.total) {
+              setTimeout(() => setMegaProgress(null), 3000);
+            }
+          }
+        })
+      );
+      unlistenPromises.push(
+        listen<any>("torrent_download_progress", (event) => {
+          setTorrentProgress(event.payload);
+          if (event.payload.status === "complete") {
+            setTimeout(() => setTorrentProgress(null), 3000);
+          }
+        })
+      );
     } else if (!isFixtureMode && !previewNoticeShownRef.current) {
       previewNoticeShownRef.current = true;
       setResourceMetrics(INITIAL_RESOURCE_METRICS);
@@ -1035,6 +1063,7 @@ function App() {
         ...crawlOptions,
         daemons: crawlOptions.daemons > 0 ? crawlOptions.daemons : null,
         resume: resumeMode,
+        mega_password: megaPassword || null,
       };
 
       const result = await invoke<CrawlSessionResult>("start_crawl", { url, options: payloadOptions, outputDir });
@@ -1159,11 +1188,11 @@ function App() {
             url: rawUrl,
             path: filePath,
             output_root: outputDir,
-            connections: crawlOptions.circuits || 120,
+            connections: crawlOptions.circuits || 8,
             force_tor: rawUrl.includes(".onion"),
           }
         });
-        showToast("success", "Download Engine Started", `Allocating ${crawlOptions.circuits || 120} circuits to target...`);
+        showToast("success", "Download Engine Started", `Allocating ${crawlOptions.circuits || 8} Multi-Clients to target...`);
       }
     } catch (err: any) {
       setLogs((l) => [...l, `[ERROR] Download failed: ${err}`]);
@@ -1381,6 +1410,22 @@ function App() {
         >
           <CircleHelp size={22} /> Support
         </button>
+        <button
+          className={`tool-btn ${inputMode === 'mega' ? 'active' : ''}`}
+          data-testid="btn-mega"
+          onClick={() => setInputMode('mega')}
+          title="Switch to Mega.nz download mode"
+        >
+          <Cloud size={22} /> Mega.nz
+        </button>
+        <button
+          className={`tool-btn ${inputMode === 'torrent' ? 'active' : ''}`}
+          data-testid="btn-torrent"
+          onClick={() => setInputMode('torrent')}
+          title="Switch to BitTorrent download mode"
+        >
+          <Magnet size={22} /> Torrent
+        </button>
       </div>
 
       {showSupportPopover && (
@@ -1443,23 +1488,68 @@ function App() {
         </div>
       )}
 
-      <div className="url-bar">
+      <div
+        className={`url-bar ${isDragOver ? 'drag-over' : ''}`}
+        onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+        onDragLeave={() => setIsDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDragOver(false);
+          const file = e.dataTransfer.files[0];
+          if (file && file.name.endsWith('.torrent')) {
+            setInputMode('torrent');
+            // In Tauri, we get the real path; in browser context use the name
+            const path = (file as any).path || file.name;
+            setUrl(path);
+            setLogs((l) => [...l.slice(-399), `[SYSTEM] .torrent file dropped: ${path}`]);
+          }
+        }}
+      >
         <div className="input-group">
-          <span className="input-label">Target Source</span>
+          <span className="input-label">
+            {inputMode === "mega" ? "MEGA.NZ" : inputMode === "torrent" ? "TORRENT" : "Target Source"}
+          </span>
           <input
             ref={urlInputRef}
             data-testid="input-target-url"
             type="text"
             className="url-input"
-            placeholder="http://... (⌘+Enter to start)"
+            placeholder={inputMode === "mega" ? "https://mega.nz/folder/..." : inputMode === "torrent" ? "magnet:?xt=... or drop .torrent file" : "http://... (⌘+Enter to start)"}
             value={url}
-            onChange={(e) => setUrl(e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              setUrl(val);
+              // Phase 52: Auto-detect input mode
+              if (val.includes("mega.nz/") || val.includes("mega.co.nz/")) {
+                setInputMode("mega");
+              } else if (val.trimStart().toLowerCase().startsWith("magnet:?")) {
+                setInputMode("torrent");
+              } else {
+                setInputMode("onion");
+              }
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Enter') handleCrawl();
             }}
             disabled={isCrawling}
           />
         </div>
+
+        {/* Phase 52E: Mega password input for #P! protected links */}
+        {inputMode === "mega" && url.includes("#P!") && (
+          <div className="input-group" style={{ marginTop: '6px' }}>
+            <span className="input-label" style={{ background: 'var(--accent-warning, #ff9800)', color: '#000' }}>PASSWORD</span>
+            <input
+              data-testid="input-mega-password"
+              type="password"
+              className="url-input"
+              placeholder="Enter Mega.nz folder password"
+              value={megaPassword}
+              onChange={(e) => setMegaPassword(e.target.value)}
+              disabled={isCrawling}
+            />
+          </div>
+        )}
 
         <button
           className="action-btn popup-hover"
@@ -1476,6 +1566,32 @@ function App() {
           )}
         </button>
       </div>
+
+      {/* Phase 52E: Mega/Torrent download progress cards */}
+      {megaProgress && (
+        <div className="mega-torrent-progress-card" data-testid="mega-progress-card">
+          <div className="progress-header">MEGA Download — {megaProgress.index}/{megaProgress.total}</div>
+          <div className="progress-file">{megaProgress.file}</div>
+          <div className="progress-bar-container">
+            <div className="progress-bar" style={{ width: `${(megaProgress.index / Math.max(megaProgress.total, 1)) * 100}%` }} />
+          </div>
+          <div className="progress-counters">
+            ✓ {megaProgress.completed} &nbsp; ✗ {megaProgress.failed} &nbsp; ⤳ {megaProgress.skipped}
+          </div>
+        </div>
+      )}
+      {torrentProgress && (
+        <div className="mega-torrent-progress-card" data-testid="torrent-progress-card">
+          <div className="progress-header">Torrent — {torrentProgress.progress_pct}%</div>
+          <div className="progress-file">{torrentProgress.download_speed}</div>
+          <div className="progress-bar-container">
+            <div className="progress-bar" style={{ width: `${parseFloat(torrentProgress.progress_pct || '0')}%` }} />
+          </div>
+          <div className="progress-counters">
+            {(torrentProgress.downloaded_bytes / 1048576).toFixed(1)} MB / {(torrentProgress.total_bytes / 1048576).toFixed(1)} MB
+          </div>
+        </div>
+      )}
 
       <div className="url-bar" style={{ marginTop: '0', borderTop: 'none', paddingTop: '0' }}>
         <div className="input-group">
@@ -1584,8 +1700,11 @@ function App() {
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Concurrency:</span>
           <select
             data-testid="sel-circuits"
-            value={crawlOptions.circuits}
-            onChange={(e) => setCrawlOptions({ ...crawlOptions, circuits: parseInt(e.target.value) })}
+            value={`${crawlOptions.daemons},${crawlOptions.circuits}`}
+            onChange={(e) => {
+              const [d, c] = e.target.value.split(',').map(Number);
+              setCrawlOptions({ ...crawlOptions, daemons: d, circuits: c });
+            }}
             disabled={isCrawling}
             style={{
               background: 'var(--bg-dark)',
@@ -1598,40 +1717,13 @@ function App() {
               cursor: isCrawling ? 'not-allowed' : 'pointer'
             }}
           >
-            <option value={40}>40 Circuits</option>
-            <option value={120}>120 Circuits (Default)</option>
-            <option value={150}>150 Circuits</option>
-            <option value={200}>200 Circuits</option>
-            <option value={240}>240 Circuits (Max)</option>
+            <option value="1,4">1 Swarm / 4 Circuits (Low)</option>
+            <option value="1,6">1 Swarm / 6 Circuits (Standard)</option>
+            <option value="2,12">2 Swarms / 12 Circuits (High)</option>
+            <option value="4,24">4 Swarms / 24 Circuits (Ultimate Max)</option>
           </select>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: '24px' }}>
-          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Tor Daemons:</span>
-          <select
-            data-testid="sel-daemons"
-            value={crawlOptions.daemons}
-            onChange={(e) => setCrawlOptions({ ...crawlOptions, daemons: parseInt(e.target.value) })}
-            disabled={isCrawling}
-            style={{
-              background: 'var(--bg-dark)',
-              color: 'var(--text-main)',
-              border: '1px solid var(--border-color)',
-              borderRadius: '4px',
-              padding: '4px 8px',
-              fontSize: '0.85rem',
-              outline: 'none',
-              cursor: isCrawling ? 'not-allowed' : 'pointer'
-            }}
-          >
-            <option value={0}>Auto (Balanced)</option>
-            <option value={4}>4 Daemons</option>
-            <option value={6}>6 Daemons (Windows Optimal)</option>
-            <option value={8}>8 Daemons</option>
-            <option value={12}>12 Daemons (Mac Optimal)</option>
-            <option value={16}>16 Daemons (Max)</option>
-          </select>
-        </div>
       </div>
 
       <Dashboard
@@ -1642,12 +1734,14 @@ function App() {
         downloadBatchStatus={downloadBatchStatus}
         logs={logs}
         vfsCount={vfsStats.totalNodes}
+        vfsRefreshTrigger={vfsRefreshTrigger}
         downloadProgress={downloadProgress}
         elapsed={crawlElapsed}
         downloadElapsed={downloadElapsed}
         resourceMetrics={resourceMetrics}
         crawlRunStatus={lastCrawlResult}
         downloadResumePlan={downloadResumePlan}
+        onAzureClick={() => setShowAzureModal(true)}
       />
 
       <div className="main-workspace">
@@ -1813,7 +1907,10 @@ function App() {
             </div>
           ))
         )}
-      </div>
+      </div >
+
+      {/* Phase 53: Azure Connectivity Modal */}
+      <AzureConnectivityModal isOpen={showAzureModal} onClose={() => setShowAzureModal(false)} />
     </div >
   );
 }

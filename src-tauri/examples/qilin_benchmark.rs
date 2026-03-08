@@ -262,6 +262,7 @@ async fn run_case(
         agnostic_state: false,
         resume: false,
         resume_index: None,
+        mega_password: None,
     };
 
     let frontier = Arc::new(CrawlerFrontier::new(
@@ -272,6 +273,7 @@ async fn run_case(
         vec![0; circuits.max(1)],
         Vec::new(),
         options,
+        None,
     ));
 
     let adapter = QilinAdapter;

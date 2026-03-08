@@ -197,6 +197,7 @@ fn main() {
             agnostic_state: false,
             resume: false,
             resume_index: None,
+            mega_password: None,
         };
 
         let daemon_count = active_ports.len().max(1);
@@ -209,6 +210,7 @@ fn main() {
             active_ports,
             arti_clients,
             options,
+            None,
         );
         frontier.swarm_guard = Some(Arc::new(tokio::sync::Mutex::new(guard)));
 
@@ -301,6 +303,7 @@ fn main() {
                             url: entry.raw_url.clone(),
                             path: full_path.to_string_lossy().to_string(),
                             size_hint: entry.size_bytes,
+                            jwt_exp: entry.jwt_exp,
                         });
                     }
                 }

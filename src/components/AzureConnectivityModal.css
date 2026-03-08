@@ -1,0 +1,240 @@
+/* =============================================================================
+   AzureConnectivityModal.css — Phase 53B
+   ============================================================================= */
+
+.azure-modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: fadeIn 0.2s ease;
+}
+
+.azure-modal {
+    background: var(--panel-bg, #1a1a2e);
+    border: 1px solid var(--border-color, rgba(162, 0, 255, 0.2));
+    border-radius: 16px;
+    width: 560px;
+    max-height: 80vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 25px 80px rgba(0, 0, 0, 0.6), 0 0 40px rgba(162, 0, 255, 0.15);
+}
+
+.azure-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border-color, rgba(162, 0, 255, 0.15));
+}
+
+.azure-modal-header h2 {
+    margin: 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text-main, #eee);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.azure-modal-close {
+    background: none;
+    border: none;
+    color: var(--text-muted, #888);
+    font-size: 1.4rem;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+    transition: all 0.15s;
+}
+
+.azure-modal-close:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-main, #eee);
+}
+
+/* Tab Bar */
+.azure-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border-color, rgba(162, 0, 255, 0.15));
+}
+
+.azure-tab {
+    flex: 1;
+    padding: 12px 16px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-muted, #888);
+    background: none;
+    border: none;
+    cursor: pointer;
+    transition: all 0.15s;
+    border-bottom: 2px solid transparent;
+}
+
+.azure-tab:hover {
+    color: var(--text-main, #eee);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.azure-tab.active {
+    color: var(--accent-secondary, #00e5ff);
+    border-bottom-color: var(--accent-secondary, #00e5ff);
+}
+
+/* Form Content */
+.azure-modal-body {
+    padding: 20px 24px;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.azure-form-group {
+    margin-bottom: 14px;
+}
+
+.azure-form-group label {
+    display: block;
+    font-size: 0.78rem;
+    color: var(--text-muted, #888);
+    margin-bottom: 5px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.azure-form-group input,
+.azure-form-group select {
+    width: 100%;
+    padding: 10px 14px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border-color, rgba(162, 0, 255, 0.15));
+    border-radius: 8px;
+    color: var(--text-main, #eee);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    transition: border-color 0.15s;
+    box-sizing: border-box;
+}
+
+.azure-form-group input:focus,
+.azure-form-group select:focus {
+    outline: none;
+    border-color: var(--accent-secondary, #00e5ff);
+}
+
+.azure-form-group input::placeholder {
+    color: rgba(255, 255, 255, 0.2);
+}
+
+/* Toggle */
+.azure-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0;
+}
+
+.azure-toggle-label {
+    font-size: 0.85rem;
+    color: var(--text-main, #eee);
+}
+
+/* Action Buttons */
+.azure-modal-actions {
+    display: flex;
+    gap: 10px;
+    padding: 16px 24px;
+    border-top: 1px solid var(--border-color, rgba(162, 0, 255, 0.15));
+}
+
+.azure-btn {
+    flex: 1;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    border: 1px solid transparent;
+}
+
+.azure-btn-primary {
+    background: linear-gradient(135deg, var(--accent-primary, #a200ff), var(--accent-secondary, #00e5ff));
+    color: #fff;
+}
+
+.azure-btn-primary:hover {
+    opacity: 0.9;
+    box-shadow: 0 0 20px rgba(162, 0, 255, 0.3);
+}
+
+.azure-btn-secondary {
+    background: transparent;
+    border-color: var(--border-color, rgba(162, 0, 255, 0.3));
+    color: var(--text-main, #eee);
+}
+
+.azure-btn-secondary:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.azure-btn-danger {
+    background: rgba(255, 70, 70, 0.15);
+    border-color: rgba(255, 70, 70, 0.3);
+    color: #ff6b6b;
+}
+
+/* Status Indicator */
+.azure-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    margin-bottom: 14px;
+}
+
+.azure-status.connected {
+    background: rgba(0, 229, 100, 0.08);
+    border: 1px solid rgba(0, 229, 100, 0.2);
+    color: #00e564;
+}
+
+.azure-status.disconnected {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-color, rgba(162, 0, 255, 0.12));
+    color: var(--text-muted, #888);
+}
+
+.azure-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.azure-status.connected .azure-status-dot {
+    background: #00e564;
+    box-shadow: 0 0 8px rgba(0, 229, 100, 0.5);
+}
+
+.azure-status.disconnected .azure-status-dot {
+    background: #666;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}

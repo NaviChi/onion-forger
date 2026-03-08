@@ -65,23 +65,23 @@ fn parse_alphalocker_listing(html: &str, base_url: &str) -> Vec<FileEntry> {
                 }
 
                 // Build child URL
-                let child_url = if raw_href.starts_with("http://")
-                    || raw_href.starts_with("https://")
-                {
-                    raw_href.to_string()
-                } else {
-                    let encoded = path_utils::url_encode(&clean_name);
-                    let base = base_url.trim_end_matches('/');
-                    if is_dir {
-                        format!("{}/{}/", base, encoded)
+                let child_url =
+                    if raw_href.starts_with("http://") || raw_href.starts_with("https://") {
+                        raw_href.to_string()
                     } else {
-                        format!("{}/{}", base, encoded)
-                    }
-                };
+                        let encoded = path_utils::url_encode(&clean_name);
+                        let base = base_url.trim_end_matches('/');
+                        if is_dir {
+                            format!("{}/{}/", base, encoded)
+                        } else {
+                            format!("{}/{}", base, encoded)
+                        }
+                    };
 
                 let size = extract_size_from_line(line);
 
                 entries.push(FileEntry {
+                    jwt_exp: None,
                     path: format!("/{}", path_utils::sanitize_path(&clean_name)),
                     size_bytes: size,
                     entry_type: if is_dir {
@@ -133,6 +133,7 @@ fn parse_alphalocker_listing(html: &str, base_url: &str) -> Vec<FileEntry> {
                     };
 
                     entries.push(FileEntry {
+                        jwt_exp: None,
                         path: format!("/{}", path_utils::sanitize_path(&clean_name)),
                         size_bytes: None,
                         entry_type: if is_dir {
@@ -297,7 +298,8 @@ impl CrawlerAdapter for AlphaLockerAdapter {
                         )
                         .await
                         {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            {
                                 tokio::time::sleep(delay).await;
                             }
                             if resp.status().is_success() {
@@ -410,9 +412,7 @@ impl CrawlerAdapter for AlphaLockerAdapter {
     }
 
     fn known_domains(&self) -> Vec<&'static str> {
-        vec![
-            "3v4zoso2ghne47usnhyoe4dsezmfqhfv5v5iuep4saic5nnfpc6phrad.onion",
-        ]
+        vec!["3v4zoso2ghne47usnhyoe4dsezmfqhfv5v5iuep4saic5nnfpc6phrad.onion"]
     }
 
     fn regex_marker(&self) -> Option<&'static str> {

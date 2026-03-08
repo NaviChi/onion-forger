@@ -163,6 +163,7 @@ impl CrawlerAdapter for AutoindexAdapter {
 
                     let next_url = match q_clone.pop() {
                         Some(url) => {
+                            println!("[DEBUG AUTOINDEX] Worker grabbed URL from queue: {}", url);
                             idle_sleep_ms = 50;
                             url
                         }
@@ -191,25 +192,47 @@ impl CrawlerAdapter for AutoindexAdapter {
 
                     // Fetch the HTML page
                     let (mut fetch_success, mut html) = (false, None);
-                    if let Ok(Ok(resp)) = tokio::time::timeout(
+                    let fetch_result = tokio::time::timeout(
                         std::time::Duration::from_secs(45),
                         client.get(&next_url).send(),
-                    )
-                    .await
-                    {
-                        if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
-                            tokio::time::sleep(delay).await;
-                        }
-                        if resp.status().is_success() {
-                            if let Ok(body) = resp.text().await {
-                                bytes_downloaded += body.len() as u64;
-                                fetch_success = true;
-                                html = Some(body);
+                    ).await;
+
+                    match fetch_result {
+                        Ok(Ok(resp)) => {
+                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                                tokio::time::sleep(delay).await;
                             }
-                        } else if resp.status() == 404 {
-                            f.record_failure(cid);
-                            pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            continue;
+                            if resp.status().is_success() {
+                                if let Ok(body) = resp.text().await {
+                                    bytes_downloaded += body.len() as u64;
+                                    fetch_success = true;
+                                    if next_url.contains("lockbit") {
+                                        println!("[DEBUG LOCKBIT] Body prefix: {}", &body.chars().take(4000).collect::<String>());
+                                    }
+                                    html = Some(body);
+                                }
+                            } else if resp.status() == 404 {
+                                f.record_failure(cid);
+                                pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                continue;
+                            } else {
+                                if next_url.contains("lockbit") {
+                                    println!("[DEBUG LOCKBIT] Fetch failed to {}, status: {}", next_url, resp.status());
+                                }
+                                f.record_failure(cid);
+                                pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                continue;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            if next_url.contains("lockbit") {
+                                println!("[DEBUG LOCKBIT] Reqwest HTTP error establishing connection to {}: {}", next_url, e);
+                            }
+                        }
+                        Err(e) => {
+                            if next_url.contains("lockbit") {
+                                println!("[DEBUG LOCKBIT] Tokio Timeout hitting endpoint {}: {}", next_url, e);
+                            }
                         }
                     }
 
@@ -250,7 +273,7 @@ impl CrawlerAdapter for AutoindexAdapter {
                                 if is_dir {
                                     let sanitized_path =
                                         format!("/{}", path_utils::sanitize_path(&filename));
-                                    local_files.push(FileEntry {
+                                    local_files.push(FileEntry { jwt_exp: None,
                                         path: sanitized_path,
                                         size_bytes: None,
                                         entry_type: EntryType::Folder,
@@ -260,7 +283,7 @@ impl CrawlerAdapter for AutoindexAdapter {
                                 } else {
                                     let sanitized_path =
                                         format!("/{}", path_utils::sanitize_path(&filename));
-                                    local_files.push(FileEntry {
+                                    local_files.push(FileEntry { jwt_exp: None,
                                         path: sanitized_path,
                                         size_bytes: parsed_size,
                                         entry_type: EntryType::File,

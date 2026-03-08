@@ -121,7 +121,9 @@ impl CrawlerAdapter for PearAdapter {
 
                         html = match fetch_result {
                             Ok(Ok(resp)) => {
-                                if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                                if let Some(delay) =
+                                    ddos_guard.record_response(resp.status().as_u16())
+                                {
                                     tokio::time::sleep(delay).await;
                                 }
                                 if resp.status().is_success() {
@@ -170,6 +172,7 @@ impl CrawlerAdapter for PearAdapter {
                             };
 
                             let file_entry = crate::adapters::FileEntry {
+                                jwt_exp: None,
                                 path: format!("/{}", doc.0),
                                 size_bytes: doc.1,
                                 entry_type: if doc.2 {

@@ -1,8 +1,11 @@
 use prost::Message;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+pub static TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(false);
 
 struct TelemetrySink {
     file: std::fs::File,
@@ -125,6 +128,9 @@ fn sink() -> &'static Option<Mutex<TelemetrySink>> {
 }
 
 pub fn emit_frame(kind: EventKind, payload: impl Message) {
+    if !TELEMETRY_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let Some(file_mutex) = sink().as_ref() else {
         return;
     };
