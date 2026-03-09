@@ -33,3 +33,4 @@ dist-ssr
 
 # Generated crawl indices
 src-tauri/crawl_index_*.txt
+tmp/

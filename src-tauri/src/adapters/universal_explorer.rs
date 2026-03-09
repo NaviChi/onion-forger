@@ -74,23 +74,39 @@ impl AdaptiveUniversalExplorer {
 
     /// Parse page using raw HTML body directly.
     /// Incorporates Tier-4 Adaptive Hydrator Wire Mode Detection (SPA JSON vs Autoindex)
-    fn parse_page_from_body(&self, body: &str, base_url: &str) -> Option<Vec<FileEntry>> {
+    fn parse_page_from_body(&self, body: &str, base_url: &str, app: Option<&AppHandle>) -> Option<Vec<FileEntry>> {
+        use tauri::Emitter;
         let base_parsed_url =
             Url::parse(base_url).unwrap_or_else(|_| Url::parse("http://unknown.onion").unwrap());
         let host = base_parsed_url.host_str().unwrap_or("unknown.onion");
 
         // Tier-4 Adaptive Hydrator: Mode 1 - NextJS SPA / Predictive State Mimicry
         if body.contains("__NEXT_DATA__") || body.contains("fsguest") || body.contains("token=") {
+            if let Some(app) = app {
+                let _ = app.emit("log", format!("[🤖 Tier-4 Hydrator] Mode 1 (SPA JSON Mimicry) engaged for SPA indicators on target: {}", base_url));
+            }
             let spa_entries = crate::adapters::dragonforce::parse_dragonforce_fsguest(body, host, base_url);
             if !spa_entries.is_empty() {
+                if let Some(app) = app {
+                    let _ = app.emit("log", format!("[🤖 Tier-4 Hydrator] Successfully extrapolated {} API routes bridging JS to raw state", spa_entries.len()));
+                }
                 return Some(spa_entries);
+            }
+            if let Some(app) = app {
+                let _ = app.emit("log", "[🤖 Tier-4 Hydrator] Mode 1 active but extraction yielded 0 routes. Falling back...".to_string());
             }
         }
 
         // Tier-4 Adaptive Hydrator: Mode 2 - CMS UUID / Iframe Embed (Mimics LockBit/DragonForce hybrids)
         if body.contains("<iframe") && body.contains("src=") {
+            if let Some(app) = app {
+                let _ = app.emit("log", format!("[🤖 Tier-4 Hydrator] Mode 2 (Embedded Iframe Proxy) engaged on target: {}", base_url));
+            }
             let spa_entries = crate::adapters::dragonforce::parse_dragonforce_fsguest(body, host, base_url);
             if !spa_entries.is_empty() {
+                if let Some(app) = app {
+                    let _ = app.emit("log", format!("[🤖 Tier-4 Hydrator] Extracted {} nested entries from Iframe embed", spa_entries.len()));
+                }
                 return Some(spa_entries);
             }
         }
@@ -99,6 +115,9 @@ impl AdaptiveUniversalExplorer {
         let parsed = crate::adapters::autoindex::parse_autoindex_html(body);
 
         if !parsed.is_empty() {
+            if let Some(app) = app {
+                let _ = app.emit("log", format!("[🤖 Tier-4 Hydrator] Mode 3 (Classic Autoindex) matched {} items on: {}", parsed.len(), base_url));
+            }
             let mut entries = Vec::new();
             for (name, size, is_dir) in parsed {
                 if let Ok(full) = base_parsed_url.join(&name) {
@@ -218,7 +237,7 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
             let mut children_for_prefetch: Vec<String> = Vec::new(); // FIX M-2: just URLs
             if let Some(body) = body {
                 // FIX M-4: Parse directly from body string, not from DOM re-serialize
-                if let Some(entries) = self.parse_page_from_body(&body, &link.url) {
+                if let Some(entries) = self.parse_page_from_body(&body, &link.url, Some(&app)) {
                     results.extend(entries);
                 }
 
@@ -382,7 +401,7 @@ mod tests {
 <a href="../">../</a>
 </body></html>"#;
 
-        let entries = explorer.parse_page_from_body(html, "http://test.onion/files/");
+        let entries = explorer.parse_page_from_body(html, "http://test.onion/files/", None);
         assert!(entries.is_some(), "Should parse autoindex entries");
         let entries = entries.unwrap();
         assert_eq!(
