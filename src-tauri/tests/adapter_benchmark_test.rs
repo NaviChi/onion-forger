@@ -369,6 +369,7 @@ async fn run_single_benchmark(
         resume: false,
         resume_index: None,
         mega_password: None,
+        stealth_ramp: false,
     };
 
     let daemon_count = active_ports.len().max(1);

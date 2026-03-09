@@ -29,7 +29,15 @@ impl Default for SledVfs {
 
 impl SledVfs {
     pub async fn initialize(&self, path: &str) -> Result<()> {
-        let db = sled::open(path).context("Failed to open sled database")?;
+        let db = sled::Config::new()
+            .path(path)
+            .mode(sled::Mode::HighThroughput)
+            .cache_capacity(256 * 1024 * 1024) // 256MB cache threshold for massive dataset ingestion
+            .flush_every_ms(None) // Disable built-in flush thread; Crawli controls flush bounds via explicit async commits
+            .use_compression(false) // Optimize for maximum I/O throughput over disk savings
+            .open()
+            .context("Failed to open aerospace-grade sled database")?;
+            
         let mut guard = self.db.lock().await;
         *guard = Some(db);
         Ok(())

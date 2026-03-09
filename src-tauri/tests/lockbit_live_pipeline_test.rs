@@ -200,6 +200,7 @@ fn live_lockbit_pipeline_default_ui_settings() {
             resume: false,
             resume_index: None,
             mega_password: None,
+            stealth_ramp: false,
         };
 
         let daemon_count = active_ports.len().max(1);

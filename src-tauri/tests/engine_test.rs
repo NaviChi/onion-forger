@@ -175,6 +175,7 @@ async fn test_onion_listing_worker_target_stays_pinned_after_failures() {
         resume: false,
         resume_index: None,
         mega_password: None,
+        stealth_ramp: false,
     };
     let frontier = CrawlerFrontier::new(
         None,
@@ -443,6 +444,7 @@ async fn test_crawl_options_propagation() {
             resume: false,
             resume_index: None,
             mega_password: None,
+            stealth_ramp: false,
         },
         None, // Persistent ledger bound
     );
@@ -468,6 +470,7 @@ async fn test_crawl_options_propagation() {
             resume: false,
             resume_index: None,
             mega_password: None,
+            stealth_ramp: false,
         },
         None, // Persistent ledger bound
     );

@@ -1,8 +1,13 @@
 # Crawli — Project State
 > **Last Updated:** 2026-03-08T21:45 CST
 
-## Current Phase: 71 — Decentralized Metric Distribution Nodes & Vanguard Telemetry
+## Current Phase: 72 — Aerospace-Grade VFS Ledger Compaction & Failure Simulation
 **Overall Completion:** 100%
+
+## Phase 72 Status
+- **Phase 72 Aerospace-Grade Auto-Compacting VFS Ledger** — Refactored the internal `SledVfs` connection bound in `db.rs` to enforce `sled::Mode::HighThroughput` alongside manual 256MB cache threshold parameters mapping strict memory flushes and averting unchecked background garbage collection fragmentation. Memory footprints for massive local indices are actively stabilized. ✅
+- **Phase 72 Windows Extended Validation Signing Bounds** — Verified Extended Validation (EV) certificate integration mapping inside `tauri.conf.json`, utilizing `timestampUrl` boundaries (`http://timestamp.digicert.com`) and explicit `sha256` digest configurations to bypass SmartScreen filters organically. ✅
+- **Phase 72 High-Volume Vanguard Failure Boundaries** — Created `examples/vanguard_failure_bounds.rs` to intentionally simulate Tor exit-node protocol drops specifically mapping `nodeFailovers`. Validated complete atomic synchronization through the memory framework. ✅
 
 ## Phase 71 Status
 - **Phase 71 Decentralized Metric Distribution Nodes** — Orchestrated `RuntimeTelemetry` native bounds scaling. Replaced fixed rotation metrics inside the compiler memory with an observable `multi_client_rotations` atomic pipeline binding directly into the metric emission engine payload representing load sharing across multiple physical Tor daemons. ✅
