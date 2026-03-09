@@ -874,3 +874,9 @@ A dedicated `MultiClientPool` was engineered to instantiate and isolate multiple
 **Key Prevention Rules (Enforced and Logged):**
 - **PR-MULTICLIENT-001:** Never exceed 4 active TorClients on 4 GB RAM VMs to prevent NT Kernel OOM exhaustion. This boundary is rigidly enforced by the new Resource Governor instantiation constraints.
 - **PR-MULTICLIENT-002:** Client rotations must strictly utilize the shared healing engine to prevent "orphan" clients and silent memory leaks.
+
+### Phase 67E: HEAD Probe Phase-Out
+- **Date**: 2026-03-08
+- **Issue**: Standard auto-index instances (AlphaLocker, Play, Abyss, Genesis) performed a redundant `HEAD` request before every `GET` merely to ascertain file sizes, doubling network strain and triggering rate limit blocks (especially 429 errors from strict proxies).
+- **Fix**: Replaced solitary `HEAD` probes with integrated `GET Range: bytes=0-0` probes. The application parses either the `Content-Range` header limits or fallback `Content-Length`. Any size probe now merges neatly into the initial network connection with the same stream allocation.
+- **Prevention Rule**: Never spawn `HEAD` probes to deduce chunk bounds in adapters when `GET Range: bytes=0-0` or `bytes=0-1` accomplishes the same task safely without multiplying HTTP overhead.
