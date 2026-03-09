@@ -413,6 +413,134 @@ const INITIAL_RESOURCE_METRICS: ResourceMetricsSnapshot = {
   consensusWeight: 0,
 };
 
+function toFiniteNumber(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function toNonNegativeInteger(value: unknown, fallback = 0): number {
+  const normalized = Math.floor(toFiniteNumber(value, fallback));
+  return normalized >= 0 ? normalized : fallback;
+}
+
+function normalizeCrawlStatusFrame(
+  frame: Partial<CrawlStatusEvent> | null | undefined,
+  previous: CrawlStatusEvent,
+): CrawlStatusEvent {
+  if (!frame) return previous;
+
+  const progressPercent = Math.max(
+    0,
+    Math.min(100, toFiniteNumber(frame.progressPercent, previous.progressPercent)),
+  );
+  const phase =
+    typeof frame.phase === "string" && frame.phase.length > 0
+      ? frame.phase
+      : previous.phase;
+  const etaSeconds =
+    frame.etaSeconds === null
+      ? null
+      : frame.etaSeconds === undefined
+        ? previous.etaSeconds
+        : toNonNegativeInteger(frame.etaSeconds, previous.etaSeconds ?? 0);
+
+  return {
+    ...previous,
+    phase,
+    progressPercent,
+    visitedNodes: toNonNegativeInteger(frame.visitedNodes, previous.visitedNodes),
+    processedNodes: toNonNegativeInteger(frame.processedNodes, previous.processedNodes),
+    queuedNodes: toNonNegativeInteger(frame.queuedNodes, previous.queuedNodes),
+    activeWorkers: toNonNegativeInteger(frame.activeWorkers, previous.activeWorkers),
+    workerTarget: toNonNegativeInteger(frame.workerTarget, previous.workerTarget),
+    etaSeconds,
+    estimation:
+      typeof frame.estimation === "string" && frame.estimation.length > 0
+        ? frame.estimation
+        : previous.estimation,
+    deltaNewFiles:
+      frame.deltaNewFiles === undefined
+        ? previous.deltaNewFiles
+        : toNonNegativeInteger(frame.deltaNewFiles, previous.deltaNewFiles ?? 0),
+    vanguard:
+      frame.vanguard === undefined
+        ? previous.vanguard
+        : frame.vanguard,
+  };
+}
+
+function normalizeResourceMetricsFrame(
+  frame: Partial<ResourceMetricsSnapshot> | null | undefined,
+  previous: ResourceMetricsSnapshot,
+): ResourceMetricsSnapshot {
+  if (!frame) return previous;
+
+  const systemMemoryUsedBytes = toNonNegativeInteger(
+    frame.systemMemoryUsedBytes,
+    previous.systemMemoryUsedBytes,
+  );
+  const systemMemoryTotalBytes = toNonNegativeInteger(
+    frame.systemMemoryTotalBytes,
+    previous.systemMemoryTotalBytes,
+  );
+  const derivedMemoryPercent =
+    systemMemoryTotalBytes > 0
+      ? (systemMemoryUsedBytes / systemMemoryTotalBytes) * 100
+      : 0;
+  const systemMemoryPercent = Math.max(
+    0,
+    Math.min(
+      100,
+      toFiniteNumber(
+        frame.systemMemoryPercent,
+        Number.isFinite(derivedMemoryPercent)
+          ? derivedMemoryPercent
+          : previous.systemMemoryPercent,
+      ),
+    ),
+  );
+
+  return {
+    ...previous,
+    processCpuPercent: Math.max(
+      0,
+      toFiniteNumber(frame.processCpuPercent, previous.processCpuPercent),
+    ),
+    processMemoryBytes: toNonNegativeInteger(
+      frame.processMemoryBytes,
+      previous.processMemoryBytes,
+    ),
+    processThreads: toNonNegativeInteger(frame.processThreads, previous.processThreads),
+    systemMemoryUsedBytes,
+    systemMemoryTotalBytes,
+    systemMemoryPercent,
+    activeWorkers: toNonNegativeInteger(frame.activeWorkers, previous.activeWorkers),
+    workerTarget: toNonNegativeInteger(frame.workerTarget, previous.workerTarget),
+    activeCircuits: toNonNegativeInteger(frame.activeCircuits, previous.activeCircuits),
+    peakActiveCircuits: toNonNegativeInteger(
+      frame.peakActiveCircuits,
+      previous.peakActiveCircuits,
+    ),
+    currentNodeHost:
+      frame.currentNodeHost === undefined
+        ? previous.currentNodeHost
+        : frame.currentNodeHost,
+    nodeFailovers: toNonNegativeInteger(frame.nodeFailovers, previous.nodeFailovers),
+    throttleCount: toNonNegativeInteger(frame.throttleCount, previous.throttleCount),
+    timeoutCount: toNonNegativeInteger(frame.timeoutCount, previous.timeoutCount),
+    uptimeSeconds: toNonNegativeInteger(frame.uptimeSeconds, previous.uptimeSeconds),
+    consensusWeight: toNonNegativeInteger(frame.consensusWeight, previous.consensusWeight),
+  };
+}
+
 function App() {
   const isTauriRuntime = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
   const isFixtureMode = !isTauriRuntime && isVfsFixtureMode();
@@ -906,15 +1034,24 @@ function App() {
 
             switch (frame.kind) {
               case 1:
-                lastResourceMetrics = pb.ResourceMetricsFrame.toObject(pb.ResourceMetricsFrame.decode(payloadReader), { longs: Number });
+                lastResourceMetrics = pb.ResourceMetricsFrame.toObject(
+                  pb.ResourceMetricsFrame.decode(payloadReader),
+                  { longs: Number, defaults: true },
+                );
                 resourceMetricsUpdated = true;
                 break;
               case 2:
-                lastCrawlStatus = pb.CrawlStatusFrame.toObject(pb.CrawlStatusFrame.decode(payloadReader), { longs: Number });
+                lastCrawlStatus = pb.CrawlStatusFrame.toObject(
+                  pb.CrawlStatusFrame.decode(payloadReader),
+                  { longs: Number, defaults: true },
+                );
                 crawlStatusUpdated = true;
                 break;
               case 3:
-                lastBatchProgress = pb.BatchProgressFrame.toObject(pb.BatchProgressFrame.decode(payloadReader), { longs: Number });
+                lastBatchProgress = pb.BatchProgressFrame.toObject(
+                  pb.BatchProgressFrame.decode(payloadReader),
+                  { longs: Number, defaults: true },
+                );
                 batchUpdated = true;
                 break;
               case 4:
@@ -924,10 +1061,20 @@ function App() {
           }
 
           if (crawlStatusUpdated) {
-            setCrawlStatus(lastCrawlStatus as any);
+            setCrawlStatus((previous) =>
+              normalizeCrawlStatusFrame(
+                lastCrawlStatus as Partial<CrawlStatusEvent>,
+                previous,
+              ),
+            );
           }
           if (resourceMetricsUpdated) {
-            setResourceMetrics(lastResourceMetrics as any);
+            setResourceMetrics((previous) =>
+              normalizeResourceMetricsFrame(
+                lastResourceMetrics as Partial<ResourceMetricsSnapshot>,
+                previous,
+              ),
+            );
           }
           if (batchUpdated) {
             applyBatchProgress({
