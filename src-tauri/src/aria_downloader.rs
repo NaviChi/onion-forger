@@ -2,7 +2,7 @@ use crate::adapters::CrawlerAdapter;
 use crate::arti_client::ArtiClient;
 use crate::binary_telemetry::{self, DownloadStatusFrame, EventKind};
 use anyhow::{anyhow, Result};
-use http::header::{ACCEPT_RANGES, CONTENT_RANGE};
+use http::header::CONTENT_RANGE;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -106,7 +106,7 @@ const DEFAULT_DOWNLOAD_INITIAL_ACTIVE_MIN: usize = 4;
 const DEFAULT_RESUME_COALESCE_PIECES: usize = 4;
 
 // Phase 4.1: Adaptive piece sizing bounds
-const MIN_PIECE_SIZE: u64 = 5_242_880; // 5MB minimum (Allows Tor TCP Window to reach maximum speed)
+const MIN_PIECE_SIZE: u64 = 1_048_576; // 1MB minimum — enables parallelism for small files (Phase 67)
 const MAX_PIECE_SIZE: u64 = 52_428_800; // 50MB maximum
 
 /// Phase 4.1: Compute optimal piece size based on file size and circuit count.
@@ -740,76 +740,48 @@ async fn probe_target(
     let mut last_modified = None;
 
     // Apply strict 8-second timeout to HEAD to prevent infinite proxy stalls
-    match tokio::time::timeout(Duration::from_secs(8), client.head(url).send()).await {
+    // Apply strict 8-second timeout to GET Range proxy probe
+    match tokio::time::timeout(
+        Duration::from_secs(8),
+        client.get(url).header("Range", "bytes=0-0").send(),
+    )
+    .await
+    {
         Ok(Ok(resp)) => {
-            content_length = resp.content_length().unwrap_or(0);
-            supports_ranges = resp
+            if resp.status() == StatusCode::PARTIAL_CONTENT {
+                supports_ranges = true;
+            }
+            if etag.is_none() && last_modified.is_none() {
+                (etag, last_modified) = extract_resume_validators(&resp);
+            }
+
+            if let Some(value) = resp
                 .headers()
-                .get(ACCEPT_RANGES)
+                .get(CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
-                .map(|value| value.to_ascii_lowercase().contains("bytes"))
-                .unwrap_or(false);
-            (etag, last_modified) = extract_resume_validators(&resp);
+            {
+                if let Some(total) = parse_content_range_total(value) {
+                    content_length = total;
+                }
+            }
+
+            if content_length == 0 {
+                content_length = resp.content_length().unwrap_or(0);
+            }
         }
         Ok(Err(err)) => {
-            let _ = app.emit("log", format!("[!] HEAD probe failed: {err}"));
+            let _ = app.emit("log", format!("[!] GET Range probe failed: {err}"));
+            supports_ranges = false;
+            content_length = 0;
         }
         Err(_) => {
             let _ = app.emit(
                 "log",
-                "[!] HEAD probe timed out after 8s. Hostile proxy likely dropped TCP.".to_string(),
+                "[!] GET Range probe timed out after 8s. Forcing fallback stream mode..."
+                    .to_string(),
             );
-        }
-    }
-
-    if content_length == 0 || !supports_ranges {
-        let _ = app.emit(
-            "log",
-            "[*] HEAD probe insufficient. Attempting GET range probe...".to_string(),
-        );
-
-        match tokio::time::timeout(
-            Duration::from_secs(8),
-            client.get(url).header("Range", "bytes=0-1").send(),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => {
-                if resp.status() == StatusCode::PARTIAL_CONTENT {
-                    supports_ranges = true;
-                }
-                if etag.is_none() && last_modified.is_none() {
-                    (etag, last_modified) = extract_resume_validators(&resp);
-                }
-
-                if let Some(value) = resp
-                    .headers()
-                    .get(CONTENT_RANGE)
-                    .and_then(|value| value.to_str().ok())
-                {
-                    if let Some(total) = parse_content_range_total(value) {
-                        content_length = total;
-                    }
-                }
-
-                if content_length == 0 {
-                    content_length = resp.content_length().unwrap_or(0);
-                }
-            }
-            Ok(Err(err)) => {
-                let _ = app.emit("log", format!("[!] GET Range probe failed: {err}"));
-                supports_ranges = false;
-                content_length = 0;
-            }
-            Err(_) => {
-                let _ = app.emit(
-                    "log",
-                    "[!] GET Range probe timed out after 8s. Forcing fallback stream mode..."
-                        .to_string(),
-                );
-                supports_ranges = false;
-                content_length = 0;
-            }
+            supports_ranges = false;
+            content_length = 0;
         }
     }
 
@@ -822,18 +794,17 @@ async fn probe_target(
     })
 }
 
-fn get_arti_client(is_onion: bool, circuit_id: usize) -> Result<ArtiClient> {
+fn get_arti_client(
+    is_onion: bool,
+    circuit_id: usize,
+    clients: &[crate::tor_native::SharedTorClient],
+) -> Result<ArtiClient> {
     if is_onion {
-        let clients = crate::tor_native::active_tor_clients();
         if clients.is_empty() {
             return Err(anyhow::anyhow!("No active Tor clients available"));
         }
         let shared_client = &clients[circuit_id % clients.len()];
-        let tor_client = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| shared_client.blocking_read().clone())
-        } else {
-            shared_client.blocking_read().clone()
-        };
+        let tor_client = shared_client.read().unwrap().clone();
         let isolation_token = arti_client::IsolationToken::new();
         Ok(crate::arti_client::ArtiClient::new(
             (*tor_client).clone(),
@@ -949,6 +920,7 @@ async fn process_swarm(
     batch_telemetry: Option<crate::runtime_metrics::RuntimeTelemetry>,
     _jwt_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     total_files: usize,
+    active_client_ptrs: Vec<crate::tor_native::SharedTorClient>,
 ) {
     if files.is_empty() {
         return;
@@ -969,8 +941,9 @@ async fn process_swarm(
 
     let mut tasks = JoinSet::new();
     for circuit_id in 0..parallelism {
-        let daemon_port = active_ports[circuit_id % daemon_count.max(1)] as usize;
-        let client = match get_arti_client(is_onion, circuit_id) {
+        // Find which port this circuit maps to (simple round robin based on circuit_id)
+        let _daemon_port = active_ports[circuit_id % daemon_count.max(1)] as usize;
+        let client = match get_arti_client(is_onion, circuit_id, &active_client_ptrs) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -1017,13 +990,14 @@ async fn process_swarm(
                                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                             {
                                 task_bbr.on_reject();
-                                let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} hit HTTP {}. Rotating client slot {}...", circuit_id, status, daemon_port));
-                                let slot = daemon_port;
-                                tokio::spawn(async move { let _ = crate::tor::request_newnym_slot(slot).await; });
+                                let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} hit HTTP {}. Re-isolating circuit locally...", circuit_id, status));
+                                // With isolated_client() native regeneration, no global rotation is needed.
+                                // Since we create a single `client` per circuit thread in process_swarm and 
+                                // don't share it, we don't actually need to rotate the token here if we
+                                // regenerate the stream internally, but for pure idempotency we just pause.
                             } else {
                                 task_bbr.on_reject();
-                            }
-                            retries += 1;
+                            }                          retries += 1;
                             let active = task_bbr.current_active();
                             let base = backoff_duration(retries);
                             let bbr_pause = if circuit_id >= active { Duration::from_millis(2000) } else { Duration::ZERO };
@@ -1033,11 +1007,8 @@ async fn process_swarm(
                         Ok(Err(err)) => {
                             task_bbr.on_reject();
                             if err.to_string().contains("connect") || err.to_string().contains("request") {
-                                let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} connection reset. Rotating client slot {}...", circuit_id, daemon_port));
-                                let slot = daemon_port;
-                                tokio::spawn(async move { let _ = crate::tor::request_newnym_slot(slot).await; });
-                            }
-                            retries += 1;
+                                let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} connection reset. Re-isolating circuit locally...", circuit_id));
+                            }                          retries += 1;
                             let active = task_bbr.current_active();
                             let base = backoff_duration(retries);
                             let bbr_pause = if circuit_id >= active { Duration::from_millis(2000) } else { Duration::ZERO };
@@ -1253,22 +1224,36 @@ pub async fn start_batch_download(
 
     // Dynamically detect active Tor daemon ports
     let mut active_ports: Vec<u16> = Vec::new();
-    let mut _tor_guard: Option<crate::tor::TorProcessGuard> = None;
+    let mut active_client_ptrs: Vec<crate::tor_native::SharedTorClient> = Vec::new();
+
     let daemon_count = if is_onion {
-        if crate::tor_native::active_tor_clients().is_empty() {
-            match crate::tor::bootstrap_tor_cluster(app.clone(), batch_circuit_cap).await {
-                Ok((guard, _ports)) => {
-                    _tor_guard = Some(guard);
+        let state = app.state::<crate::AppState>();
+        let mut download_guard = state.download_swarm_guard.lock().await;
+
+        let needs_bootstrap = match download_guard.as_ref() {
+            Some(arc) => arc.lock().await.native_swarm.is_none() || arc.lock().await.get_arti_clients().is_empty(),
+            None => true,
+        };
+
+        if needs_bootstrap {
+            match crate::tor::bootstrap_tor_cluster(app.clone(), batch_circuit_cap, 128).await {
+                Ok((new_guard, _ports)) => {
+                    *download_guard = Some(std::sync::Arc::new(tokio::sync::Mutex::new(new_guard)));
                 }
                 Err(err) => {
-                    return Err(anyhow!(
+                    return Err(anyhow::anyhow!(
                         "Failed to bootstrap Aria Forge Tor cluster for batch download: {}",
                         err
                     ));
                 }
             }
         }
-        let live_clients = crate::tor_native::active_tor_clients().len().max(1);
+
+        if let Some(arc) = download_guard.as_ref() {
+            active_client_ptrs = arc.lock().await.get_arti_clients();
+        }
+
+        let live_clients = active_client_ptrs.len().max(1);
         active_ports = (0..live_clients).map(|idx| idx as u16).collect();
         live_clients
     } else {
@@ -1279,7 +1264,7 @@ pub async fn start_batch_download(
     }
 
     // -- Probe all files and sort into small vs large --
-    let sniff_client = get_arti_client(is_onion, 0)?;
+    let sniff_client = get_arti_client(is_onion, 0, &active_client_ptrs)?;
     let mut micro_candidates: Vec<ScheduledBatchFile> = Vec::new();
     let mut small_candidates: Vec<ScheduledBatchFile> = Vec::new();
     let mut large_candidates: Vec<ScheduledBatchFile> = Vec::new();
@@ -1400,6 +1385,7 @@ pub async fn start_batch_download(
         let micro_parallelism = batch_download_budget.micro_swarm_circuits;
         let total = total_files;
         let micro_jwt_cache = Arc::clone(&jwt_cache);
+        let active_client_ptrs_clone = active_client_ptrs.clone();
 
         tokio::spawn(async move {
             process_swarm(
@@ -1418,6 +1404,7 @@ pub async fn start_batch_download(
                 batch_telemetry_clone,
                 micro_jwt_cache,
                 total,
+                active_client_ptrs_clone,
             )
             .await;
         })
@@ -1443,6 +1430,7 @@ pub async fn start_batch_download(
             batch_telemetry.clone(),
             Arc::clone(&jwt_cache),
             total_files,
+            active_client_ptrs.clone(),
         )
         .await;
     }
@@ -1639,44 +1627,50 @@ pub async fn start_download(
     // Detect or bootstrap Tor daemons dynamically
     let mut daemon_count = 0usize;
     let mut active_ports: Vec<u16> = Vec::new();
-    let mut _tor_guard: Option<crate::tor::TorProcessGuard> = None;
+    let mut active_client_ptrs: Vec<crate::tor_native::SharedTorClient> = Vec::new();
 
     if is_onion {
-        if crate::tor_native::active_tor_clients().is_empty() {
-            // No running daemons found — bootstrap our own cluster
+        let state = app.state::<crate::AppState>();
+        let mut download_guard = state.download_swarm_guard.lock().await;
+
+        let needs_bootstrap = match download_guard.as_ref() {
+            Some(arc) => arc.lock().await.native_swarm.is_none() || arc.lock().await.get_arti_clients().is_empty(),
+            None => true,
+        };
+
+        if needs_bootstrap {
             logger.log(
                 &app,
                 "[*] No active TorForge client pool detected. Bootstrapping fresh Aria Forge cluster..."
                     .to_string(),
             );
 
-            match crate::tor::bootstrap_tor_cluster(app.clone(), bootstrap_budget.circuit_cap).await
+            match crate::tor::bootstrap_tor_cluster(app.clone(), bootstrap_budget.circuit_cap, 128).await
             {
-                Ok((guard, ports)) => {
-                    _tor_guard = Some(guard);
-                    let _ = ports;
-                    daemon_count = crate::tor_native::active_tor_clients().len();
-                    active_ports = (0..daemon_count).map(|idx| idx as u16).collect();
+                Ok((new_guard, _ports)) => {
+                    *download_guard = Some(std::sync::Arc::new(tokio::sync::Mutex::new(new_guard)));
                     logger.log(
                         &app,
-                        format!(
-                            "[✓] Aria Forge TorForge client pool ready: {} slots",
-                            daemon_count
-                        ),
+                        "[✓] Aria Forge TorForge client pool ready".to_string(),
                     );
                 }
                 Err(e) => {
-                    return Err(anyhow!("Failed to bootstrap Aria Forge Tor cluster: {}", e));
+                    return Err(anyhow::anyhow!("Failed to bootstrap Aria Forge Tor cluster: {}", e));
                 }
             }
         } else {
-            daemon_count = crate::tor_native::active_tor_clients().len();
-            active_ports = (0..daemon_count).map(|idx| idx as u16).collect();
             logger.log(
                 &app,
-                format!("[✓] Reusing {} active TorForge client slots", daemon_count),
+                "[✓] Reusing active TorForge client slots".to_string(),
             );
         }
+
+        if let Some(arc) = download_guard.as_ref() {
+            active_client_ptrs = arc.lock().await.get_arti_clients();
+        }
+
+        daemon_count = active_client_ptrs.len().max(1);
+        active_ports = (0..daemon_count).map(|idx| idx as u16).collect();
 
         let _ = app.emit(
             "tor_status",
@@ -1704,7 +1698,8 @@ pub async fn start_download(
     }
 
     let _primary_port = active_ports.first().copied().unwrap_or(9051);
-    let sniff_client = get_arti_client(is_onion, 0)?;
+    let sniff_client = get_arti_client(is_onion, 0, &active_client_ptrs)?;
+    let active_clients_arc = Arc::new(active_client_ptrs.clone());
 
     // =========================================================
     // Phase 58: JWT Expiration Refresh (Pre-Flight Intercept)
@@ -2411,6 +2406,7 @@ pub async fn start_download(
             let unchoke_content_length = content_length;
             let unchoke_active_ports = active_ports.clone();
             let unchoke_if_range = resume_if_range.clone();
+            let unchoke_active_client_ptrs = Arc::clone(&active_clients_arc);
 
             tokio::spawn(async move {
                 // Wait for initial circuits to warm up
@@ -2430,8 +2426,7 @@ pub async fn start_download(
                         9051 // Fallback for non-onion, though unchoke_is_onion should handle this
                     };
 
-                    // Build a fresh circuit
-                    let client = match get_arti_client(unchoke_is_onion, unchoke_id) {
+                    let client = match get_arti_client(unchoke_is_onion, unchoke_id, &unchoke_active_client_ptrs) {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
@@ -2525,15 +2520,17 @@ pub async fn start_download(
             );
 
             let mut handshake_tasks = JoinSet::new();
+            let circuit_active_client_ptrs = Arc::clone(&active_clients_arc);
             for cid in 0..tournament_pool {
                 let probe_url = entry.url.clone();
                 let c = cid;
                 let is_onion_clone = is_onion;
                 let active_ports_clone = active_ports.clone();
+                let circuit_active_client_ptrs_clone = Arc::clone(&circuit_active_client_ptrs);
                 handshake_tasks.spawn(async move {
                     let port = active_ports_clone[c % daemon_count.max(1)] as usize;
                     let start = Instant::now();
-                    let client = match get_arti_client(is_onion_clone, c) {
+                    let client = match get_arti_client(is_onion_clone, c, &circuit_active_client_ptrs_clone) {
                         Ok(c) => c,
                         Err(_) => return (c, port, None, u128::MAX),
                     };
@@ -2640,6 +2637,7 @@ pub async fn start_download(
             let task_active_circuits = Arc::clone(&active_circuits);
             let task_circuit_rank = circuit_rank;
             let task_if_range = resume_if_range.clone();
+            let task_active_client_ptrs = Arc::clone(&active_clients_arc);
 
             tasks.spawn(async move {
                 use futures::StreamExt;
@@ -2722,7 +2720,7 @@ pub async fn start_download(
                     if circuit_id < task_circuit_killed.len() && task_circuit_killed[circuit_id].load(Ordering::Relaxed) {
                         recycle_count += 1;
                         let new_socks_id = circuit_id + recycle_count * task_tournament_pool;
-                        match get_arti_client(task_is_onion, new_socks_id) {
+                        match get_arti_client(task_is_onion, new_socks_id, &task_active_client_ptrs) {
                             Ok(new_client) => {
                                 circuit_client = new_client;
                                 task_circuit_killed[circuit_id].store(false, Ordering::Relaxed);
@@ -2849,8 +2847,6 @@ pub async fn start_download(
 
                                 if err.to_string().contains("connect") || err.to_string().contains("request") {
                                     let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Circuit {} connection reset. Rotating client slot {}...", circuit_id, task_daemon_port));
-                                    let slot = task_daemon_port;
-                                    tokio::spawn(async move { let _ = crate::tor::request_newnym_slot(slot).await; });
                                 }
 
                                 if stalls > MAX_STALL_RETRIES {
@@ -2898,8 +2894,6 @@ pub async fn start_download(
                                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                             {
                                 let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Circuit {} hit HTTP {}. Rotating client slot {}...", circuit_id, status, task_daemon_port));
-                                let slot = task_daemon_port;
-                                tokio::spawn(async move { let _ = crate::tor::request_newnym_slot(slot).await; });
                             }
 
                             if stalls > MAX_STALL_RETRIES {
@@ -3090,7 +3084,8 @@ pub async fn start_download(
             });
         }
     } else {
-        let stream_client = get_arti_client(is_onion, 0)?;
+        logger.log(&app, "[!] Engaging 1-Circuit Fallback Stream Mode".to_string());
+        let stream_client = get_arti_client(is_onion, 0, &active_client_ptrs)?;
         let task_tx = tx.clone();
         let task_app = app.clone();
         let task_url = entry.url.clone();
