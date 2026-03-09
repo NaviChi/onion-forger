@@ -69,6 +69,8 @@ interface DashboardProps {
     timeoutCount: number;
     uptimeSeconds: number;
     consensusWeight: number;
+    multiClientRotations?: number;
+    multiClientCount?: number;
   };
   crawlRunStatus: {
     targetKey: string;
@@ -281,7 +283,7 @@ export function Dashboard({
             )}
           </div>
           <div className="dash-sub" data-testid="resource-node-metrics" style={{ fontFamily: 'JetBrains Mono' }}>
-            Node {resourceMetrics.currentNodeHost || "unresolved"} | Failovers {resourceMetrics.nodeFailovers} | 429/503 {resourceMetrics.throttleCount} | Timeouts {resourceMetrics.timeoutCount}
+            Node {resourceMetrics.currentNodeHost || "unresolved"} | Multi-Client Rotations {resourceMetrics.multiClientRotations || 0} (Pool: {resourceMetrics.multiClientCount || 0}) | 429/503 {resourceMetrics.throttleCount} | Timeouts {resourceMetrics.timeoutCount}
           </div>
         </div>
       </div>

@@ -2,7 +2,7 @@ use crate::adapters::{CrawlerAdapter, EntryType, FileEntry, SiteFingerprint};
 use crate::frontier::CrawlerFrontier;
 use scraper::{Html, Selector};
 use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tokio::sync::mpsc;
 
 #[derive(Default)]
@@ -416,8 +416,9 @@ impl CrawlerAdapter for DragonForceAdapter {
                 multi_clients
             ),
         );
+        let telemetry = app.try_state::<crate::AppState>().map(|s| s.telemetry.clone());
         let multi_pool = Arc::new(
-            crate::multi_client_pool::MultiClientPool::new(multi_clients)
+            crate::multi_client_pool::MultiClientPool::new(multi_clients, telemetry)
                 .await
                 .unwrap(),
         );

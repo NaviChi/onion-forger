@@ -1,8 +1,27 @@
 # Crawli — Project State
 > **Last Updated:** 2026-03-08T21:45 CST
 
-## Current Phase: 67N — URL Normalization + Multi-Node-Safe Dedup
+## Current Phase: 71 — Decentralized Metric Distribution Nodes & Vanguard Telemetry
 **Overall Completion:** 100%
+
+## Phase 71 Status
+- **Phase 71 Decentralized Metric Distribution Nodes** — Orchestrated `RuntimeTelemetry` native bounds scaling. Replaced fixed rotation metrics inside the compiler memory with an observable `multi_client_rotations` atomic pipeline binding directly into the metric emission engine payload representing load sharing across multiple physical Tor daemons. ✅
+- **Phase 71 Dashboard Endpoint Telemetry Mapping** — Rewired the Vanguard Scaling limit UI component inside `Dashboard.tsx` to natively parse and visualize `multi_client_rotations` against `multi_client_count`. We now observe exact internal bounds of the agnostically routed rotation telemetry without leaving the node endpoint. Visual diff thresholds reset successfully via CI pipeline runs to lock layout. ✅
+
+## Phase 70 Status
+- **Phase 70 Cross-Platform Deployment Sandboxing** — Created native `Entitlements.mac.plist` encapsulating runtime capability requests (Network bounds, User File bounds, Sandboxing enforcement) for macOS deployments. Configured `tauri.conf.json` with strict Windows/macOS parameters. 
+- **Phase 70 Playwright Visual Regression** — Orchestrated `visual_regression.spec.ts` locking `dashboard-empty-state.png`, `dashboard-vfs-state.png`, and `vanguard-metrics-state.png`. Future layout drifts will result in deterministic CI failures. ✅
+- **Phase 70 Node Rotation Metrics** — Bound `get_total_client_requests` into `MultiClientPool` alongside atomic metric emission, bridging observability for our agnostic round-robin logic without compromising performance. ✅
+
+## Phase 69 Status
+- **Phase 69 Automated Download Fingerprinting** — SHA-256 generation tied strictly to Tor Stream chunks, represented visually in the VFS with `SHA-256 VERIFIED` badges upon native validation ✅
+- **Phase 69 Agnostic Circuit Routing** — Refactored `multi_client_pool.rs` to abstract Tor Clients using `next_slot.fetch_add()`. Workers no longer pin strict client pools, bridging boundaries seamlessly to eliminate localized rate limits ✅
+- **Phase 69 VFS Visual Segregation Enhancements** — Re-structured the Frontend `VFSExplorer.tsx` to visualize strictly `NATIVE TOR ISOLATION` tags when download nodes are operating cleanly ✅
+
+## Phase 68 Verification Status
+- **Phase 68 Mock Power Outages Verified** (`crawli/src-tauri/examples/mock_power_outage_resume.rs`) ✅
+- **Phase 68 GUI Vanguard Scaling Limits Verified** (E2E playwright `tests/vanguard_ui.spec.ts` passing) ✅
+- **Phase 68 Tier-4 Hydrator Observability Tested** (`crawli/src-tauri/examples/qilin_hydrator_stress.rs`) ✅
 
 ## Build & Test Status
 - `cargo check` — **0 errors, 2 warnings** ✅
@@ -23,6 +42,9 @@
 - **Phase 67M** — Multi-node rotation with single-node fallback ✅
 - **Phase 67N** — URL normalization (`agnostic_state: true`) for multi-node-safe dedup ✅
 - **Phase 67O (Worker Affinity)** — Already exists via circuit pinning (67I) ✅
+- **Phase 68** — Multi-Stage Resumable Session Ledger (auto-restart from TargetLedger snapshots) ✅
+- **Phase 68B** — Parallelized Tor Circuit Pre-Warming (HEAD requests to rendezvous points) ✅
+- **Phase 68C** — Finalized `librqbit` Piece-Mode Audit (Verified true piece-mode + Json persistence) ✅
 
 ## Open Issues (Priority / Date)
 
@@ -38,6 +60,7 @@
 3. **Per-target node telemetry** — Deeper metrics
 4. ~~**Competition audit**~~ — ✅ Aerospace-grade compliance secured — Cross-reference field-leading crawling architectures
 5. ~~**Frontend Phase 52B**~~ — ✅ Mega/Torrent toolbar toggles injected — Mode buttons for Mega.nz / Torrent in toolbar
+6. ~~**Phase 68 Resumable Ledger**~~ — ✅ TargetLedger integrated into crawler bootstrap for seamless cross-restart recovery
 
 ## Prevention Rules Active
 - PR-GUI-001: Playwright Frontend must execute entirely decoupled from Tauri Native context using explicit Fixtures.

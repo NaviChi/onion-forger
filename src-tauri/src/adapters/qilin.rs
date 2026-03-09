@@ -1236,7 +1236,7 @@ impl CrawlerAdapter for QilinAdapter {
             ),
         );
         let multi_pool = Arc::new(
-            crate::multi_client_pool::MultiClientPool::new(multi_clients)
+            crate::multi_client_pool::MultiClientPool::new(multi_clients, telemetry.clone())
                 .await
                 .unwrap(),
         );
@@ -1626,6 +1626,9 @@ impl CrawlerAdapter for QilinAdapter {
                                 || status == reqwest::StatusCode::BAD_REQUEST
                             {
                                 f.trigger_circuit_isolation(cid).await; // 403/400 means our Tor IP is blocked
+                                if let Some(telemetry) = &crawl_governor.telemetry {
+                                    telemetry.record_failover(format!("circuit_{}", cid));
+                                }
                                 CrawlFailureKind::Throttle
                             } else {
                                 CrawlFailureKind::Http
@@ -1680,6 +1683,9 @@ impl CrawlerAdapter for QilinAdapter {
                             crawl_governor.record_failure_for_circuit(failure_kind, cid);
                             retry_failure_kind = failure_kind;
                             f.trigger_circuit_isolation(cid).await;
+                            if let Some(telemetry) = &crawl_governor.telemetry {
+                                telemetry.record_failover(format!("circuit_{}", cid));
+                            }
                         } else {
                             f.record_failure(cid);
                             retry_failure_kind = match &resp_result {

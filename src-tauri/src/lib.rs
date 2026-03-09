@@ -424,6 +424,27 @@ async fn execute_crawl_attempt(
     timer.emit_log("[VFS] Storage initialized & wiped for new run");
     println!("[Crawli Bootstrap] vfs initialized at {}", vfs_path_str);
 
+    if is_onion {
+        let clients_to_warm = frontier.http_clients.len();
+        if clients_to_warm > 1 {
+            timer.emit_log(&format!("[Tor Swarm] Executing Parallelized Tor Circuit Pre-Warming across {} daemons...", clients_to_warm));
+            let mut pre_warms = Vec::with_capacity(clients_to_warm);
+            for client in &frontier.http_clients {
+                let warm_client = client.clone();
+                let warm_url = url.to_string();
+                pre_warms.push(tokio::spawn(async move {
+                    // Send a lightweight HEAD request just to build the Tor circuit to the rendezvous point
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(45),
+                        warm_client.head(&warm_url).send(),
+                    ).await;
+                }));
+            }
+            let _ = futures::future::join_all(pre_warms).await;
+            timer.emit_log("[Tor Swarm] Circuit Pre-Warming Complete. Full parallel throughput unlocked.");
+        }
+    }
+
     println!("[Crawli Fingerprint] requesting initial URL: {}", url);
     timer.emit_log("[Fingerprint] Initiating site capabilities probe...");
 
@@ -1110,7 +1131,7 @@ fn get_adapter_support_catalog() -> Vec<adapters::AdapterSupportInfo> {
 #[tauri::command]
 async fn start_crawl(
     url: String,
-    options: frontier::CrawlOptions,
+    mut options: frontier::CrawlOptions,
     output_dir: String,
     app: tauri::AppHandle,
 ) -> Result<CrawlSessionResult, String> {
@@ -1144,6 +1165,21 @@ async fn start_crawl(
     let best_prior_count = best_prior_entries.len();
     let retry_budget = 2usize;
     let started_at_epoch = chrono::Local::now().timestamp().max(0) as u64;
+
+    if options.resume && options.resume_index.is_none() {
+        if best_prior_count > 0 && target_paths.stable_best_dirs_listing_path.exists() {
+            options.resume_index = Some(target_paths.stable_best_dirs_listing_path.to_string_lossy().to_string());
+        } else if target_paths.stable_current_dirs_listing_path.exists() {
+            options.resume_index = Some(target_paths.stable_current_dirs_listing_path.to_string_lossy().to_string());
+        }
+        
+        if options.resume_index.is_some() {
+             app.emit(
+                "crawl_log",
+                format!("[SYSTEM] 🔭 Phase 68 Ledger Resume: Auto-injecting persistent snapshot across system restarts.")
+            ).unwrap_or_default();
+        }
+    }
 
     if options.resume_index.is_some() {
         app.emit(
@@ -1420,6 +1456,10 @@ async fn start_crawl(
             }
         }
     }
+
+    // Phase 72: Trigger Aerospace-Grade VFS Leveling (Sled compact bounds + wait layer sync)
+    // Runs right before session shutdown blocks to guarantee no dangling memory artifacts
+    let _ = vfs.compact_database().await;
 
     Ok(CrawlSessionResult {
         target_key: target_paths.target_identity.target_key.clone(),

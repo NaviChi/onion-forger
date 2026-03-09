@@ -10,10 +10,14 @@ use tor_rtcompat::PreferredRuntime;
 #[derive(Clone)]
 pub struct MultiClientPool {
     clients: Vec<Arc<RwLock<Arc<TorClient<PreferredRuntime>>>>>,
+    next_slot: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MultiClientPool {
-    pub async fn new(count: usize) -> anyhow::Result<Self> {
+    pub async fn new(
+        count: usize,
+        telemetry: Option<crate::runtime_metrics::RuntimeTelemetry>,
+    ) -> anyhow::Result<Self> {
         let mut clients = Vec::with_capacity(count);
 
         if count > 0 {
@@ -65,12 +69,34 @@ impl MultiClientPool {
             }
         }
 
-        Ok(Self { clients })
+        let pool = Self { 
+            clients,
+            next_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        if let Some(t) = telemetry {
+            let next_slot = pool.next_slot.clone();
+            let len = pool.clients.len();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    if !t.is_active() { continue; }
+                    t.set_multi_client_metrics(
+                        next_slot.load(std::sync::atomic::Ordering::Relaxed),
+                        len
+                    );
+                }
+            });
+        }
+
+        Ok(pool)
     }
 
-    // Governor will call this to get a client for a specific worker
-    pub async fn get_client(&self, worker_idx: usize) -> Arc<TorClient<PreferredRuntime>> {
-        let slot = worker_idx % self.clients.len();
+    // Phase 69: Completely agnostic circuit boundaries bridging Tor Clients
+    // Governor will call this to get a dynamic client for any worker
+    pub async fn get_client(&self, _worker_idx: usize) -> Arc<TorClient<PreferredRuntime>> {
+        let slot = self.next_slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len().max(1);
         self.clients[slot].read().await.clone()
     }
 
@@ -80,5 +106,14 @@ impl MultiClientPool {
         let new_client = TorClient::create_bootstrapped(config).await.unwrap();
         let mut guard = self.clients[slot].write().await;
         *guard = Arc::new(new_client);
+    }
+
+    // Phase 70: Metric export for round-robin validation against DDoS heuristics
+    pub fn get_total_client_requests(&self) -> usize {
+        self.next_slot.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn clients_count(&self) -> usize {
+        self.clients.len()
     }
 }

@@ -23,6 +23,8 @@ pub struct ResourceMetricsSnapshot {
     pub timeout_count: usize,
     pub uptime_seconds: u64,
     pub consensus_weight: u64,
+    pub multi_client_rotations: usize,
+    pub multi_client_count: usize,
 }
 
 #[derive(Clone, Default)]
@@ -38,6 +40,8 @@ pub struct RuntimeTelemetry {
     timeout_count: Arc<AtomicUsize>,
     current_node_host: Arc<RwLock<Option<String>>>,
     session_start: Arc<RwLock<Option<std::time::Instant>>>,
+    multi_client_rotations: Arc<AtomicUsize>,
+    multi_client_count: Arc<AtomicUsize>,
 }
 
 impl RuntimeTelemetry {
@@ -142,6 +146,11 @@ impl RuntimeTelemetry {
         self.timeout_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn set_multi_client_metrics(&self, rotations: usize, count: usize) {
+        self.multi_client_rotations.store(rotations, Ordering::Relaxed);
+        self.multi_client_count.store(count, Ordering::Relaxed);
+    }
+
     fn build_snapshot(
         &self,
         process_cpu_percent: f64,
@@ -177,6 +186,8 @@ impl RuntimeTelemetry {
             timeout_count: self.timeout_count.load(Ordering::Relaxed),
             uptime_seconds: self.session_start.read().ok().and_then(|t| t.map(|i| i.elapsed().as_secs())).unwrap_or(0),
             consensus_weight: self.active_circuits.load(Ordering::Relaxed) as u64 * 8192 + self.throttle_count.load(Ordering::Relaxed) as u64 * 256,
+            multi_client_rotations: self.multi_client_rotations.load(Ordering::Relaxed),
+            multi_client_count: self.multi_client_count.load(Ordering::Relaxed),
         }
     }
 
