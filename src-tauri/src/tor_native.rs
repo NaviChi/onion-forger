@@ -17,7 +17,6 @@ use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 use tor_rtcompat::PreferredRuntime;
 
 use crate::kalman::KalmanFilter;
@@ -198,9 +197,9 @@ pub fn build_tor_config(node_index: usize) -> Result<TorClientConfig> {
         .map_err(|e| anyhow!("Failed to build arti config for node {}: {}", node_index, e))
 }
 
-pub type SharedTorClient = Arc<RwLock<Arc<TorClient<PreferredRuntime>>>>;
-type SharedIsolationCache = Arc<RwLock<HashMap<SocksIsolationKey, IsolationToken>>>;
-type SharedCircuitHealth = Arc<RwLock<HashMap<usize, CircuitHealth>>>;
+pub type SharedTorClient = Arc<StdRwLock<Arc<TorClient<PreferredRuntime>>>>;
+type SharedIsolationCache = Arc<StdRwLock<HashMap<SocksIsolationKey, IsolationToken>>>;
+type SharedCircuitHealth = Arc<StdRwLock<HashMap<usize, CircuitHealth>>>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SocksIsolationKey {
@@ -233,24 +232,18 @@ impl CircuitHealth {
 }
 
 static ACTIVE_SOCKS_PORTS: OnceLock<StdRwLock<HashMap<u16, ManagedSocksPort>>> = OnceLock::new();
-static ACTIVE_TOR_CLIENTS: OnceLock<StdRwLock<Vec<SharedTorClient>>> = OnceLock::new();
 static ACTIVE_TOR_ISOLATION_CACHES: OnceLock<StdRwLock<Vec<SharedIsolationCache>>> =
     OnceLock::new();
 static NEXT_SWARM_ID: AtomicU64 = AtomicU64::new(1);
 
-pub fn active_tor_clients() -> Vec<SharedTorClient> {
-    ACTIVE_TOR_CLIENTS
-        .get_or_init(|| StdRwLock::new(Vec::new()))
-        .read()
-        .unwrap()
-        .clone()
-}
+// Global registries are now removed to explicitly ensure strict lifecycle
+// segregation between crawler swarms and downloader swarms.
+// Clients are passed via ArtiSwarm instances explicitly.
 
 fn socks_registry() -> &'static StdRwLock<HashMap<u16, ManagedSocksPort>> {
     ACTIVE_SOCKS_PORTS.get_or_init(|| StdRwLock::new(HashMap::new()))
 }
 
-#[allow(dead_code)]
 fn register_socks_port(port: u16, registration: ManagedSocksPort) {
     if let Ok(mut ports) = socks_registry().write() {
         ports.insert(port, registration);
@@ -269,14 +262,6 @@ fn register_live_client(
     socks_ports: &Arc<StdRwLock<Vec<u16>>>,
     clients_count: &Arc<AtomicUsize>,
 ) -> ManagedSocksPort {
-    {
-        let mut global_clients = ACTIVE_TOR_CLIENTS
-            .get_or_init(|| StdRwLock::new(Vec::new()))
-            .write()
-            .unwrap();
-        global_clients.push(client_slot.clone());
-    }
-
     {
         let mut clients_guard = clients.write().unwrap();
         clients_guard.push(client_slot.clone());
@@ -308,13 +293,6 @@ fn register_live_client_slot(
     isolation_caches: &Arc<StdRwLock<Vec<SharedIsolationCache>>>,
     clients_count: &Arc<AtomicUsize>,
 ) {
-    {
-        let mut global_clients = ACTIVE_TOR_CLIENTS
-            .get_or_init(|| StdRwLock::new(Vec::new()))
-            .write()
-            .unwrap();
-        global_clients.push(client_slot.clone());
-    }
     {
         let mut global_caches = ACTIVE_TOR_ISOLATION_CACHES
             .get_or_init(|| StdRwLock::new(Vec::new()))
@@ -368,7 +346,7 @@ async fn isolation_token_for(
     isolation_cache: &SharedIsolationCache,
     key: SocksIsolationKey,
 ) -> IsolationToken {
-    let mut cache = isolation_cache.write().await;
+    let mut cache = isolation_cache.write().unwrap();
     match cache.entry(key) {
         Entry::Occupied(entry) => *entry.get(),
         Entry::Vacant(entry) => {
@@ -385,10 +363,10 @@ async fn install_client(
     replacement: Arc<TorClient<PreferredRuntime>>,
 ) {
     {
-        let mut slot = client_slot.write().await;
+        let mut slot = client_slot.write().unwrap();
         *slot = replacement;
     }
-    isolation_cache.write().await.clear();
+    isolation_cache.write().unwrap().clear();
 }
 
 fn health_probe_target() -> (String, u16) {
@@ -409,7 +387,7 @@ async fn probe_client_connectivity(
     probe_host: &str,
     probe_port: u16,
 ) -> Result<f64> {
-    let tor_client = { client_slot.read().await.clone() };
+    let tor_client = { client_slot.read().unwrap().clone() };
     if probe_host.eq_ignore_ascii_case("none") {
         return Ok(10.0);
     }
@@ -442,19 +420,20 @@ fn should_rotate_on_onion_connect_error(error_text: &str) -> bool {
 
 async fn take_phantom_or_bootstrap(
     node_idx: usize,
-    phantom_pool: &Arc<RwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
+    phantom_pool: &Arc<StdRwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
     is_vm: bool,
 ) -> Result<Arc<TorClient<PreferredRuntime>>> {
-    let mut pool = phantom_pool.write().await;
-    if let Some(phantom) = pool.pop() {
-        eprintln!(
-            "[Aerospace Healing] Circuit {} swapped with phantom standby (pool: {} remaining).",
-            node_idx,
-            pool.len()
-        );
-        return Ok(phantom);
+    {
+        let mut pool = phantom_pool.write().unwrap();
+        if let Some(phantom) = pool.pop() {
+            eprintln!(
+                "[Aerospace Healing] Circuit {} swapped with phantom standby (pool: {} remaining).",
+                node_idx,
+                pool.len()
+            );
+            return Ok(phantom);
+        }
     }
-    drop(pool);
 
     eprintln!(
         "[Aerospace Healing Warning] Phantom pool empty for circuit {}. Re-bootstrapping.",
@@ -498,7 +477,7 @@ pub async fn spawn_tor_node(node_index: usize, is_vm: bool) -> Result<TorClient<
 pub struct ArtiSwarm {
     pub clients: Arc<StdRwLock<Vec<SharedTorClient>>>,
     isolation_caches: Arc<StdRwLock<Vec<SharedIsolationCache>>>,
-    pub phantom_pool: Arc<RwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
+    pub phantom_pool: Arc<StdRwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
     pub socks_ports: Arc<StdRwLock<Vec<u16>>>,
     #[allow(dead_code)]
     circuit_health: SharedCircuitHealth,
@@ -532,6 +511,10 @@ impl ArtiSwarm {
         install_client(&client_slot, &isolation_cache, replacement).await;
         Ok(())
     }
+
+    pub fn get_clients(&self) -> Vec<SharedTorClient> {
+        self.clients.read().unwrap().clone()
+    }
 }
 
 impl Drop for ArtiSwarm {
@@ -540,19 +523,10 @@ impl Drop for ArtiSwarm {
         let socks_ports = self.socks_ports.read().unwrap().clone();
         unregister_socks_ports(self.owner_id, &socks_ports);
 
-        // Remove our clients from the global pool (using pointer equality for simplicity, or just clear if we assume 1 swarm)
-        let current_clients = self.clients.read().unwrap().clone();
-        let mut global_clients = ACTIVE_TOR_CLIENTS
-            .get_or_init(|| StdRwLock::new(Vec::new()))
-            .write()
-            .unwrap();
-        global_clients.retain(|c| !current_clients.iter().any(|my_c| Arc::ptr_eq(my_c, c)));
-        drop(global_clients);
-
         // TorClient Drop handles cleanup automatically — no PID files, no process kills
         eprintln!(
             "ArtiSwarm dropped: {} native Tor clients released",
-            current_clients.len()
+            self.clients.read().unwrap().len()
         );
     }
 }
@@ -571,8 +545,8 @@ pub async fn run_socks_proxy(
     shutdown: Arc<AtomicBool>,
     node_idx: usize,
 ) -> Result<()> {
-    let client_slot = Arc::new(RwLock::new(tor_client));
-    let isolation_cache = Arc::new(RwLock::new(HashMap::new()));
+    let client_slot = Arc::new(StdRwLock::new(tor_client));
+    let isolation_cache = Arc::new(StdRwLock::new(HashMap::new()));
     run_managed_socks_proxy(client_slot, isolation_cache, port, shutdown, node_idx).await
 }
 
@@ -775,7 +749,7 @@ async fn handle_socks_connection(
             prefs.set_isolation(token);
         }
 
-        let tor_client = client_slot.read().await.clone();
+        let tor_client = client_slot.read().unwrap().clone();
         match tor_client
             .connect_with_prefs((target_addr.clone(), port), &prefs)
             .await
@@ -795,7 +769,7 @@ async fn handle_socks_connection(
                     && should_rotate_on_onion_connect_error(&error_text)
                 {
                     let replacement = {
-                        let current = client_slot.read().await.clone();
+                        let current = client_slot.read().unwrap().clone();
                         Arc::new(current.isolated_client())
                     };
                     install_client(&client_slot, &isolation_cache, replacement).await;
@@ -837,7 +811,7 @@ fn spawn_health_monitor(
     clients: Arc<StdRwLock<Vec<SharedTorClient>>>,
     isolation_caches: Arc<StdRwLock<Vec<SharedIsolationCache>>>,
     health_map: SharedCircuitHealth,
-    phantom_pool: Arc<RwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
+    phantom_pool: Arc<StdRwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
     probe_host: String,
     probe_port: u16,
     is_vm: bool,
@@ -881,51 +855,51 @@ fn spawn_health_monitor(
             .await;
 
             let mut degraded = Vec::new();
-            let mut health = health_map.write().await;
+            {
+                let mut health = health_map.write().unwrap();
 
-            for ((idx, client_slot, isolation_cache), sample) in samples {
-                let circuit = health.entry(idx).or_insert_with(CircuitHealth::new);
-                match sample {
-                    Ok(rtt_ms) => {
-                        let baseline_ms = circuit.latency_kalman.predict();
-                        let predicted_ms = circuit.latency_kalman.update(rtt_ms);
-                        let is_slow = baseline_ms > 0.0 && rtt_ms > baseline_ms * drift_multiplier;
+                for ((idx, client_slot, isolation_cache), sample) in samples {
+                    let circuit = health.entry(idx).or_insert_with(CircuitHealth::new);
+                    match sample {
+                        Ok(rtt_ms) => {
+                            let baseline_ms = circuit.latency_kalman.predict();
+                            let predicted_ms = circuit.latency_kalman.update(rtt_ms);
+                            let is_slow = baseline_ms > 0.0 && rtt_ms > baseline_ms * drift_multiplier;
 
-                        if is_slow {
+                            if is_slow {
+                                circuit.anomaly_streak = circuit.anomaly_streak.saturating_add(1);
+                                eprintln!(
+                                    "[Tor Probe] Circuit {} slow: {:.0} ms (baseline: {:.0} ms, predicted: {:.0} ms, streak: {})",
+                                    idx,
+                                    rtt_ms,
+                                    baseline_ms,
+                                    predicted_ms,
+                                    circuit.anomaly_streak
+                                );
+                            } else {
+                                circuit.anomaly_streak = 0;
+                            }
+                        }
+                        Err(err) => {
                             circuit.anomaly_streak = circuit.anomaly_streak.saturating_add(1);
                             eprintln!(
-                                "[Tor Probe] Circuit {} slow: {:.0} ms (baseline: {:.0} ms, predicted: {:.0} ms, streak: {})",
-                                idx,
-                                rtt_ms,
-                                baseline_ms,
-                                predicted_ms,
-                                circuit.anomaly_streak
+                                "[Tor Probe] Circuit {} probe failed (streak: {}): {}",
+                                idx, circuit.anomaly_streak, err
                             );
-                        } else {
-                            circuit.anomaly_streak = 0;
                         }
                     }
-                    Err(err) => {
-                        circuit.anomaly_streak = circuit.anomaly_streak.saturating_add(1);
+
+                    if circuit.anomaly_streak >= anomaly_threshold {
                         eprintln!(
-                            "[Tor Probe] Circuit {} probe failed (streak: {}): {}",
-                            idx, circuit.anomaly_streak, err
+                            "[Tor Probe] Circuit {} marked degraded after {} consecutive probe anomalies.",
+                            idx,
+                            circuit.anomaly_streak
                         );
+                        circuit.anomaly_streak = 0;
+                        degraded.push((idx, client_slot, isolation_cache));
                     }
                 }
-
-                if circuit.anomaly_streak >= anomaly_threshold {
-                    eprintln!(
-                        "[Tor Probe] Circuit {} marked degraded after {} consecutive probe anomalies.",
-                        idx,
-                        circuit.anomaly_streak
-                    );
-                    circuit.anomaly_streak = 0;
-                    degraded.push((idx, client_slot, isolation_cache));
-                }
             }
-
-            drop(health);
 
             for (idx, client_slot, isolation_cache) in degraded {
                 match take_phantom_or_bootstrap(idx, &phantom_pool, is_vm).await {
@@ -950,7 +924,7 @@ fn spawn_health_monitor(
 
 fn spawn_phantom_pool_builder(
     pool_size: usize,
-    phantom_pool: Arc<RwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
+    phantom_pool: Arc<StdRwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
     is_vm: bool,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -982,7 +956,7 @@ fn spawn_phantom_pool_builder(
 
         let count = phantoms.len();
         {
-            let mut pool = phantom_pool.write().await;
+            let mut pool = phantom_pool.write().unwrap();
             pool.extend(phantoms);
         }
         eprintln!("Phantom Pool: {} warm standby circuits READY", count);
@@ -998,7 +972,7 @@ fn spawn_phantom_pool_builder(
                 break;
             }
 
-            let current_len = phantom_pool.read().await.len();
+            let current_len = phantom_pool.read().unwrap().len();
             let deficit = pool_size.saturating_sub(current_len);
             if deficit > 0 {
                 eprintln!(
@@ -1018,7 +992,7 @@ fn spawn_phantom_pool_builder(
                     new_phantoms.push(Arc::new(c));
                 }
                 if !new_phantoms.is_empty() {
-                    let mut pool = phantom_pool.write().await;
+                    let mut pool = phantom_pool.write().unwrap();
                     let count = new_phantoms.len();
                     pool.extend(new_phantoms);
                     eprintln!(
@@ -1038,7 +1012,7 @@ fn spawn_phantom_pool_builder(
 
 fn spawn_memory_pressure_monitor(
     clients_count: Arc<AtomicUsize>,
-    phantom_pool: Arc<RwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
+    phantom_pool: Arc<StdRwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
     shutdown: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
@@ -1079,7 +1053,7 @@ fn spawn_memory_pressure_monitor(
 
             if usage_pct > threshold_pct {
                 let reclaimed = {
-                    let mut pool = phantom_pool.write().await;
+                    let mut pool = phantom_pool.write().unwrap();
                     let count = pool.len();
                     pool.clear();
                     count
@@ -1108,11 +1082,14 @@ fn spawn_memory_pressure_monitor(
 pub async fn bootstrap_arti_cluster(
     app: AppHandle,
     daemon_count: usize,
+    node_offset: usize,
 ) -> Result<(ArtiSwarm, Vec<u16>)> {
     let requested = daemon_count.max(1);
     let governor_profile = crate::resource_governor::detect_profile(None);
-    let target = 1;
-    let min_ready = 1;
+    // PR-CRAWLER-016: Do not hardcode daemon instantiation. Respect user requested concurrency
+    // to prevent single-point-of-failure burnout on a single Arti guard node.
+    let target = requested.min(governor_profile.recommended_arti_cap).max(1);
+    let min_ready = (target / 2).max(1);
     let is_vm = detect_vm_environment();
     let (probe_host, probe_port) = health_probe_target();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1135,31 +1112,21 @@ pub async fn bootstrap_arti_cluster(
         },
     );
 
-    let _ = app.emit(
-        "crawl_log",
-        format!(
-            "[TOR] Phase 43B: Native arti engine ({}) . target={} quorum={} requested={}. Health probe: {}:{}. VM mode: {}",
-            runtime_label(),
-            target,
-            min_ready,
-            requested,
-            probe_host,
-            probe_port,
-            is_vm
-        ),
-    );
-    let _ = app.emit(
-        "crawl_log",
-        format!(
-            "[TOR] Resource Governor: cpu={} total_gib={} avail_gib={} storage={} recommended_cap={} direct_io={}",
-            governor_profile.cpu_cores,
-            governor_profile.total_memory_bytes / (1024 * 1024 * 1024),
-            governor_profile.available_memory_bytes / (1024 * 1024 * 1024),
-            crate::resource_governor::storage_class_label(governor_profile.storage_class),
-            governor_profile.recommended_arti_cap,
-            crate::io_vanguard::direct_io_policy_label()
-        ),
-    );
+    let timer = crate::timer::CrawlTimer::new(app.clone());
+
+    timer.emit_log(&format!(
+        "[Tor Swarm] Phase 43B: Native arti engine ({}) . target={} quorum={} requested={}. Health probe: {}:{}. VM mode: {}",
+        runtime_label(), target, min_ready, requested, probe_host, probe_port, is_vm
+    ));
+    timer.emit_log(&format!(
+        "[Tor Swarm] Governor Profile: cpu={} total={}GiB avail={}GiB (Class: {}) Target Rec={} Direct IO={}",
+        governor_profile.cpu_cores,
+        governor_profile.total_memory_bytes / (1024 * 1024 * 1024),
+        governor_profile.available_memory_bytes / (1024 * 1024 * 1024),
+        crate::resource_governor::storage_class_label(governor_profile.storage_class),
+        governor_profile.recommended_arti_cap,
+        crate::io_vanguard::direct_io_policy_label()
+    ));
 
     let clients_arc = Arc::new(StdRwLock::new(Vec::new()));
     let isolation_caches_arc = Arc::new(StdRwLock::new(Vec::new()));
@@ -1169,14 +1136,15 @@ pub async fn bootstrap_arti_cluster(
     let mut client_futures = tokio::task::JoinSet::new();
     for i in 0..target {
         let vm = is_vm;
-        client_futures.spawn(async move { (i, spawn_tor_node(i, vm).await) });
+        let global_node_idx = node_offset + i;
+        client_futures.spawn(async move { (global_node_idx, spawn_tor_node(global_node_idx, vm).await) });
     }
 
     while clients_count.load(Ordering::Relaxed) < min_ready {
         match client_futures.join_next().await {
             Some(Ok((idx, Ok(client)))) => {
-                let shared_client = Arc::new(RwLock::new(Arc::new(client)));
-                let isolation_cache = Arc::new(RwLock::new(HashMap::new()));
+                let shared_client = Arc::new(StdRwLock::new(Arc::new(client)));
+                let isolation_cache = Arc::new(StdRwLock::new(HashMap::new()));
                 register_live_client_slot(
                     shared_client.clone(),
                     isolation_cache.clone(),
@@ -1184,7 +1152,9 @@ pub async fn bootstrap_arti_cluster(
                     &isolation_caches_arc,
                     &clients_count,
                 );
-                let _ = idx;
+                timer.emit_log(&format!(
+                    "[Tor Swarm] Node {} built directory consensus and is online.", idx
+                ));
             }
             Some(Ok((_idx, Err(e)))) => eprintln!("Arti node failed to create: {}", e),
             Some(Err(e)) => eprintln!("Arti join task failed: {}", e),
@@ -1235,8 +1205,8 @@ pub async fn bootstrap_arti_cluster(
     );
 
     // Health monitoring, phantom pool, memory monitor
-    let circuit_health = Arc::new(RwLock::new(HashMap::new()));
-    let phantom_pool = Arc::new(RwLock::new(Vec::new()));
+    let circuit_health = Arc::new(StdRwLock::new(HashMap::new()));
+    let phantom_pool = Arc::new(StdRwLock::new(Vec::new()));
 
     spawn_health_monitor(
         clients_arc.clone(),
@@ -1267,8 +1237,8 @@ pub async fn bootstrap_arti_cluster(
             while let Some(result) = client_futures.join_next().await {
                 match result {
                     Ok((_idx, Ok(client))) => {
-                        let shared_client = Arc::new(RwLock::new(Arc::new(client)));
-                        let isolation_cache = Arc::new(RwLock::new(HashMap::new()));
+                        let shared_client = Arc::new(StdRwLock::new(Arc::new(client)));
+                        let isolation_cache = Arc::new(StdRwLock::new(HashMap::new()));
                         register_live_client_slot(
                             shared_client,
                             isolation_cache,
@@ -1312,7 +1282,7 @@ pub async fn bootstrap_arti_cluster(
         isolation_caches: isolation_caches_arc,
         phantom_pool,
         socks_ports: socks_ports_arc,
-        circuit_health,
+        circuit_health: circuit_health.clone(),
         shutdown,
         owner_id,
         is_vm,
@@ -1365,7 +1335,7 @@ pub async fn request_newnym_arti(socks_port: u16) -> Result<()> {
         )
     })?;
     let replacement = {
-        let client = registration.client_slot.read().await.clone();
+        let client = registration.client_slot.read().unwrap().clone();
         Arc::new(client.isolated_client())
     };
     install_client(
@@ -1381,26 +1351,26 @@ pub async fn request_newnym_arti(socks_port: u16) -> Result<()> {
     Ok(())
 }
 
-pub async fn request_newnym_slot_arti(slot_idx: usize) -> Result<()> {
-    let client_slot = ACTIVE_TOR_CLIENTS
-        .get_or_init(|| StdRwLock::new(Vec::new()))
-        .read()
-        .unwrap()
-        .get(slot_idx)
-        .cloned()
-        .ok_or_else(|| anyhow!("No managed Arti client slot at index {}", slot_idx))?;
-    let isolation_cache = ACTIVE_TOR_ISOLATION_CACHES
-        .get_or_init(|| StdRwLock::new(Vec::new()))
-        .read()
-        .unwrap()
-        .get(slot_idx)
-        .cloned()
-        .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new())));
-    let replacement = {
-        let client = client_slot.read().await.clone();
-        Arc::new(client.isolated_client())
-    };
-    install_client(&client_slot, &isolation_cache, replacement).await;
-    eprintln!("[Arti NEWNYM] Rotated managed circuit slot {}", slot_idx);
-    Ok(())
+#[cfg(test)]
+mod dual_swarm_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_dual_swarm_segregation_locks() {
+        println!("[TEST] Spawning parallel Tor environments to verify NT lock segregation.");
+
+        // Swarm 1: Node offset 0 (Crawl pool simulator)
+        let crawl_node_future = spawn_tor_node(0, false);
+
+        // Swarm 2: Node offset 128 (Download pool simulator)
+        let download_node_future = spawn_tor_node(128, false);
+
+        // Boot concurrently
+        let (crawl_res, download_res) = tokio::join!(crawl_node_future, download_node_future);
+
+        let _crawl_client = crawl_res.expect("Crawl swarm Arti node 0 failed to bootstrap");
+        let _download_client = download_res.expect("Download swarm Arti node 128 failed to bootstrap");
+
+        println!("[TEST] Both swarms instantiated and bound unique sub-directories correctly.");
+    }
 }

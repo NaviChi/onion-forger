@@ -197,13 +197,21 @@ impl CrawlerAdapter for PlayAdapter {
                                 if let Some(s) = parsed_entry.1 {
                                     Some(s)
                                 } else {
-                                    // Try HTTP HEAD to get Content-Length
-                                    match client.head(&raw_url).send().await {
-                                        Ok(head_resp) => head_resp
+                                    // Merge HEAD Size Probes into First GET (Kill Redundant Requests)
+                                    match client.get(&raw_url).header("Range", "bytes=0-0").send().await {
+                                        Ok(size_resp) => size_resp
                                             .headers()
-                                            .get("content-length")
+                                            .get("content-range")
                                             .and_then(|v| v.to_str().ok())
-                                            .and_then(|s| s.parse::<u64>().ok()),
+                                            .and_then(|s| s.split('/').last())
+                                            .and_then(|s| s.parse::<u64>().ok())
+                                            .or_else(|| {
+                                                size_resp
+                                                    .headers()
+                                                    .get("content-length")
+                                                    .and_then(|v| v.to_str().ok())
+                                                    .and_then(|s| s.parse::<u64>().ok())
+                                            }),
                                         Err(_) => None,
                                     }
                                 }

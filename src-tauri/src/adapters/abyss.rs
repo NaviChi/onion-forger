@@ -171,22 +171,30 @@ impl CrawlerAdapter for AbyssAdapter {
                 format!("[Abyss] Direct archive detected: {}", filename),
             );
 
-            // Probe for file size via HEAD request
+            // Probe for file size via GET Range request
             let (cid, client) = frontier.get_client();
             let start = std::time::Instant::now();
             let mut size_bytes = None;
 
-            if let Ok(Ok(resp)) = tokio::time::timeout(
+            if let Ok(Ok(size_resp)) = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                client.head(current_url).send(),
+                client.get(current_url).header("Range", "bytes=0-0").send(),
             )
             .await
             {
-                size_bytes = resp
+                size_bytes = size_resp
                     .headers()
-                    .get("content-length")
+                    .get("content-range")
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok());
+                    .and_then(|s| s.split('/').last())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| {
+                        size_resp
+                            .headers()
+                            .get("content-length")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                    });
                 frontier.record_success(cid, 0, start.elapsed().as_millis() as u64);
             } else {
                 frontier.record_failure(cid);

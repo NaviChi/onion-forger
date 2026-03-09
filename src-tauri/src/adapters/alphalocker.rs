@@ -361,22 +361,32 @@ impl CrawlerAdapter for AlphaLockerAdapter {
                         new_files.push(entry);
                     }
 
-                    // HEAD probes for sizes if enabled
+                    // Merge HEAD Size Probes into First GET (Kill Redundant Requests)
                     if f.active_options.sizes {
                         for nf in new_files.iter_mut() {
                             if nf.entry_type == EntryType::File && nf.size_bytes.is_none() {
                                 let (hcid, hclient) = f.get_client();
-                                if let Ok(Ok(head_resp)) = tokio::time::timeout(
+                                if let Ok(Ok(size_resp)) = tokio::time::timeout(
                                     std::time::Duration::from_secs(10),
-                                    hclient.head(&nf.raw_url).send(),
+                                    hclient.get(&nf.raw_url)
+                                        .header("Range", "bytes=0-0")
+                                        .send(),
                                 )
                                 .await
                                 {
-                                    nf.size_bytes = head_resp
+                                    nf.size_bytes = size_resp
                                         .headers()
-                                        .get("content-length")
+                                        .get("content-range")
                                         .and_then(|v| v.to_str().ok())
-                                        .and_then(|s| s.parse::<u64>().ok());
+                                        .and_then(|s| s.split('/').last())
+                                        .and_then(|s| s.parse::<u64>().ok())
+                                        .or_else(|| {
+                                            size_resp
+                                                .headers()
+                                                .get("content-length")
+                                                .and_then(|v| v.to_str().ok())
+                                                .and_then(|s| s.parse::<u64>().ok())
+                                        });
                                     f.record_success(hcid, 0, 0);
                                 } else {
                                     f.record_failure(hcid);

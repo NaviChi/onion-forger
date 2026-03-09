@@ -305,21 +305,29 @@ impl CrawlerAdapter for AutoindexAdapter {
                         }
                     }
 
-                    // Async HEAD requests for Content-Length if required
+                    // Async GET Range requests for Content-Length (merges HEAD redundancy)
                     if f.active_options.sizes {
                         for nf in new_files.iter_mut() {
                             if nf.entry_type == EntryType::File && nf.size_bytes.is_none() {
-                                if let Ok(Ok(head_resp)) = tokio::time::timeout(
+                                if let Ok(Ok(size_resp)) = tokio::time::timeout(
                                     std::time::Duration::from_secs(10),
-                                    client.head(&nf.raw_url).send(),
+                                    client.get(&nf.raw_url).header("Range", "bytes=0-0").send(),
                                 )
                                 .await
                                 {
-                                    nf.size_bytes = head_resp
+                                    nf.size_bytes = size_resp
                                         .headers()
-                                        .get("content-length")
+                                        .get("content-range")
                                         .and_then(|v| v.to_str().ok())
-                                        .and_then(|s| s.parse::<u64>().ok());
+                                        .and_then(|s| s.split('/').last())
+                                        .and_then(|s| s.parse::<u64>().ok())
+                                        .or_else(|| {
+                                            size_resp
+                                                .headers()
+                                                .get("content-length")
+                                                .and_then(|v| v.to_str().ok())
+                                                .and_then(|s| s.parse::<u64>().ok())
+                                        });
                                 }
                             }
                         }
