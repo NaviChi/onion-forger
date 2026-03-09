@@ -27,6 +27,7 @@ pub mod tor;
 pub mod tor_native;
 pub mod tor_runtime; // Phase 45: Parallel chunk downloading
 pub mod torrent_handler; // Phase 52: BitTorrent .torrent + magnet support // Phase 53: Optional Azure + Intranet enterprise
+pub mod timer;
 
 use std::sync::Arc;
 use tauri::Emitter;
@@ -41,7 +42,8 @@ pub struct AppState {
     pub vfs: db::SledVfs,
     pub telemetry: runtime_metrics::RuntimeTelemetry,
     pub telemetry_bridge: telemetry_bridge::TelemetryBridge,
-    pub swarm_guard: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>>>,
+    pub crawl_swarm_guard: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>>>,
+    pub download_swarm_guard: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>>>,
     /// Phase 53: Azure connectivity state (only compiled with `--features azure`)
     #[cfg(feature = "azure")]
     pub azure: tokio::sync::Mutex<azure_connectivity::AzureConnectivityState>,
@@ -49,14 +51,16 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
+        let telemetry_bridge = telemetry_bridge::TelemetryBridge::default();
         Self {
             active_frontier: Mutex::new(None),
             current_target_dir: Mutex::new(None),
             current_target_key: Mutex::new(None),
             vfs: db::SledVfs::default(),
             telemetry: runtime_metrics::RuntimeTelemetry::default(),
-            telemetry_bridge: telemetry_bridge::TelemetryBridge::default(),
-            swarm_guard: tokio::sync::Mutex::new(None),
+            telemetry_bridge,
+            crawl_swarm_guard: tokio::sync::Mutex::new(None),
+            download_swarm_guard: tokio::sync::Mutex::new(None),
             #[cfg(feature = "azure")]
             azure: tokio::sync::Mutex::new(azure_connectivity::AzureConnectivityState::default()),
         }
@@ -76,6 +80,16 @@ pub(crate) struct CrawlStatusUpdate {
     eta_seconds: Option<u64>,
     estimation: String,
     delta_new_files: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vanguard: Option<VanguardTelemetry>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VanguardTelemetry {
+    pub current: usize,
+    pub target: usize,
+    pub status: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -151,6 +165,21 @@ fn crawl_status_snapshot(
         delta_new_files: frontier
             .delta_new_files
             .load(std::sync::atomic::Ordering::Relaxed),
+        vanguard: if frontier.stealth_ramp_active() {
+            let active = frontier.active_workers();
+            let target = frontier.worker_target();
+            Some(VanguardTelemetry {
+                current: active,
+                target,
+                status: if active >= target {
+                    "Maxed".to_string()
+                } else {
+                    format!("Ramping... ({}/{})", active, target)
+                },
+            })
+        } else {
+            None
+        },
     }
 }
 
@@ -300,23 +329,28 @@ async fn execute_crawl_attempt(
     vfs: &db::SledVfs,
     ledger: std::sync::Arc<crate::target_state::TargetLedger>,
 ) -> Result<CrawlAttemptResult, String> {
+    let timer = crate::timer::CrawlTimer::new(app.clone());
+    timer.emit_log(&format!("[System] Bootstrapping Target: {}", url));
+
     let is_onion = url.contains(".onion");
     let support_dir = output_root.join("temp_onionforge_forger");
     tokio::fs::create_dir_all(&support_dir)
         .await
         .map_err(|e| format!("Failed to create support directory: {e}"))?;
 
-    let mut swarm_guard = None;
+    let app_state = app.state::<AppState>();
     let mut arti_clients = Vec::new();
+    let mut swarm_guard_for_frontier = None;
 
     if is_onion {
         let mut pre_warmed = false;
-        if let Some(guard_arc) = app.state::<AppState>().swarm_guard.lock().await.as_ref() {
+        if let Some(guard_arc) = app_state.crawl_swarm_guard.lock().await.as_ref() {
             let guard = guard_arc.lock().await;
             arti_clients = guard.get_arti_clients();
             if !arti_clients.is_empty() {
-                swarm_guard = Some(guard_arc.clone());
+                swarm_guard_for_frontier = Some(guard_arc.clone());
                 pre_warmed = true;
+                timer.emit_log(&format!("[Tor Swarm] Using pre-warmed Phantom Swarm ({} clients)", arti_clients.len()));
                 println!(
                     "[Crawli Bootstrap] Using pre-warmed Phantom Swarm ({} clients)",
                     arti_clients.len()
@@ -325,27 +359,30 @@ async fn execute_crawl_attempt(
         }
 
         if !pre_warmed {
+            timer.emit_log("[Tor Swarm] No pre-warmed swarm found. Cleaning stale daemons...");
             tor::cleanup_stale_tor_daemons();
-            app.emit(
-                "crawl_log",
-                format!("[System] Bootstrapping Target: {}", url),
-            )
-            .unwrap_or_default();
+            timer.emit_log("[Tor Swarm] Bootstrapping new native Arti cluster...");
             println!("[Crawli Bootstrap] starting tor bootstrap for {}", url);
 
             let target_daemons = options
                 .daemons
                 .unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 })
                 .max(1);
-            match tor::bootstrap_tor_cluster(app.clone(), target_daemons).await {
+            match tor::bootstrap_tor_cluster(app.clone(), target_daemons, 0).await {
                 Ok((guard, ports)) => {
+                    timer.emit_log(&format!(
+                        "[Tor Swarm] Bootstrap complete: {} runtime, {} daemons active",
+                        guard.runtime_label(), ports.len()
+                    ));
                     println!(
                         "[Crawli Bootstrap] tor bootstrap complete: runtime={} ports={:?}",
                         guard.runtime_label(),
                         ports
                     );
                     arti_clients = guard.get_arti_clients();
-                    swarm_guard = Some(std::sync::Arc::new(tokio::sync::Mutex::new(guard)));
+                    let arc_guard = std::sync::Arc::new(tokio::sync::Mutex::new(guard));
+                    *app_state.crawl_swarm_guard.lock().await = Some(arc_guard.clone());
+                    swarm_guard_for_frontier = Some(arc_guard);
                 }
                 Err(e) => return Err(format!("Failed to start Tor Swarm: {}", e)),
             }
@@ -377,28 +414,36 @@ async fn execute_crawl_attempt(
         frontier.num_daemons,
         frontier.is_onion
     );
-    frontier.swarm_guard = swarm_guard;
+    frontier.swarm_guard = swarm_guard_for_frontier;
 
     let vfs_path = support_dir.join(".crawli_vtdb");
     let vfs_path_str = vfs_path.to_string_lossy().to_string();
+    timer.emit_log(&format!("[VFS] Initializing Sled storage at {}", vfs_path_str));
     let _ = vfs.initialize(&vfs_path_str).await;
     let _ = vfs.clear().await;
+    timer.emit_log("[VFS] Storage initialized & wiped for new run");
     println!("[Crawli Bootstrap] vfs initialized at {}", vfs_path_str);
 
     println!("[Crawli Fingerprint] requesting initial URL: {}", url);
-    app.emit(
-        "crawl_log",
-        "[System] Generating Site Fingerprint...".to_string(),
-    )
-    .unwrap_or_default();
+    timer.emit_log("[Fingerprint] Initiating site capabilities probe...");
 
     let fingerprint_attempts = if is_onion { 4 } else { 2 };
     let mut fingerprint_attempt = 1usize;
     let resp = loop {
         let attempt = fingerprint_attempt;
         let (cid, client) = frontier.get_client();
-        match client.get(url).send().await {
-            Ok(r) => {
+        // PR-CRAWLER-012: Every HTTP call through Tor must have explicit timeout
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.get(url).send(),
+        )
+        .await
+        {
+            Ok(Ok(r)) => {
+                timer.emit_log(&format!(
+                    "[Fingerprint] Probe successful! Status: {}, Final URL: {}",
+                    r.status(), r.url()
+                ));
                 println!(
                     "[Crawli Fingerprint] initial URL responded: status={} final={}",
                     r.status(),
@@ -406,7 +451,7 @@ async fn execute_crawl_attempt(
                 );
                 break r;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let error_text = e.to_string();
                 println!(
                     "[Crawli Fingerprint] initial URL request failed on attempt {} via cid {}: {}",
@@ -414,19 +459,59 @@ async fn execute_crawl_attempt(
                 );
 
                 if attempt >= fingerprint_attempts {
+                    timer.emit_log(&format!("[Fingerprint] CRITICAL FAIL: Site offline or blocking Tor. ({})", error_text));
+                    
+                    // PR-CRAWLER-017: If the fallback chain fails completely, the Phantom Swarm
+                    // may have a burned guard node or IP ban. Shred it from AppState so
+                    // the user's next 'Retry' click forces a 100% cold boot.
+                    timer.emit_log("[Tor Swarm] ⚠ Evicting degraded Phantom Swarm to force cold boot next run.");
+                    if let Some(guard_arc) = app_state.crawl_swarm_guard.lock().await.take() {
+                        let mut g = guard_arc.lock().await;
+                        g.shutdown_all();
+                    }
+
                     return Err(format!(
                         "OFFLINE_SYNC_ERROR: The site might be down. Please manually check it to verify if it is actually functional and active. ({})",
                         error_text
                     ));
                 }
 
-                let _ = app.emit(
-                    "crawl_log",
-                    format!(
-                        "[System] Initial fingerprint connect failed on attempt {}. Rotating client slot and retrying...",
-                        attempt
-                    ),
+                timer.emit_log(&format!(
+                    "[Fingerprint] Probe failed on attempt {}/{}. Rotating circuit...",
+                    attempt, fingerprint_attempts
+                ));
+                if is_onion {
+                    frontier.trigger_circuit_isolation(cid).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis((attempt as u64) * 750)).await;
+                fingerprint_attempt = fingerprint_attempt.saturating_add(1);
+            }
+            Err(_) => {
+                // Timeout — treat as failure
+                println!(
+                    "[Crawli Fingerprint] attempt {} timed out after 30s via cid {}",
+                    attempt, cid
                 );
+
+                if attempt >= fingerprint_attempts {
+                    timer.emit_log("[Fingerprint] CRITICAL FAIL: All fingerprint attempts timed out (30s each).");
+                    
+                    // PR-CRAWLER-017: Shred degraded Phantom Swarm to prevent infinite loop of dead circuits
+                    timer.emit_log("[Tor Swarm] ⏰ Evicting dead Phantom Swarm to force cold boot next run.");
+                    if let Some(guard_arc) = app_state.crawl_swarm_guard.lock().await.take() {
+                        let mut g = guard_arc.lock().await;
+                        g.shutdown_all();
+                    }
+
+                    return Err(
+                        "OFFLINE_SYNC_ERROR: All fingerprint probes timed out. The site may be down or Tor circuits are degraded.".to_string()
+                    );
+                }
+
+                timer.emit_log(&format!(
+                    "[Fingerprint] Probe timed out on attempt {}/{}. Rotating circuit...",
+                    attempt, fingerprint_attempts
+                ));
                 if is_onion {
                     frontier.trigger_circuit_isolation(cid).await;
                 }
@@ -448,14 +533,26 @@ async fn execute_crawl_attempt(
         && (content_type.contains("application/")
             || url.ends_with(".7z")
             || url.ends_with(".zip")
-            || url.ends_with(".rar"));
+            || url.ends_with(".rar")
+            || url.ends_with(".tar.gz")
+            || url.ends_with(".tar")
+            || url.ends_with(".gz"));
 
     let body = if is_binary {
         "[BINARY_OR_ARCHIVE_DATA]".to_string()
     } else {
-        resp.text()
-            .await
-            .unwrap_or_else(|_| "[DECODE_ERROR]".to_string())
+        // PR-CRAWLER-012: Timeout on body read to prevent hang on stalled connections
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            resp.text(),
+        ).await {
+            Ok(Ok(text)) => text,
+            Ok(Err(_)) => "[DECODE_ERROR]".to_string(),
+            Err(_) => {
+                println!("[Crawli Fingerprint] body read timed out after 15s");
+                "[BODY_TIMEOUT]".to_string()
+            }
+        }
     };
 
     let fingerprint = adapters::SiteFingerprint {
@@ -466,14 +563,17 @@ async fn execute_crawl_attempt(
     };
 
     if let Some(name) = looks_like_direct_artifact(url, is_binary) {
+        timer.emit_log(&format!("[Adapter] Target appears to be a direct file/artifact: {}", name));
         let registry = adapters::AdapterRegistry::new().with_explorer_context(ledger.clone());
         if let Some(adapter) = registry.determine_adapter(&fingerprint).await {
+            timer.emit_log(&format!("[Adapter] Match found: {}", adapter.name()));
             app.emit(
                 "crawl_log",
                 format!("[Adapter] Match found: {}", adapter.name()),
             )
             .unwrap_or_default();
         } else {
+            timer.emit_log("[Adapter] Match found: Direct Artifact (No specialized adapter match)");
             app.emit(
                 "crawl_log",
                 "[Adapter] Match found: Direct Artifact (No specialized adapter match)".to_string(),
@@ -525,9 +625,11 @@ async fn execute_crawl_attempt(
 
     let registry = adapters::AdapterRegistry::new().with_explorer_context(ledger.clone());
     let Some(adapter) = registry.determine_adapter(&fingerprint).await else {
+        timer.emit_log("[Adapter] CRITICAL FAIL: No known adapter matched this site architecture.");
         return Err("No known adapter matched this sites architecture.".to_string());
     };
 
+    timer.emit_log(&format!("[Adapter] Match found: {}. Executing deep crawl...", adapter.name()));
     app.emit(
         "crawl_log",
         format!("[Adapter] Match found: {}", adapter.name()),
@@ -583,6 +685,7 @@ async fn execute_crawl_attempt(
 
     match crawl_result {
         Ok(files) => {
+            timer.emit_log(&format!("[Adapter] Crawl complete! Found {} raw entries.", files.len()));
             let state = app.state::<AppState>();
             *state.current_target_dir.lock().await = None;
             *state.current_target_key.lock().await = None;
@@ -590,6 +693,7 @@ async fn execute_crawl_attempt(
                 vfs.insert_entries(&files)
                     .await
                     .map_err(|e| e.to_string())?;
+                timer.emit_log("[VFS] Entries successfully committed to local storage.");
             }
             let mut summary = vfs.summarize_entries().await.map_err(|e| e.to_string())?;
             if summary.discovered_count == 0 && !files.is_empty() {
@@ -601,6 +705,7 @@ async fn execute_crawl_attempt(
             })
         }
         Err(e) => {
+            timer.emit_log(&format!("[Adapter] CRITICAL FAIL during crawl execution: {}", e));
             let state = app.state::<AppState>();
             let mut lock = state.active_frontier.lock().await;
             *lock = None;
@@ -1839,15 +1944,11 @@ async fn pre_resolve_onion(url: String, app: tauri::AppHandle) -> Result<(), Str
         return Ok(());
     }
     let state = app.state::<AppState>();
-    if let Some(guard_arc) = state.swarm_guard.lock().await.clone() {
+    if let Some(guard_arc) = state.crawl_swarm_guard.lock().await.clone() {
         tauri::async_runtime::spawn(async move {
             let guard = guard_arc.lock().await;
             if let Some(client) = guard.get_arti_clients().first() {
-                let tor_client = if tokio::runtime::Handle::try_current().is_ok() {
-                    tokio::task::block_in_place(|| client.blocking_read().clone())
-                } else {
-                    client.blocking_read().clone()
-                };
+                let tor_client = client.read().unwrap().clone();
                 let token = ::arti_client::IsolationToken::new();
                 let arti = arti_client::ArtiClient::new((*tor_client).clone(), Some(token));
                 let _ = tokio::time::timeout(
@@ -1897,8 +1998,32 @@ fn detect_input_mode(input: String) -> String {
     torrent_handler::detect_input_mode(&input).to_string()
 }
 
+/// Phase 67H: Returns the detected system profile for GUI auto-selection
+#[tauri::command]
+fn get_system_profile() -> serde_json::Value {
+    let profile = crate::resource_governor::recommended_concurrency_preset();
+    serde_json::json!({
+        "preset": profile.preset,
+        "circuits": profile.circuits,
+        "workers": profile.workers,
+        "cpuCores": profile.cpu_cores,
+        "totalRamGb": profile.total_ram_gb,
+        "availableRamGb": profile.available_ram_gb,
+        "storageClass": profile.storage_class,
+        "os": profile.os
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Phase 62: Install missing global CryptoProvider for rustls >= 0.23
+    // Without this, ArtiClient::new panics silently on the tokio async thread,
+    // dropping the Tauri IPC resolver and creating an infinite hang in the frontend proxy.
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+            .expect("Failed to universally install ring CryptoProvider. Backend cannot run safely.");
+    }
+
     // Flush any zombie Tor daemons from previous sessions on startup
     tor::cleanup_stale_tor_daemons();
 
@@ -1916,8 +2041,8 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
-                if let Ok((guard, _)) = tor::bootstrap_tor_cluster(handle.clone(), 4).await {
-                    *state.swarm_guard.lock().await =
+                if let Ok((guard, _)) = tor::bootstrap_tor_cluster(handle.clone(), 4, 0).await {
+                    *state.crawl_swarm_guard.lock().await =
                         Some(Arc::new(tokio::sync::Mutex::new(guard)));
                 }
             });
@@ -1939,7 +2064,9 @@ pub fn run() {
             get_subtree_heatmap,
             open_folder_os,
             set_telemetry_enabled,
+            crate::binary_telemetry::drain_telemetry_ring,
             detect_input_mode,
+            get_system_profile,
             // Phase 53: Azure + Intranet enterprise commands (feature-gated)
             #[cfg(feature = "azure")]
             azure_connectivity::configure_azure_storage,

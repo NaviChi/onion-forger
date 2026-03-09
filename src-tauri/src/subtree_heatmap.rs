@@ -112,6 +112,22 @@ impl SubtreeHeatmap {
         record.failure_score >= 4 || record.consecutive_failures >= 2
     }
 
+    pub fn is_subtree_penalized(url: &str) -> bool {
+        // Global static check utility for vanguard fusion
+        lazy_static::lazy_static! {
+            static ref CACHED_HEATMAP: std::sync::Mutex<Option<SubtreeHeatmap>> = std::sync::Mutex::new(None);
+        }
+        
+        let Ok(hm) = CACHED_HEATMAP.lock() else { return false };
+        let hm = match hm.as_ref() {
+            Some(h) => h,
+            None => return false,
+        };
+
+        let Some(key) = Self::subtree_key(&hm.target_key, url) else { return false };
+        hm.should_route_to_degraded(&key)
+    }
+
     pub fn record_failure(&mut self, subtree_key: &str, kind: HeatFailureKind) {
         let now = unix_now();
         let record = self

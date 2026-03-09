@@ -61,10 +61,13 @@ impl Drop for TorProcessGuard {
 pub async fn bootstrap_tor_cluster(
     app: AppHandle,
     daemon_count: usize,
+    node_offset: usize,
 ) -> Result<(TorProcessGuard, Vec<u16>)> {
-    let (swarm, ports) = tor_native::bootstrap_arti_cluster(app, daemon_count).await?;
-    let mut guard = TorProcessGuard::new();
-    guard.native_swarm = Some(swarm);
+    // Explicitly install the rustls crypto provider globally before building the Arti client
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let (swarm, ports) =
+        tor_native::bootstrap_arti_cluster(app.clone(), daemon_count, node_offset).await?;
+    let guard = TorProcessGuard { native_swarm: Some(swarm) };
     Ok((guard, ports))
 }
 
@@ -84,14 +87,9 @@ pub async fn request_newnym(socks_port: u16) -> Result<()> {
     tor_native::request_newnym_arti(socks_port).await
 }
 
-/// Rotate a live managed client slot directly.
-pub async fn request_newnym_slot(slot_idx: usize) -> Result<()> {
-    tor_native::request_newnym_slot_arti(slot_idx).await
-}
 
-pub fn active_client_count() -> usize {
-    tor_native::active_tor_clients().len()
-}
+
+
 
 /// Cleanup stale Tor daemons — no-op with native arti (no child processes to clean).
 pub fn cleanup_stale_tor_daemons() {

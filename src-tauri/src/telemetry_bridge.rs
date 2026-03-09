@@ -23,6 +23,8 @@ pub struct BridgeCrawlStatus {
     pub eta_seconds: Option<u64>,
     pub estimation: String,
     pub delta_new_files: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vanguard: Option<crate::VanguardTelemetry>,
 }
 
 impl From<crate::CrawlStatusUpdate> for BridgeCrawlStatus {
@@ -38,6 +40,7 @@ impl From<crate::CrawlStatusUpdate> for BridgeCrawlStatus {
             eta_seconds: value.eta_seconds,
             estimation: value.estimation,
             delta_new_files: value.delta_new_files,
+            vanguard: value.vanguard,
         }
     }
 }

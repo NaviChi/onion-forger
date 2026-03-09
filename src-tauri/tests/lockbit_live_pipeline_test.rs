@@ -181,7 +181,7 @@ fn live_lockbit_pipeline_default_ui_settings() {
         println!("[STEP] Cleaning stale Tor daemons and bootstrapping 4-daemon swarm...");
         tor::cleanup_stale_tor_daemons();
         let tor_start = Instant::now();
-        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), 4)
+        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), 4, 0)
             .await
             .expect("bootstrap tor cluster");
         println!(

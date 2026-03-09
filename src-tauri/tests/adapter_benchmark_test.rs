@@ -14,21 +14,17 @@ use crawli_lib::frontier::{CrawlOptions, CrawlerFrontier};
 use crawli_lib::telemetry_bridge;
 use crawli_lib::{tor, AppState};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tauri::Manager;
 
 const BENCHMARK_DURATION_SECS: u64 = 300; // 5 minutes per adapter
 const TOR_DAEMONS: usize = 4;
 const CIRCUIT_COUNT: usize = 120;
 
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
+// Removed unused now_epoch_secs
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
 struct TestUrl {
     id: String,
     adapter: String,
@@ -39,6 +35,7 @@ struct TestUrl {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
 struct TestDatabase {
     version: u32,
     description: String,
@@ -217,7 +214,7 @@ fn multi_adapter_benchmark() {
 
         println!("[STEP] Bootstrapping {}-daemon Tor swarm...", TOR_DAEMONS);
         let tor_start = Instant::now();
-        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), TOR_DAEMONS)
+        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), TOR_DAEMONS, 0)
             .await
             .expect("bootstrap tor cluster");
         let tor_bootstrap_secs = tor_start.elapsed().as_secs_f64();
@@ -375,7 +372,7 @@ async fn run_single_benchmark(
     };
 
     let daemon_count = active_ports.len().max(1);
-    let mut frontier = CrawlerFrontier::new(
+    let frontier = CrawlerFrontier::new(
         Some(app_handle.clone()),
         test_url.url.clone(),
         daemon_count,

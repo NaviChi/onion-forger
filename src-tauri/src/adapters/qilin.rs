@@ -4,7 +4,7 @@ use crate::frontier::CrawlerFrontier;
 use crate::path_utils;
 use crate::runtime_metrics::RuntimeTelemetry;
 use crate::subtree_heatmap::{HeatFailureKind, SubtreeHeatmap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -81,6 +81,10 @@ impl QilinRoutePlan {
 
     async fn current_seed_url(&self) -> String {
         self.active_seed_url.read().await.clone()
+    }
+
+    fn current_seed_url_sync(&self) -> String {
+        self.active_seed_url.blocking_read().clone()
     }
 
     async fn failover_url(
@@ -290,7 +294,7 @@ fn emit_root_listing_diagnostics(app: &AppHandle, next_url: &str, html: &str) {
     );
 }
 
-const CHILD_DIAGNOSTIC_LIMIT: usize = 16;
+const CHILD_DIAGNOSTIC_LIMIT: usize = 64;
 
 fn emit_limited_child_log(app: &AppHandle, counter: &AtomicUsize, stage: &str, message: String) {
     let idx = counter.fetch_add(1, Ordering::Relaxed);
@@ -346,8 +350,17 @@ struct QilinCrawlGovernor {
     failures: AtomicUsize,
     timeouts: AtomicUsize,
     circuit_failures: AtomicUsize,
-    throttles: AtomicUsize,
+    pub throttles: Arc<AtomicUsize>,
     http_failures: AtomicUsize,
+    // Phase 67D: epoch millis of most recent throttle for reactive scale-down
+    pub last_throttle_epoch_ms: Arc<AtomicU64>,
+    pub throttles_in_window: Arc<AtomicUsize>,
+    pub adaptive_ramp_ceiling: Arc<AtomicUsize>,
+    // Phase 67F: Per-circuit latency profiling (supports up to 16 circuits)
+    circuit_latency_sum_ms: [AtomicU64; 16],
+    circuit_request_count: [AtomicU64; 16],
+    // Phase 67L: Per-circuit error count for health scoring
+    circuit_error_count: [AtomicUsize; 16],
     telemetry: Option<RuntimeTelemetry>,
 }
 
@@ -374,7 +387,7 @@ impl QilinCrawlGovernor {
             reserve_for_downloads,
             telemetry.as_ref(),
         );
-        let default_max = if reserve_for_downloads { 8 } else { 12 };
+        let default_max = if reserve_for_downloads { 10 } else { 16 };
         let max_active = env_usize(if reserve_for_downloads {
             "CRAWLI_QILIN_PAGE_WORKERS_DOWNLOAD_MAX"
         } else {
@@ -404,8 +417,14 @@ impl QilinCrawlGovernor {
             failures: AtomicUsize::new(0),
             timeouts: AtomicUsize::new(0),
             circuit_failures: AtomicUsize::new(0),
-            throttles: AtomicUsize::new(0),
+            throttles: Arc::new(AtomicUsize::new(0)),
             http_failures: AtomicUsize::new(0),
+            last_throttle_epoch_ms: Arc::new(AtomicU64::new(0)),
+            throttles_in_window: Arc::new(AtomicUsize::new(0)),
+            adaptive_ramp_ceiling: Arc::new(AtomicUsize::new(max_active)),
+            circuit_latency_sum_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+            circuit_request_count: std::array::from_fn(|_| AtomicU64::new(0)),
+            circuit_error_count: std::array::from_fn(|_| AtomicUsize::new(0)),
             telemetry,
         }
     }
@@ -414,8 +433,137 @@ impl QilinCrawlGovernor {
         self.desired_active.load(Ordering::Relaxed)
     }
 
-    fn record_success(&self) {
+    /// Phase 67F: Record success with per-circuit latency tracking
+    fn record_success_with_latency(&self, cid: usize, elapsed_ms: u64) {
         self.successes.fetch_add(1, Ordering::Relaxed);
+        if cid < 16 {
+            self.circuit_latency_sum_ms[cid].fetch_add(elapsed_ms, Ordering::Relaxed);
+            self.circuit_request_count[cid].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Phase 67F: Format per-circuit avg latency for logging
+    fn circuit_latency_summary(&self) -> String {
+        let mut parts = Vec::new();
+        for i in 0..16 {
+            let count = self.circuit_request_count[i].load(Ordering::Relaxed);
+            if count > 0 {
+                let sum = self.circuit_latency_sum_ms[i].load(Ordering::Relaxed);
+                let avg = sum / count;
+                parts.push(format!("c{}:{}ms", i, avg));
+            }
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+
+    pub fn record_throttle(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_millis() as u64;
+
+        let last = self.last_throttle_epoch_ms.swap(now, Ordering::Relaxed);
+        
+        if now.saturating_sub(last) > 10000 {
+            // Reset sliding window if it's been > 10s since the last throttle
+            self.throttles_in_window.store(1, Ordering::Relaxed);
+        } else {
+            self.throttles_in_window.fetch_add(1, Ordering::Relaxed);
+        }
+
+        self.throttles.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn should_halt_ramp(&self, current_active_workers: usize) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_millis() as u64;
+
+        let last_throttle = self.last_throttle_epoch_ms.load(Ordering::Relaxed);
+        let window_throttles = self.throttles_in_window.load(Ordering::Relaxed);
+        let current_ceiling = self.adaptive_ramp_ceiling.load(Ordering::Relaxed);
+
+        if current_active_workers > current_ceiling {
+            return true;
+        }
+
+        // Halt ramp and set adaptive ceiling if we've seen > 2 throttles in the last 10 seconds
+        if window_throttles > 2 && (now.saturating_sub(last_throttle) < 10000) {
+            // Freeze ceiling at the current active worker count (or slightly less to relieve pressure)
+            let safe_ceiling = current_active_workers.saturating_sub(1).max(1);
+            
+            // Only update if we're lowering the ceiling further (don't accidentally raise it)
+            if safe_ceiling < current_ceiling {
+                self.adaptive_ramp_ceiling.store(safe_ceiling, Ordering::Relaxed);
+            }
+            return true;
+        }
+        
+        false
+    }
+
+
+    /// Phase 67I: Returns (best_cid, best_avg_ms) for the fastest circuit
+    fn best_latency_circuit(&self) -> Option<(usize, u64)> {
+        let mut best: Option<(usize, u64)> = None;
+        for i in 0..16 {
+            let count = self.circuit_request_count[i].load(Ordering::Relaxed);
+            if count >= 5 {
+                let sum = self.circuit_latency_sum_ms[i].load(Ordering::Relaxed);
+                let avg = sum / count;
+                if best.is_none() || avg < best.unwrap().1 {
+                    best = Some((i, avg));
+                }
+            }
+        }
+        best
+    }
+
+    /// Phase 67I+L: Returns true if the worker should re-pin to a faster/healthier circuit
+    fn should_repin(&self, current_cid: usize) -> bool {
+        if current_cid >= 16 { return false; }
+        let my_count = self.circuit_request_count[current_cid].load(Ordering::Relaxed);
+        if my_count < 10 { return false; } // Need enough samples
+
+        // Phase 67L: Check error rate — re-pin if >30% error rate
+        let my_errors = self.circuit_error_count[current_cid].load(Ordering::Relaxed) as u64;
+        let my_total = my_count + my_errors;
+        if my_total >= 10 && my_errors * 100 / my_total.max(1) > 30 {
+            return true;
+        }
+
+        // Phase 67I: Check latency — re-pin if >1.8× slower than best
+        let my_sum = self.circuit_latency_sum_ms[current_cid].load(Ordering::Relaxed);
+        let my_avg = my_sum / my_count;
+        if let Some((_, best_avg)) = self.best_latency_circuit() {
+            my_avg > best_avg.saturating_mul(18) / 10
+        } else {
+            false
+        }
+    }
+
+    /// Phase 67K: Compute adaptive timeout from observed latency data
+    /// Returns timeout in seconds: max(8, median_avg_latency × 4), clamped [8, 45]
+    fn adaptive_timeout_secs(&self) -> u64 {
+        let mut avgs: Vec<u64> = Vec::new();
+        for i in 0..16 {
+            let count = self.circuit_request_count[i].load(Ordering::Relaxed);
+            if count >= 3 {
+                let sum = self.circuit_latency_sum_ms[i].load(Ordering::Relaxed);
+                avgs.push(sum / count);
+            }
+        }
+        if avgs.is_empty() {
+            return 25; // No data yet — use default
+        }
+        avgs.sort();
+        let median_ms = avgs[avgs.len() / 2];
+        // Timeout = 4× median latency, clamped to [8, 45] seconds
+        (median_ms.saturating_mul(4) / 1000).clamp(8, 45)
     }
 
     fn record_failure(&self, kind: CrawlFailureKind) {
@@ -431,7 +579,7 @@ impl QilinCrawlGovernor {
                 self.circuit_failures.fetch_add(1, Ordering::Relaxed);
             }
             CrawlFailureKind::Throttle => {
-                self.throttles.fetch_add(1, Ordering::Relaxed);
+                self.record_throttle();
                 if let Some(telemetry) = &self.telemetry {
                     telemetry.record_throttle();
                 }
@@ -442,11 +590,52 @@ impl QilinCrawlGovernor {
         }
     }
 
+    /// Phase 67L: Record a failure with circuit tracking for health scoring
+    fn record_failure_for_circuit(&self, kind: CrawlFailureKind, cid: usize) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        if cid < 16 {
+            self.circuit_error_count[cid].fetch_add(1, Ordering::Relaxed);
+        }
+        match kind {
+            CrawlFailureKind::Timeout => {
+                self.timeouts.fetch_add(1, Ordering::Relaxed);
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.record_timeout();
+                }
+            }
+            CrawlFailureKind::Throttle => {
+                self.record_throttle();
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.record_throttle();
+                }
+            }
+            CrawlFailureKind::Circuit => {
+                self.circuit_failures.fetch_add(1, Ordering::Relaxed);
+            }
+            CrawlFailureKind::Http => {
+                self.http_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     async fn acquire_slot(self: &Arc<Self>) -> QilinCrawlPermit {
         loop {
             let desired = self.desired_active.load(Ordering::Relaxed).max(1);
+            // Phase 67D: Reactive throttle — if a throttle happened within 5s,
+            // cut effective desired in half to prevent hammering
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let last_throttle = self.last_throttle_epoch_ms.load(Ordering::Relaxed);
+            let throttle_active = last_throttle > 0 && now_ms.saturating_sub(last_throttle) < 5_000;
+            let effective_desired = if throttle_active {
+                (desired / 2).max(self.min_active)
+            } else {
+                desired
+            };
             let current = self.in_flight.load(Ordering::Relaxed);
-            if current < desired
+            if current < effective_desired
                 && self
                     .in_flight
                     .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
@@ -504,9 +693,28 @@ impl QilinCrawlGovernor {
         } else if http_failures >= 4 && http_failures > successes {
             next = ((current * 4) / 5).max(self.min_active);
         } else if pending > current * 3 && success_ratio > 0.90 && total >= current.min(6) {
-            next = (current + 4).min(pressure_cap);
+            // Phase 67D: Graduated re-escalation — limit scale-up after recent throttles
+            let throttle_cooldown_active = {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let last = self.last_throttle_epoch_ms.load(Ordering::Relaxed);
+                last > 0 && now_ms.saturating_sub(last) < 30_000
+            };
+            let step = if throttle_cooldown_active { 1 } else { 4 };
+            next = (current + step).min(pressure_cap);
         } else if pending > current && success_ratio > 0.75 && total >= 4 {
-            next = (current + 2).min(pressure_cap);
+            let throttle_cooldown_active = {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let last = self.last_throttle_epoch_ms.load(Ordering::Relaxed);
+                last > 0 && now_ms.saturating_sub(last) < 30_000
+            };
+            let step = if throttle_cooldown_active { 1 } else { 2 };
+            next = (current + step).min(pressure_cap);
         } else if total >= 6 && success_ratio < 0.50 {
             next = ((current * 3) / 4).max(self.min_active);
         }
@@ -562,12 +770,22 @@ fn classify_request_error(err: &anyhow::Error) -> CrawlFailureKind {
 #[async_trait::async_trait]
 impl CrawlerAdapter for QilinAdapter {
     async fn can_handle(&self, fingerprint: &SiteFingerprint) -> bool {
+        // URL-based matching: Qilin CMS URL patterns are unique identifiers
+        // (reqwest follows 302 redirects, so body won't contain CMS markers
+        //  when the URL is /site/view or /site/data — the body will be nginx autoindex)
+        if fingerprint.url.contains("/site/view") || fingerprint.url.contains("/site/data") {
+            return true;
+        }
+        // Body-based matching: CMS page markers (when redirect doesn't happen)
         fingerprint
             .body
             .contains("<div class=\"page-header-title\">QData</div>")
             || fingerprint.body.contains("Data browser")
             || fingerprint.body.contains("_csrf-blog")
             || fingerprint.body.contains("item_box_photos")
+            // Nginx autoindex markers (storage node pages after redirect)
+            || (fingerprint.body.contains("<table id=\"list\">")
+                && fingerprint.body.contains("<td class=\"link\">"))
             || regex::Regex::new(r#"value="[a-z2-7]{56}\.onion""#)
                 .unwrap()
                 .is_match(&fingerprint.body)
@@ -654,6 +872,8 @@ impl CrawlerAdapter for QilinAdapter {
             if let Some(uuid_start) = current_url.find("uuid=") {
                 let uuid = current_url[uuid_start + 5..].trim_end_matches('/');
 
+                let timer = crate::timer::CrawlTimer::new(app.clone());
+                timer.emit_log(&format!("[Qilin] Phase 30: Multi-node discovery for UUID: {}", uuid));
                 let _ = app.emit(
                     "log",
                     format!("[Qilin] Phase 30: Multi-node discovery for UUID: {}", uuid),
@@ -672,12 +892,24 @@ impl CrawlerAdapter for QilinAdapter {
                 // Pre-seed known QData storage domains as fallback (Stage C insurance)
                 node_cache.seed_known_mirrors(uuid).await;
 
-                // Run the 4-stage discovery algorithm
+                // Run the 4-stage discovery algorithm with a hard global timeout
+                // to prevent indefinite UI hang when Tor circuits are degraded
                 let (_, client) = frontier.get_client();
-                if let Some(best_node) = node_cache
-                    .discover_and_resolve(current_url, uuid, &client)
-                    .await
-                {
+                let discovery_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(45),
+                    node_cache.discover_and_resolve(current_url, uuid, &client, Some(&app)),
+                )
+                .await;
+                let resolved_node = match discovery_result {
+                    Ok(node) => node,
+                    Err(_) => {
+                        timer.emit_log("[Qilin] ⚠ Storage discovery global timeout (45s). Falling back to direct mirror probing...");
+                        println!("[Qilin Phase 30] ⚠ Global discovery timeout after 45s");
+                        let _ = app.emit("log", "[Qilin] Storage discovery timed out after 45s. Trying direct mirrors...".to_string());
+                        None
+                    }
+                };
+                if let Some(best_node) = resolved_node {
                     actual_seed_url = best_node.url.clone();
                     if let Some(telemetry) = &telemetry {
                         telemetry.set_current_node_host(best_node.host.clone());
@@ -688,6 +920,10 @@ impl CrawlerAdapter for QilinAdapter {
                         "[Qilin Phase 30] ✅ Resolved to storage node: {} ({}ms, {} hits)",
                         best_node.host, best_node.avg_latency_ms, best_node.hit_count
                     );
+                    timer.emit_log(&format!(
+                        "[Qilin] Storage Node Resolved: {} ({}ms avg latency)",
+                        best_node.host, best_node.avg_latency_ms
+                    ));
                     let _ = app.emit(
                         "log",
                         format!(
@@ -706,12 +942,14 @@ impl CrawlerAdapter for QilinAdapter {
                     }
                 } else {
                     // Phase 42 Fix 4: Direct UUID retry with NEWNYM rotation
+                    timer.emit_log("[Qilin] All storage nodes dead. Trying direct UUID construction with fresh circuits...");
                     println!("[Qilin Phase 42] ⚠ All storage nodes dead. Attempting direct UUID retry with NEWNYM...");
                     let _ = app.emit("log", "[Qilin] All storage nodes dead. Trying direct UUID construction with fresh circuits...".to_string());
 
                     // Blast NEWNYM to all active managed Tor daemons to get fresh circuits
-                    for slot_idx in 0..crate::tor::active_client_count() {
-                        let _ = crate::tor::request_newnym_slot(slot_idx).await;
+                    let current_ports = crate::tor::detect_active_managed_tor_ports();
+                    for port in current_ports {
+                        let _ = crate::tor::request_newnym(port).await;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -721,66 +959,76 @@ impl CrawlerAdapter for QilinAdapter {
                         "arrfcpipltlfgxc6hvjylixc6c5hrummwctz4wqysk3h56ntqz5scnad.onion",
                     ];
 
-                    let mut found_alive = false;
-                    for mirror in &known_mirrors {
-                        let test_url = format!("http://{}/{}/", mirror, uuid);
-                        println!("[Qilin Phase 42] Probing direct mirror: {}", test_url);
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(15),
-                            client.get(&test_url).send(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(resp))
-                                if resp.status().is_success()
-                                    || resp.status().as_u16() == 301
-                                    || resp.status().as_u16() == 302 =>
+                    // Phase 62: Concurrent mirror probing with batch timeout
+                    let mirror_result: Arc<tokio::sync::Mutex<Option<(String, String)>>> = Arc::new(tokio::sync::Mutex::new(None));
+                    let mut mirror_tasks = tokio::task::JoinSet::new();
+                    for mirror in known_mirrors {
+                        let client = client.clone();
+                        let uuid_owned = uuid.to_string();
+                        let result_ref = mirror_result.clone();
+                        mirror_tasks.spawn(async move {
+                            let test_url = format!("http://{}/{}/", mirror, uuid_owned);
+                            println!("[Qilin Phase 42] Probing direct mirror: {}", test_url);
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(8),
+                                client.get(&test_url).send(),
+                            )
+                            .await
                             {
-                                // Check if response body looks like an autoindex
-                                let final_url = resp.url().as_str().to_string();
-                                if let Ok(body) = resp.text().await {
-                                    if body.contains("<table id=\"list\">")
-                                        || body.contains("Index of")
-                                        || body.contains("<td class=\"link\">")
-                                    {
-                                        println!("[Qilin Phase 42] ✅ Direct mirror alive with file index: {}", mirror);
-                                        let _ = app.emit(
-                                            "log",
-                                            format!("[Qilin] ✅ Direct mirror alive: {}", mirror),
-                                        );
-                                        actual_seed_url = if final_url != test_url {
-                                            final_url
-                                        } else {
-                                            test_url
-                                        };
-                                        if let Some(telemetry) = &telemetry {
-                                            telemetry.set_current_node_host((*mirror).to_string());
+                                Ok(Ok(resp))
+                                    if resp.status().is_success()
+                                        || resp.status().as_u16() == 301
+                                        || resp.status().as_u16() == 302 =>
+                                {
+                                    let final_url = resp.url().as_str().to_string();
+                                    if let Ok(body) = resp.text().await {
+                                        if body.contains("<table id=\"list\">")
+                                            || body.contains("Index of")
+                                            || body.contains("<td class=\"link\">")
+                                        {
+                                            let mut guard = result_ref.lock().await;
+                                            if guard.is_none() {
+                                                *guard = Some((mirror.to_string(), if final_url != test_url { final_url } else { test_url }));
+                                            }
                                         }
-                                        found_alive = true;
-                                        break;
                                     }
                                 }
+                                Ok(Ok(resp)) => {
+                                    println!("[Qilin Phase 42] Mirror {} responded with {}", mirror, resp.status());
+                                }
+                                Ok(Err(e)) => {
+                                    println!("[Qilin Phase 42] Mirror {} unreachable: {}", mirror, e);
+                                }
+                                Err(_) => {
+                                    println!("[Qilin Phase 42] Mirror {} timed out", mirror);
+                                }
                             }
-                            Ok(Ok(resp)) => {
-                                println!(
-                                    "[Qilin Phase 42] Mirror {} responded with {}",
-                                    mirror,
-                                    resp.status()
-                                );
-                            }
-                            Ok(Err(e)) => {
-                                println!("[Qilin Phase 42] Mirror {} unreachable: {}", mirror, e);
-                            }
-                            Err(_) => {
-                                println!("[Qilin Phase 42] Mirror {} timed out", mirror);
-                            }
-                        }
+                        });
                     }
+                    // 15s batch timeout for all concurrent mirror probes
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        async { while mirror_tasks.join_next().await.is_some() {} },
+                    ).await;
+
+                    let found_alive = if let Some((mirror_host, mirror_url)) = mirror_result.lock().await.take() {
+                        println!("[Qilin Phase 42] ✅ Direct mirror alive: {}", mirror_host);
+                        timer.emit_log(&format!("[Qilin] ✅ Direct mirror alive: {}", mirror_host));
+                        let _ = app.emit("log", format!("[Qilin] ✅ Direct mirror alive: {}", mirror_host));
+                        actual_seed_url = mirror_url;
+                        if let Some(telemetry) = &telemetry {
+                            telemetry.set_current_node_host(mirror_host);
+                        }
+                        true
+                    } else {
+                        false
+                    };
 
                     if !found_alive {
                         println!(
                             "[Qilin Phase 42] ⚠ No alive mirrors found. Falling back to CMS URL."
                         );
+                        timer.emit_log("[Qilin] No alive storage nodes. Using CMS URL directly (limited results expected).");
                         let _ = app.emit("log", "[Qilin] No alive storage nodes. Using CMS URL directly (limited results expected).".to_string());
                     }
                 }
@@ -798,6 +1046,8 @@ impl CrawlerAdapter for QilinAdapter {
         frontier.mark_visited(&actual_seed_url);
 
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Phase 67E: Shared counter for real-time entry count visibility
+        let discovered_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let (ui_tx, mut ui_rx) = mpsc::channel::<FileEntry>(4096);
@@ -862,8 +1112,17 @@ impl CrawlerAdapter for QilinAdapter {
         });
 
         let reserve_for_downloads = frontier.active_options.download;
+        // Phase 67C: Use actual pool size instead of frontier.active_client_count() (which is 1).
+        // Compute the same value that multi_clients will have (env var override, capped at 8).
+        let governor_pool_size = std::env::var("CRAWLI_MULTI_CLIENTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            // Phase 67G: Raised cap from 8→16 for higher concurrency
+            .unwrap_or_else(|| frontier.active_options.circuits.unwrap_or(120).min(16))
+            .min(16)
+            .max(1);
         let governor = Arc::new(QilinCrawlGovernor::new(
-            frontier.active_client_count(),
+            governor_pool_size,
             reserve_for_downloads,
             telemetry.clone(),
         ));
@@ -890,6 +1149,7 @@ impl CrawlerAdapter for QilinAdapter {
         {
             let governor = governor.clone();
             let pending = pending.clone();
+            let discovered_entries_gov = discovered_entries.clone();
             let cancel_flag = frontier.cancel_flag.clone();
             let app = app.clone();
             let governor_interval = governor_interval;
@@ -913,13 +1173,33 @@ impl CrawlerAdapter for QilinAdapter {
                     }
 
                     if let Some((next, pressure)) = governor.rebalance(pending_now) {
+                        let latency = governor.circuit_latency_summary();
+                        let adaptive_to = governor.adaptive_timeout_secs();
                         let _ = app.emit(
                             "log",
                             format!(
-                                "[Qilin] Adaptive page governor adjusted to {} active workers (pending={}, in_flight={}, pressure={:.2})",
-                                next, pending_now, in_flight, pressure
+                                "[Qilin] Governor: workers={} pending={} in_flight={} pressure={:.2} entries={} timeout={}s latency=[{}]",
+                                next, pending_now, in_flight, pressure,
+                                discovered_entries_gov.load(Ordering::Relaxed),
+                                adaptive_to, latency
                             ),
                         );
+                        println!(
+                            "[Qilin] Governor: workers={} pending={} in_flight={} pressure={:.2} entries={} timeout={}s latency=[{}]",
+                            next, pending_now, in_flight, pressure,
+                            discovered_entries_gov.load(Ordering::Relaxed),
+                            adaptive_to, latency
+                        );
+                    } else if idle_rounds == 0 {
+                        // Phase 67E+F: Periodic progress with latency
+                        let total = discovered_entries_gov.load(Ordering::Relaxed);
+                        if total > 0 {
+                            println!(
+                                "[Qilin Progress] entries={} pending={} in_flight={} latency=[{}]",
+                                total, pending_now, in_flight,
+                                governor.circuit_latency_summary()
+                            );
+                        }
                     }
                 }
             });
@@ -932,17 +1212,27 @@ impl CrawlerAdapter for QilinAdapter {
             parsed_url.host_str().unwrap_or("")
         );
 
-        let multi_clients = frontier.active_options.circuits.unwrap_or_else(|| {
-            std::env::var("CRAWLI_MULTI_CLIENTS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(4)
-        });
+        // Phase 67B: Separate pool size (TorClient count) from circuits_ceiling (worker budget).
+        // circuits_ceiling controls how many workers/circuits operate; pool size controls
+        // how many actual TorClient instances are created. Creating 120 TorClients is catastrophic.
+        let circuits_ceiling = frontier.active_options.circuits.unwrap_or(120);
+        let multi_clients = std::env::var("CRAWLI_MULTI_CLIENTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            // Phase 67G: Raised cap from 8→16 for higher concurrency
+            .unwrap_or_else(|| circuits_ceiling.min(16))
+            .min(16)
+            .max(1);
+        let timer = crate::timer::CrawlTimer::new(app.clone());
+        timer.emit_log(&format!(
+            "[Qilin] Bootstrapping MultiClientPool with {} TorClients (circuits_ceiling={})",
+            multi_clients, circuits_ceiling
+        ));
         let _ = app.emit(
             "log",
             format!(
-                "[Qilin] Bootstrapping MultiClientPool with {} independent TorClients...",
-                multi_clients
+                "[Qilin] Bootstrapping MultiClientPool with {} TorClients (circuits_ceiling={})",
+                multi_clients, circuits_ceiling
             ),
         );
         let multi_pool = Arc::new(
@@ -951,29 +1241,40 @@ impl CrawlerAdapter for QilinAdapter {
                 .unwrap(),
         );
 
+        timer.emit_log("[Qilin] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors...");
         let _ = app.emit(
             "log",
             "[Qilin] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors..."
                 .to_string(),
         );
+        // Phase 67: Fire-and-Forget preheat — block only until FIRST client is hot,
+        // then spawn remaining warmups as background tasks.
         let mut preheats = Vec::new();
         for i in 0..multi_clients {
             let tor_arc = multi_pool.get_client(i).await;
             let preheat_client = crate::arti_client::ArtiClient::new((*tor_arc).clone(), None);
             let target_heat_url = actual_seed_url.clone();
             preheats.push(tokio::spawn(async move {
-                // Try fetching to cache the .onion descriptor, ignore errors as building the circuit is the only goal
                 let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(55),
+                    std::time::Duration::from_secs(20),
                     preheat_client.get(&target_heat_url).send(),
                 )
                 .await;
             }));
         }
-        futures::future::join_all(preheats).await;
+        // Gate: wait for ANY single client to finish preheating, then unleash workers immediately
+        if !preheats.is_empty() {
+            let (result, _index, remaining) = futures::future::select_all(preheats).await;
+            let _ = result; // Ignore errors — circuit warmup is best-effort
+            // Fire-and-forget remaining preheats as background tasks
+            for handle in remaining {
+                tokio::spawn(async move { let _ = handle.await; });
+            }
+        }
+        timer.emit_log("[Qilin] First circuit hot. Unleashing workers (remaining circuits warming in background).");
         let _ = app.emit(
             "log",
-            "[Qilin] Pre-heating complete. Unleashing workers.".to_string(),
+            "[Qilin] First circuit hot. Unleashing workers (remaining warming in background).".to_string(),
         );
 
         for worker_idx in 0..max_concurrent {
@@ -985,6 +1286,7 @@ impl CrawlerAdapter for QilinAdapter {
             let ui_tx_clone = ui_tx.clone();
             let ui_app_clone = app.clone();
             let pending_clone = pending.clone();
+            let discovered_clone = discovered_entries.clone();
             let domain_clone = base_domain.clone();
             let crawl_governor = governor.clone();
             let route_plan = route_plan.clone();
@@ -1003,9 +1305,40 @@ impl CrawlerAdapter for QilinAdapter {
             let vf_clone = visited_folders.clone();
 
             workers.spawn(async move {
+                let ramp_initial = std::env::var("CRAWLI_VANGUARD_INITIAL")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let ramp_interval_ms = std::env::var("CRAWLI_VANGUARD_RAMP_INTERVAL_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(2500);
+
+                if f.stealth_ramp_active() && worker_idx >= ramp_initial {
+                    let offset_ms = (worker_idx - ramp_initial + 1) as u64 * ramp_interval_ms;
+                    let mut slept = 0;
+                    while slept < offset_ms {
+                        if f.is_cancelled() { return; }
+                        let current_workers = f.active_workers();
+                        if crawl_governor.should_halt_ramp(current_workers) {
+                            let _ = ui_app_clone.emit(
+                                "log",
+                                format!("[Vanguard] Halting worker induction at {}/{} due to server 503s.", worker_idx, max_concurrent)
+                            );
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        slept += 100;
+                    }
+                    let current_workers = f.active_workers();
+                    if crawl_governor.should_halt_ramp(current_workers) { return; }
+                    let _ = ui_app_clone.emit("log", format!("[Qilin Vanguard] Inducting worker {}/{}", worker_idx + 1, max_concurrent));
+                }
+
                 let mut ddos = crate::adapters::qilin_ddos_guard::DdosGuard::new();
                 let mut idle_sleep_ms: u64 = 50;
                 let mut worker_client: Option<(usize, crate::arti_client::ArtiClient)> = None;
+                let mut worker_req_count: usize = 0; // Phase 67I: request counter for circuit re-eval
                 loop {
                     if f.is_cancelled() {
                         break;
@@ -1046,6 +1379,13 @@ impl CrawlerAdapter for QilinAdapter {
                                     } else {
                                         drop(permit);
                                         if let Some(payload) = take_due_retry(&retry_q_clone) {
+                                            let current_seed = route_plan.current_seed_url_sync();
+                                            if f.stealth_ramp_active() && std::env::var("CRAWLI_QILIN_SUBTREE_HEATMAP").unwrap_or_default() == "true" {
+                                                if crate::subtree_heatmap::SubtreeHeatmap::is_subtree_penalized(&payload.url) && !payload.url.starts_with(&current_seed) {
+                                                    degraded_retry_q_clone.push(payload);
+                                                    continue;
+                                                }
+                                            }
                                             idle_sleep_ms = 50;
                                             (payload.url, payload.attempt)
                                         } else {
@@ -1056,11 +1396,18 @@ impl CrawlerAdapter for QilinAdapter {
                                                 break;
                                             }
                                             tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
-                                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
+                                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                             continue;
                                         }
                                     }
                                 } else if let Some(payload) = take_due_retry(&retry_q_clone) {
+                                    let current_seed = route_plan.current_seed_url_sync();
+                                    if f.stealth_ramp_active() && std::env::var("CRAWLI_QILIN_SUBTREE_HEATMAP").unwrap_or_default() == "true" {
+                                        if crate::subtree_heatmap::SubtreeHeatmap::is_subtree_penalized(&payload.url) && !payload.url.starts_with(&current_seed) {
+                                            degraded_retry_q_clone.push(payload);
+                                            continue;
+                                        }
+                                    }
                                     idle_sleep_ms = 50;
                                     (payload.url, payload.attempt)
                                 } else {
@@ -1071,10 +1418,17 @@ impl CrawlerAdapter for QilinAdapter {
                                         break;
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
-                                    idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
+                                    idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                     continue;
                                 }
                             } else if let Some(payload) = take_due_retry(&retry_q_clone) {
+                                let current_seed = route_plan.current_seed_url_sync();
+                                if f.stealth_ramp_active() && std::env::var("CRAWLI_QILIN_SUBTREE_HEATMAP").unwrap_or_default() == "true" {
+                                    if crate::subtree_heatmap::SubtreeHeatmap::is_subtree_penalized(&payload.url) && !payload.url.starts_with(&current_seed) {
+                                        degraded_retry_q_clone.push(payload);
+                                        continue;
+                                    }
+                                }
                                 idle_sleep_ms = 50;
                                 (payload.url, payload.attempt)
                             } else if let Some(permit) =
@@ -1105,7 +1459,7 @@ impl CrawlerAdapter for QilinAdapter {
                                         break;
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
-                                    idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
+                                    idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                     continue;
                                 }
                             } else {
@@ -1116,7 +1470,7 @@ impl CrawlerAdapter for QilinAdapter {
                                     break;
                                 }
                                 tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
-                                idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
+                                idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                 continue;
                             }
                         }
@@ -1128,8 +1482,10 @@ impl CrawlerAdapter for QilinAdapter {
                     let (cid, client) = if let Some((cid, client)) = &worker_client {
                         (*cid, client.clone())
                     } else {
-                        let tor_arc = pool_clone.get_client(worker_idx).await;
-                        let cid = worker_idx;
+                        // Phase 67: Bandit-guided circuit pre-selection via Thompson scoring
+                        let best_cid = f.scorer.best_circuit_for_url(multi_clients);
+                        let tor_arc = pool_clone.get_client(best_cid).await;
+                        let cid = best_cid;
                         let client = crate::arti_client::ArtiClient::new(
                             (*tor_arc).clone(),
                             None,
@@ -1177,12 +1533,34 @@ impl CrawlerAdapter for QilinAdapter {
                         );
                     }
 
-                    // 7-pass Exponential Retry Pattern (Inverted Worker-Stealing)
+                    // Phase 67: Speculative dual-circuit GET racing — fire on 2 circuits, take fastest
                     let start_time = std::time::Instant::now();
-                    let resp_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(45),
-                        client.get(&next_url).send()
-                    ).await;
+                    let resp_result: Result<Result<crate::arti_client::ArtiResponse, anyhow::Error>, _> = if multi_clients >= 2 {
+                        // Build a speculative request on a different circuit
+                        let adaptive_timeout = std::time::Duration::from_secs(crawl_governor.adaptive_timeout_secs());
+                        let spec_cid = (worker_idx + 1) % multi_clients;
+                        let spec_tor = pool_clone.get_client(spec_cid).await;
+                        let spec_client = crate::arti_client::ArtiClient::new((*spec_tor).clone(), None);
+                        let spec_url = next_url.clone();
+                        let primary_fut = tokio::time::timeout(
+                            adaptive_timeout,
+                            client.get(&next_url).send(),
+                        );
+                        let spec_fut = tokio::time::timeout(
+                            adaptive_timeout,
+                            spec_client.get(&spec_url).send(),
+                        );
+                        tokio::select! {
+                            biased; // Prefer primary circuit
+                            r = primary_fut => r,
+                            r = spec_fut => r,
+                        }
+                    } else {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(crawl_governor.adaptive_timeout_secs()),
+                            client.get(&next_url).send()
+                        ).await
+                    };
 
                     let mut html = None;
                     let mut effective_url = next_url.clone();
@@ -1201,18 +1579,45 @@ impl CrawlerAdapter for QilinAdapter {
 
                         if status.is_success() {
                             f.record_success(cid, 4096, elapsed_ms);
-                            crawl_governor.record_success();
-                            if let Ok(body) = resp.text().await {
-                                html = Some(body);
-                            } else {
-                                f.record_failure(cid);
-                                crawl_governor.record_failure(CrawlFailureKind::Http);
-                                retry_failure_kind = CrawlFailureKind::Http;
-                                should_retry = true;
+                            crawl_governor.record_success_with_latency(cid, elapsed_ms);
+                            // Phase 67I: Periodic circuit re-evaluation (every 20 requests)
+                            worker_req_count += 1;
+                            if worker_req_count % 20 == 0 && crawl_governor.should_repin(cid) {
+                                if let Some((best_cid, best_avg)) = crawl_governor.best_latency_circuit() {
+                                    let my_count = crawl_governor.circuit_request_count[cid].load(Ordering::Relaxed);
+                                    let my_avg = if my_count > 0 {
+                                        crawl_governor.circuit_latency_sum_ms[cid].load(Ordering::Relaxed) / my_count
+                                    } else { 0 };
+                                    println!("[Qilin Worker {}] Re-pinning: c{}({}ms) → c{}({}ms)", worker_idx, cid, my_avg, best_cid, best_avg);
+                                    worker_client = None; // Force re-evaluation on next iteration
+                                }
+                            }
+                            // Phase 67: Offload UTF-8 conversion to spawn_blocking for large HTML pages
+                            match resp.bytes().await {
+                                Ok(body_bytes) => {
+                                    match tokio::task::spawn_blocking(move || {
+                                        String::from_utf8(body_bytes.to_vec())
+                                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+                                    }).await {
+                                        Ok(body) => { html = Some(body); }
+                                        Err(_) => {
+                                            f.record_failure(cid);
+                                            crawl_governor.record_failure_for_circuit(CrawlFailureKind::Http, cid);
+                                            retry_failure_kind = CrawlFailureKind::Http;
+                                            should_retry = true;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    f.record_failure(cid);
+                                    crawl_governor.record_failure_for_circuit(CrawlFailureKind::Http, cid);
+                                    retry_failure_kind = CrawlFailureKind::Http;
+                                    should_retry = true;
+                                }
                             }
                         } else if status == 404 {
                             f.record_success(cid, 512, elapsed_ms);
-                            crawl_governor.record_success();
+                            crawl_governor.record_success_with_latency(cid, elapsed_ms);
                         } else {
                             f.record_failure(cid);
                             let failure_kind = if status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -1225,7 +1630,11 @@ impl CrawlerAdapter for QilinAdapter {
                             } else {
                                 CrawlFailureKind::Http
                             };
-                            crawl_governor.record_failure(failure_kind);
+                            crawl_governor.record_failure_for_circuit(failure_kind, cid);
+                            // Phase 67D: Per-worker cool-off after throttle
+                            if matches!(failure_kind, CrawlFailureKind::Throttle) {
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
                             retry_failure_kind = failure_kind;
                             should_retry = true;
                             if next_url != active_seed_url {
@@ -1268,7 +1677,7 @@ impl CrawlerAdapter for QilinAdapter {
                                 Err(_) => CrawlFailureKind::Timeout,
                                 _ => CrawlFailureKind::Circuit,
                             };
-                            crawl_governor.record_failure(failure_kind);
+                            crawl_governor.record_failure_for_circuit(failure_kind, cid);
                             retry_failure_kind = failure_kind;
                             f.trigger_circuit_isolation(cid).await;
                         } else {
@@ -1278,7 +1687,7 @@ impl CrawlerAdapter for QilinAdapter {
                                 Err(_) => CrawlFailureKind::Timeout,
                                 _ => CrawlFailureKind::Http,
                             };
-                            crawl_governor.record_failure(retry_failure_kind);
+                            crawl_governor.record_failure_for_circuit(retry_failure_kind, cid);
                         }
                         should_retry = true;
                         if next_url != active_seed_url {
@@ -1546,6 +1955,11 @@ impl CrawlerAdapter for QilinAdapter {
                     }
 
                     new_files.extend(spawned_files);
+                    // Phase 67E: Increment discovered entries counter
+                    discovered_clone.fetch_add(
+                        spawned_folders.len(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
 
                             {
                                 let mut df = df_clone.lock().await;
@@ -1673,10 +2087,11 @@ impl CrawlerAdapter for QilinAdapter {
                     ),
                 );
 
-                for slot_idx in 0..crate::tor::active_client_count() {
-                    let _ = crate::tor::request_newnym_slot(slot_idx).await;
+                let current_ports = crate::tor::detect_active_managed_tor_ports();
+                for port in current_ports {
+                    let _ = crate::tor::request_newnym(port).await;
                 }
-                tokio::time::sleep(Duration::from_millis(1500)).await;
+                tokio::time::sleep(Duration::from_millis(800)).await; // Phase 67: Reduced NEWNYM cooldown
 
                 // Re-inject the failed folders into the primary queue and revive the workers
                 for folder in missing_folders {
@@ -1701,7 +2116,7 @@ impl CrawlerAdapter for QilinAdapter {
                 }
 
                 // Re-spawn the workers for the Tail-End Sweep
-                for _ in 0..max_concurrent {
+                for worker_idx in 0..max_concurrent {
                     let f = frontier.clone();
                     let q_clone = queue.clone();
                     let retry_q_clone = retry_queue.clone();
@@ -1709,6 +2124,7 @@ impl CrawlerAdapter for QilinAdapter {
                     let ui_tx_clone = ui_tx.clone();
                     let ui_app_clone = app.clone();
                     let pending_clone = pending.clone();
+                    let discovered_clone = discovered_entries.clone();
                     let domain_clone = base_domain.clone();
                     let crawl_governor = governor.clone();
                     let route_plan = route_plan.clone();
@@ -1727,9 +2143,39 @@ impl CrawlerAdapter for QilinAdapter {
                     let vf_clone = visited_folders.clone();
 
                     workers.spawn(async move {
+                        let ramp_initial = std::env::var("CRAWLI_VANGUARD_INITIAL")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        let ramp_interval_ms = std::env::var("CRAWLI_VANGUARD_RAMP_INTERVAL_MS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(2500);
+
+                        if f.stealth_ramp_active() && worker_idx >= ramp_initial {
+                            let offset_ms = (worker_idx - ramp_initial + 1) as u64 * ramp_interval_ms;
+                            let mut slept = 0;
+                            while slept < offset_ms {
+                                if f.is_cancelled() { return; }
+                                let current_workers = f.active_workers();
+                                if crawl_governor.should_halt_ramp(current_workers) {
+                                    let _ = ui_app_clone.emit(
+                                        "log",
+                                        format!("[Vanguard] Halting Tail-Sweep induction at {}/{} due to server 503s.", worker_idx, max_concurrent)
+                                    );
+                                    return;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                slept += 100;
+                            }
+                            let current_workers = f.active_workers();
+                            if crawl_governor.should_halt_ramp(current_workers) { return; }
+                        }
+
                         let mut ddos = crate::adapters::qilin_ddos_guard::DdosGuard::new();
                         let mut idle_sleep_ms: u64 = 50;
                         let mut worker_client: Option<(usize, crate::arti_client::ArtiClient)> = None;
+                        let mut worker_req_count: usize = 0; // Phase 67I
                         loop {
                             if f.is_cancelled() { break; }
 
@@ -1768,9 +2214,16 @@ impl CrawlerAdapter for QilinAdapter {
                                             } else {
                                                 drop(permit);
                                                 if let Some(payload) = take_due_retry(&retry_q_clone) {
-                                                    idle_sleep_ms = 50;
-                                                    (payload.url, payload.attempt)
-                                                } else {
+                                                let current_seed = route_plan.current_seed_url_sync();
+                                                if f.stealth_ramp_active() && std::env::var("CRAWLI_QILIN_SUBTREE_HEATMAP").unwrap_or_default() == "true" {
+                                                    if crate::subtree_heatmap::SubtreeHeatmap::is_subtree_penalized(&payload.url) && !payload.url.starts_with(&current_seed) {
+                                                        degraded_retry_q_clone.push(payload);
+                                                        continue;
+                                                    }
+                                                }
+                                                idle_sleep_ms = 50;
+                                                (payload.url, payload.attempt)
+                                            } else {
                                                     if pending_clone.load(Ordering::SeqCst) == 0
                                                         && retry_q_clone.is_empty()
                                                         && degraded_retry_q_clone.is_empty()
@@ -1778,11 +2231,18 @@ impl CrawlerAdapter for QilinAdapter {
                                                         break;
                                                     }
                                                     tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
-                                                    idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
+                                                    idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                                     continue;
                                                 }
                                             }
                                         } else if let Some(payload) = take_due_retry(&retry_q_clone) {
+                                            let current_seed = route_plan.current_seed_url_sync();
+                                            if f.stealth_ramp_active() && std::env::var("CRAWLI_QILIN_SUBTREE_HEATMAP").unwrap_or_default() == "true" {
+                                                if crate::subtree_heatmap::SubtreeHeatmap::is_subtree_penalized(&payload.url) && !payload.url.starts_with(&current_seed) {
+                                                    degraded_retry_q_clone.push(payload);
+                                                    continue;
+                                                }
+                                            }
                                             idle_sleep_ms = 50;
                                             (payload.url, payload.attempt)
                                         } else {
@@ -1793,10 +2253,17 @@ impl CrawlerAdapter for QilinAdapter {
                                                 break;
                                             }
                                             tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
-                                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
+                                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                             continue;
                                         }
                                     } else if let Some(payload) = take_due_retry(&retry_q_clone) {
+                                        let current_seed = route_plan.current_seed_url_sync();
+                                        if f.stealth_ramp_active() && std::env::var("CRAWLI_QILIN_SUBTREE_HEATMAP").unwrap_or_default() == "true" {
+                                            if crate::subtree_heatmap::SubtreeHeatmap::is_subtree_penalized(&payload.url) && !payload.url.starts_with(&current_seed) {
+                                                degraded_retry_q_clone.push(payload);
+                                                continue;
+                                            }
+                                        }
                                         idle_sleep_ms = 50;
                                         (payload.url, payload.attempt)
                                     } else if let Some(permit) =
@@ -1827,7 +2294,7 @@ impl CrawlerAdapter for QilinAdapter {
                                                 break;
                                             }
                                             tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
-                                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
+                                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                             continue;
                                         }
                                     } else {
@@ -1838,7 +2305,7 @@ impl CrawlerAdapter for QilinAdapter {
                                             break;
                                         }
                                         tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
-                                        idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
+                                        idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                         continue;
                                     }
                                 }
@@ -1896,7 +2363,7 @@ impl CrawlerAdapter for QilinAdapter {
 
                             let start_time = std::time::Instant::now();
                             let resp_result = tokio::time::timeout(
-                                std::time::Duration::from_secs(45),
+                                std::time::Duration::from_secs(crawl_governor.adaptive_timeout_secs()),
                                 client.get(&next_url).send()
                             ).await;
 
@@ -1917,7 +2384,13 @@ impl CrawlerAdapter for QilinAdapter {
 
                                 if status.is_success() {
                                     f.record_success(cid, 4096, elapsed_ms);
-                                    crawl_governor.record_success();
+                                    crawl_governor.record_success_with_latency(cid, elapsed_ms);
+                                    // Phase 67I: Circuit re-evaluation in secondary loop
+                                    worker_req_count += 1;
+                                    if worker_req_count % 20 == 0 && crawl_governor.should_repin(cid) {
+                                        println!("[Qilin Worker] Secondary re-pin from c{}", cid);
+                                        worker_client = None;
+                                    }
                                     if let Ok(body) = resp.text().await {
                                         html = Some(body);
                                     } else {
@@ -1928,7 +2401,7 @@ impl CrawlerAdapter for QilinAdapter {
                                     }
                                 } else if status == 404 {
                                     f.record_success(cid, 512, elapsed_ms);
-                                    crawl_governor.record_success();
+                                    crawl_governor.record_success_with_latency(cid, elapsed_ms);
                                 } else {
                                     f.record_failure(cid);
                                     let failure_kind = if status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -1939,6 +2412,10 @@ impl CrawlerAdapter for QilinAdapter {
                                         CrawlFailureKind::Http
                                     };
                                     crawl_governor.record_failure(failure_kind);
+                                    // Phase 67D: Per-worker cool-off after throttle
+                                    if matches!(failure_kind, CrawlFailureKind::Throttle) {
+                                        tokio::time::sleep(Duration::from_secs(2)).await;
+                                    }
                                     retry_failure_kind = failure_kind;
                                     should_retry = true;
                                     if next_url != active_seed_url {
@@ -2012,7 +2489,7 @@ impl CrawlerAdapter for QilinAdapter {
                                     let retry_url = route_plan
                                         .failover_url(&next_url, retry_failure_kind, current_attempt, &ui_app_clone)
                                         .await
-                                        .unwrap_or_else(|| next_url.clone());
+                                        .unwrap_or_else(|| next_url.to_string());
 
                                     let retry_payload = RetryPayload {
                                         url: retry_url,
@@ -2046,16 +2523,16 @@ impl CrawlerAdapter for QilinAdapter {
                                         let _ = writeln!(file, "FAILED_NODE: {}", next_url);
                                     }
                                     eprintln!("[Qilin] Dropping node after 15 retries: {}", next_url);
-                                    let _ = ui_app_clone.emit("crawl_error", next_url.clone());
-                                }
-                                continue;
+                                    let _ = ui_app_clone.emit("log", format!("[Qilin Queue] Re-enqueuing active_seed_url: {} -> {}", &active_seed_url, &next_url));
+                                    q_clone.push(active_seed_url);
+                                }continue;
                             }
 
                             let Some(html) = html else { continue; };
 
                             {
                                 let mut vf = vf_clone.lock().await;
-                                vf.insert(next_url.clone());
+                                vf.insert(next_url.to_string());
                                 if effective_url != next_url {
                                     vf.insert(effective_url.clone());
                                 }
@@ -2217,6 +2694,11 @@ impl CrawlerAdapter for QilinAdapter {
                             }
 
                             new_files.extend(spawned_files);
+                            // Phase 67E: Increment discovered entries counter
+                            discovered_clone.fetch_add(
+                                spawned_folders.len(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
 
                             {
                                 let mut df = df_clone.lock().await;
@@ -2326,9 +2808,11 @@ impl CrawlerAdapter for QilinAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        remap_seed_url, retry_lane_for_failure, standby_seed_urls, CrawlFailureKind, RetryLane,
+        remap_seed_url, retry_lane_for_failure, standby_seed_urls, CrawlFailureKind,
+        QilinCrawlGovernor, RetryLane,
     };
     use crate::adapters::qilin_nodes::StorageNode;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn node(url: &str, host: &str) -> StorageNode {
         StorageNode {
@@ -2401,5 +2885,56 @@ mod tests {
             retry_lane_for_failure(CrawlFailureKind::Http, 4),
             RetryLane::Primary
         );
+    }
+
+    #[test]
+    fn throttle_suppresses_fast_reescalation() {
+        let gov = QilinCrawlGovernor {
+            desired_active: AtomicUsize::new(4),
+            in_flight: AtomicUsize::new(0),
+            min_active: 2,
+            max_active: 12,
+            available_clients: 8,
+            permit_budget: 8,
+            reserve_for_downloads: false,
+            successes: AtomicUsize::new(10),
+            failures: AtomicUsize::new(0),
+            timeouts: AtomicUsize::new(0),
+            circuit_failures: AtomicUsize::new(0),
+            throttles: std::sync::Arc::new(AtomicUsize::new(0)),
+            http_failures: AtomicUsize::new(0),
+            last_throttle_epoch_ms: std::sync::Arc::new(AtomicU64::new(0)),
+            circuit_latency_sum_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+            circuit_request_count: std::array::from_fn(|_| AtomicU64::new(0)),
+            circuit_error_count: std::array::from_fn(|_| AtomicUsize::new(0)),
+            adaptive_ramp_ceiling: std::sync::Arc::new(AtomicUsize::new(12)),
+            throttles_in_window: std::sync::Arc::new(AtomicUsize::new(0)),
+            telemetry: None,
+        };
+
+        // Without recent throttle: scale up by +4 (pending=100, success_ratio=1.0)
+        let result = gov.rebalance(100);
+        assert!(result.is_some());
+        let (next, _) = result.unwrap();
+        // Should scale up by +4 from 4 → 8
+        assert!(next >= 7, "expected large step-up without throttle, got {next}");
+
+        // Reset governor to 4 workers
+        gov.desired_active.store(4, Ordering::Relaxed);
+        gov.successes.store(10, Ordering::Relaxed);
+
+        // Now record a throttle (sets last_throttle_epoch_ms to now)
+        gov.record_failure(CrawlFailureKind::Throttle);
+        // Reset the failures/throttle counters as rebalance would have consumed them
+        gov.failures.store(0, Ordering::Relaxed);
+        gov.throttles.store(0, Ordering::Relaxed);
+        gov.successes.store(10, Ordering::Relaxed);
+
+        // With recent throttle: scale up should be limited to +1
+        let result = gov.rebalance(100);
+        assert!(result.is_some());
+        let (next_throttled, _) = result.unwrap();
+        // Should scale up by +1 from 4 → 5 (not +4 → 8)
+        assert_eq!(next_throttled, 5, "expected +1 step with throttle cooldown");
     }
 }

@@ -5,11 +5,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 const NODE_TTL_SECS: u64 = 604_800; // 7 days
-const PROBE_TIMEOUT_SECS: u64 = 15;
-const PREFERRED_NODE_TIMEOUT_SECS: u64 = 8;
+const PROBE_TIMEOUT_SECS: u64 = 10;
+const PREFERRED_NODE_TIMEOUT_SECS: u64 = 6;
+const STAGE_HTTP_TIMEOUT_SECS: u64 = 20;
+const STAGE_D_BATCH_TIMEOUT_SECS: u64 = 30;
 const TOURNAMENT_HEAD_WIDTH: usize = 4;
 const BASE_NODE_COOLDOWN_SECS: u64 = 45;
 const MAX_NODE_COOLDOWN_SECS: u64 = 15 * 60;
+
+/// Emit a discovery progress event to the Tauri UI (if app handle is provided)
+fn emit_discovery_progress(app: Option<&tauri::AppHandle>, stage: &str, detail: &str) {
+    use tauri::Emitter;
+    let msg = format!("[Qilin Discovery] {} — {}", stage, detail);
+    println!("{}", msg);
+    if let Some(app) = app {
+        let _ = app.emit("crawl_log", msg);
+    }
+}
 
 /// A discovered QData storage node for a specific victim UUID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,6 +374,7 @@ impl QilinNodeCache {
         let known_storage_hosts = vec![
             // === Active (confirmed alive 2026-03-05) ===
             "szgkpzhcrnshftjb5mtvd6bc5oep5yabmgfmwt7u3tiqzfikoew27hqd.onion",
+            "25j35d6uf37tvfqt5pmz457yicgu35yhizojqxbfzv33dni2d73q3oad.onion",
             // === Previously active QData storage nodes ===
             "7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion",
             "25mjg55vcbjzwykz2uqsvaw7hcevm4pqxl42o324zr6qf5zgddmghkqd.onion",
@@ -399,25 +412,29 @@ impl QilinNodeCache {
         cms_url: &str,
         uuid: &str,
         client: &crate::arti_client::ArtiClient,
+        app: Option<&tauri::AppHandle>,
     ) -> Option<StorageNode> {
         println!(
             "[QilinNodeCache] Starting multi-path discovery for UUID: {}",
             uuid
         );
+        emit_discovery_progress(app, "Init", &format!("Starting 4-stage discovery for {}", uuid));
 
         let parsed = reqwest::Url::parse(cms_url).ok()?;
         let base = format!("{}://{}", parsed.scheme(), parsed.host_str()?);
 
         // Stage A: Follow 302 redirect from /site/data
         let data_url = format!("{}/site/data?uuid={}", base, uuid);
-        println!(
-            "[QilinNodeCache] Stage A — Following 302 redirect: {}",
-            data_url
-        );
+        emit_discovery_progress(app, "Stage A", &format!("Following 302 redirect to {}", data_url));
 
         for attempt in 1..=3 {
-            match client.get(&data_url).header("Referer", &base).send().await {
-                Ok(resp) => {
+            match tokio::time::timeout(
+                Duration::from_secs(STAGE_HTTP_TIMEOUT_SECS),
+                client.get(&data_url).header("Referer", &base).send(),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => {
                     let final_url = resp.url().as_str().to_string();
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
@@ -436,24 +453,33 @@ impl QilinNodeCache {
                     }
                     break;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     println!(
                         "[QilinNodeCache] Stage A — attempt {} failed: {}",
                         attempt, e
                     );
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
+                Err(_) => {
+                    println!(
+                        "[QilinNodeCache] Stage A — attempt {} timed out ({}s)",
+                        attempt, STAGE_HTTP_TIMEOUT_SECS
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
 
         // Stage B: Scrape the view page for the QData storage reference
         let view_url = format!("{}/site/view?uuid={}", base, uuid);
-        println!(
-            "[QilinNodeCache] Stage B — Scraping view page: {}",
-            view_url
-        );
+        emit_discovery_progress(app, "Stage B", &format!("Scraping view page: {}", view_url));
 
-        if let Ok(resp) = client.get(&view_url).send().await {
+        if let Ok(Ok(resp)) = tokio::time::timeout(
+            Duration::from_secs(STAGE_HTTP_TIMEOUT_SECS),
+            client.get(&view_url).send(),
+        )
+        .await
+        {
             if let Ok(body) = resp.text().await {
                 let watch_data_re = regex::Regex::new(
                     r#"(?is)(?:href|data-url|onclick)\s*=\s*["']([^"']*(?:site/data\?uuid=[^"']+|http://[a-z2-7]{56}\.onion/[^"']+/))["'][^>]*>\s*[^<]*watch data"#
@@ -512,10 +538,7 @@ impl QilinNodeCache {
 
         // Stage C: Load all cached nodes
         let cached_nodes = self.get_nodes(uuid).await;
-        println!(
-            "[QilinNodeCache] Stage C — {} cached nodes found",
-            cached_nodes.len()
-        );
+        emit_discovery_progress(app, "Stage C", &format!("{} cached nodes loaded", cached_nodes.len()));
 
         if cached_nodes.is_empty() {
             println!("[QilinNodeCache] No nodes discovered for UUID {}", uuid);
@@ -562,14 +585,11 @@ impl QilinNodeCache {
         }
 
         // Stage D: Probe the tournament head first, then score by reliability + latency.
-        println!(
-            "[QilinNodeCache] Stage D — Probing {} candidate nodes ({} preferred) concurrently...",
+        emit_discovery_progress(app, "Stage D", &format!(
+            "Probing {} candidate nodes ({} preferred) concurrently...",
             preferred_nodes.len(),
-            preferred_nodes
-                .iter()
-                .filter(|node| !node.is_cooling_down(now))
-                .count()
-        );
+            preferred_nodes.iter().filter(|node| !node.is_cooling_down(now)).count()
+        ));
 
         let best: Arc<Mutex<Option<(StorageNode, u128, f64)>>> = Arc::new(Mutex::new(None));
         let cache_ref = self.clone();
@@ -610,13 +630,18 @@ impl QilinNodeCache {
             });
         }
 
-        while head_tasks.join_next().await.is_some() {}
+        // Stage D-Head: 30s batch timeout for tournament head probing
+        let _ = tokio::time::timeout(
+            Duration::from_secs(STAGE_D_BATCH_TIMEOUT_SECS),
+            async { while head_tasks.join_next().await.is_some() {} },
+        )
+        .await;
 
         if best.lock().await.is_none() && !tail_nodes.is_empty() {
-            println!(
-                "[QilinNodeCache] Stage D — Tournament head failed, probing {} fallback candidates...",
+            emit_discovery_progress(app, "Stage D", &format!(
+                "Tournament head failed, probing {} fallback candidates...",
                 tail_nodes.len()
-            );
+            ));
             let mut tail_tasks = tokio::task::JoinSet::new();
             for node in tail_nodes {
                 let client = client.clone();
@@ -643,7 +668,12 @@ impl QilinNodeCache {
                 });
             }
 
-            while tail_tasks.join_next().await.is_some() {}
+            // Stage D-Tail: 30s batch timeout for fallback probing
+            let _ = tokio::time::timeout(
+                Duration::from_secs(STAGE_D_BATCH_TIMEOUT_SECS),
+                async { while tail_tasks.join_next().await.is_some() {} },
+            )
+            .await;
         }
 
         let result = best.lock().await.clone().map(|(node, _, _)| node);

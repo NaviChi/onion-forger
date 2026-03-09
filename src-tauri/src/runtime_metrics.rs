@@ -21,6 +21,8 @@ pub struct ResourceMetricsSnapshot {
     pub node_failovers: usize,
     pub throttle_count: usize,
     pub timeout_count: usize,
+    pub uptime_seconds: u64,
+    pub consensus_weight: u64,
 }
 
 #[derive(Clone, Default)]
@@ -35,6 +37,7 @@ pub struct RuntimeTelemetry {
     throttle_count: Arc<AtomicUsize>,
     timeout_count: Arc<AtomicUsize>,
     current_node_host: Arc<RwLock<Option<String>>>,
+    session_start: Arc<RwLock<Option<std::time::Instant>>>,
 }
 
 impl RuntimeTelemetry {
@@ -47,6 +50,9 @@ impl RuntimeTelemetry {
         self.timeout_count.store(0, Ordering::Relaxed);
         if let Ok(mut host) = self.current_node_host.write() {
             *host = None;
+        }
+        if let Ok(mut start) = self.session_start.write() {
+            *start = Some(std::time::Instant::now());
         }
     }
 
@@ -61,6 +67,11 @@ impl RuntimeTelemetry {
         if previous == 0 {
             self.active_circuits.store(0, Ordering::Relaxed);
             self.peak_active_circuits.store(0, Ordering::Relaxed);
+            if let Ok(mut start) = self.session_start.write() {
+                if start.is_none() {
+                    *start = Some(std::time::Instant::now());
+                }
+            }
         }
     }
 
@@ -164,6 +175,8 @@ impl RuntimeTelemetry {
             node_failovers: self.node_failovers.load(Ordering::Relaxed),
             throttle_count: self.throttle_count.load(Ordering::Relaxed),
             timeout_count: self.timeout_count.load(Ordering::Relaxed),
+            uptime_seconds: self.session_start.read().ok().and_then(|t| t.map(|i| i.elapsed().as_secs())).unwrap_or(0),
+            consensus_weight: self.active_circuits.load(Ordering::Relaxed) as u64 * 8192 + self.throttle_count.load(Ordering::Relaxed) as u64 * 256,
         }
     }
 

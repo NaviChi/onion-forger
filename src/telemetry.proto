@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+message TelemetryFrame {
+    uint64 ts_ms = 1;
+    uint32 kind = 2;
+    bytes payload = 3;
+}
+
+message ResourceMetricsFrame {
+    double process_cpu_percent = 1;
+    uint64 process_memory_bytes = 2;
+    uint64 system_memory_used_bytes = 3;
+    uint64 system_memory_total_bytes = 4;
+    uint32 active_workers = 5;
+    uint32 worker_target = 6;
+    uint32 active_circuits = 7;
+    uint32 peak_active_circuits = 8;
+    optional string current_node_host = 9;
+    uint32 node_failovers = 10;
+    uint32 throttle_count = 11;
+    uint32 timeout_count = 12;
+}
+
+message CrawlStatusFrame {
+    string phase = 1;
+    double progress_percent = 2;
+    uint64 visited_nodes = 3;
+    uint64 processed_nodes = 4;
+    uint64 queued_nodes = 5;
+    uint32 active_workers = 6;
+    uint32 worker_target = 7;
+    optional uint64 eta_seconds = 8;
+    uint64 delta_new_files = 9;
+}
+
+message BatchProgressFrame {
+    uint64 completed = 1;
+    uint64 failed = 2;
+    uint64 total = 3;
+    string current_file = 4;
+    uint64 downloaded_bytes = 5;
+    optional uint32 active_circuits = 6;
+}
+
+message DownloadStatusFrame {
+    string phase = 1;
+    string message = 2;
+    optional double download_time_secs = 3;
+    optional double percent = 4;
+}

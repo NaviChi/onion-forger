@@ -63,6 +63,7 @@ struct SoakReport {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let config = parse_args()?;
     let app = tauri::Builder::default()
         .manage(AppState::default())
@@ -253,17 +254,22 @@ async fn main() -> Result<()> {
                     Duration::from_secs(remaining),
                     aria_downloader::start_download(
                         app.handle().clone(),
-                        entry.raw_url.clone(),
-                        safe_target.to_string_lossy().to_string(),
+                        crawli_lib::aria_downloader::BatchFileEntry {
+                            url: entry.raw_url.clone(),
+                            path: safe_target.to_string_lossy().to_string(),
+                            size_hint: entry.size_bytes,
+                            jwt_exp: entry.jwt_exp,
+                        },
                         config.circuits_ceiling,
                         entry.raw_url.contains(".onion"),
                         Some(output_dir.to_string_lossy().to_string()),
                         control,
+                        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
                     ),
                 )
                 .await;
                 aria_downloader::clear_download_control();
-                if let Err(_) = download_result {
+                if download_result.is_err() {
                     let _ = aria_downloader::request_stop();
                 } else {
                     download_result??;

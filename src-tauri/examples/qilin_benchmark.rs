@@ -173,6 +173,7 @@ enum MockResponse {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let app = tauri::Builder::default()
         .manage(crawli_lib::AppState::default())
         .build(tauri::generate_context!())

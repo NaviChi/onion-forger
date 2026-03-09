@@ -51,8 +51,8 @@ headless_chrome = "1.0.21"
 rustls = { version = "0.23", features = ["ring"] }
 chrono = "0.4.44"
 # Phase 43B: Native Rust Tor (replaces tor.exe)
-arti-client = { version = "0.39.0", features = ["onion-service-client"] }
-tor-rtcompat = { version = "0.39.0" }
+arti-client = { version = "0.40", features = ["onion-service-client"] }
+tor-rtcompat = "0.40"
 socket2 = "0.5"
 sysinfo = "0.32"
 hyper-util = { version = "0.1.20", features = ["full"] }
@@ -69,6 +69,7 @@ rhai = { version = "1.24.0", features = ["sync"] }
 base64 = "0.22.1"
 # Phase 52: Mega.nz + Torrent integration
 mega = "0.8"
+# NOTE: reqwest_mega (0.12) is officially preserved here to resolve HTTP/hyper version conflicts with the primary Tor reqwest client (0.13). Both clients coexist safely by specification.
 reqwest_mega = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls"] }
 lava_torrent = "0.11"
 magnet-url = "3.0"
@@ -80,6 +81,7 @@ azure_core = { version = "0.32", optional = true }
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["fs", "cors"], optional = true }
 aes-gcm = { version = "0.10", optional = true }
+lazy_static = "1.5.0"
 
 [features]
 default = []

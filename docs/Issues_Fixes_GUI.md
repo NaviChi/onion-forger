@@ -154,3 +154,39 @@ Issue-to-fix mapping:
 # Appendices
 - Validation:
   - `npm run build` (TypeScript + Vite build passing)
+
+## Phase 61: UI Deadlock Fix & Tokio Runtime Boundary (2026-03-08)
+
+### Issues Found
+- The UI would permanently freeze at "Probing Target..." when attempting to crawl Qilin, while headless backend tests completed instantly.
+- The `Crawli` log stream ceased updating without emitting any crash log or stack trace.
+
+### Fixes Implemented
+- Identified a silent thread panic caused by `tokio::task::block_in_place()` being executed within the Tauri `#[tauri::command]` IPC environment, which lacks Tokio's multi-threaded (`MT`) reactor context.
+- Stripped 100% of asynchronous `tokio::sync::RwLock` constraints from the `ArtiSwarm` and Qilin networking stacks.
+- Re-architected primitives using `std::sync::RwLock::new()`, allowing the frontend to synchronously pull `.read().unwrap()` data without stalling the IPC bridge.
+
+### Prevention Rules
+**22. Never perform `tokio::task::block_in_place` inside a `#[tauri::command]` function. The Tauri IPC boundary is not wrapped with Tokio's necessary MT engine.**
+**23. Standard library `std::sync::RwLock` must always be preferred for shared state that spans both synchronous UI setup blocks and asynchronous worker pools.**
+
+## Phase 61b: Persistent "Probing Target" Hang Despite RwLock Fix (2026-03-08)
+
+### Issue
+After fixing the `tokio::sync::RwLock` deadlock (Phase 61), the GUI still froze at "Probing Target" for 4+ minutes. Tor Swarm reported active, but Nodes Indexed = 0, Node = unresolved.
+
+### Root Cause
+`qilin_nodes.rs::discover_and_resolve()` — the 4-stage QData storage node discovery pipeline — had no global timeout. Stage A/B HTTP calls lacked per-request timeouts. Stage D probed 17 mirrors × 15s each.
+
+### Fix
+1. Wrapped `discover_and_resolve()` in `qilin.rs` with 90s global `tokio::time::timeout`
+2. Wrapped Stage A and B HTTP calls with 20s timeouts
+3. Reduced `PROBE_TIMEOUT_SECS` 15→10, `PREFERRED_NODE_TIMEOUT_SECS` 8→6
+
+### Prevention Rules
+**24. Every HTTP call through Tor circuits MUST have an explicit `tokio::time::timeout`. Never rely on Tor's built-in connection timeout for GUI-interactive code paths.**
+
+### [2026-03-08] Playwright GUI E2E Tauri Listener Desync
+* **Issue**: Playwright tests could not verify GUI batch updates because `window.dispatchEvent(new CustomEvent(...))` does not interop with Tauri`s native `listen<T>` frontend API.
+* **Exact Fix**: Refactored all 15 `App.tsx` event hooks using a custom universal `addAppListener` proxy adapter. Evaluates `isDownloadFixtureMode()` to bind to DOM `addEventListener` locally for offline DOM verification rendering the exact BBR metrics inside `Dashboard.tsx`.
+* **Prevention Rule**: PR-GUI-001 - Playwright Frontend must execute entirely decoupled from Tauri Native context using explicit Fixtures bounding simulated progress ticks over standard `CustomEvent` interfaces.

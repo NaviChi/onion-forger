@@ -1,0 +1,173 @@
+use hyper_util::client::legacy::Client;
+use hyper_rustls::HttpsConnector;
+use hyper_rustls::HttpsConnectorBuilder;
+use http_body_util::{BodyExt, Empty};
+use bytes::Bytes;
+use http::{Request, Response, StatusCode, HeaderMap, header::HeaderName, header::HeaderValue};
+use tokio_stream::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use anyhow::{Result, anyhow};
+use crate::arti_connector::ArtiConnector;
+use arti_client::TorClient;
+use tor_rtcompat::PreferredRuntime;
+
+#[derive(Clone)]
+pub struct ArtiClient {
+    client: Client<HttpsConnector<ArtiConnector>, http_body_util::Full<Bytes>>,
+    inner_tor_client: TorClient<PreferredRuntime>,
+}
+
+impl ArtiClient {
+    pub fn new(tor_client: TorClient<PreferredRuntime>, isolation_token: Option<arti_client::IsolationToken>) -> Self {
+        let arti_connector = ArtiConnector {
+            client: tor_client,
+            isolation_token,
+        };
+        
+        // Wrap with rustls to handle HTTPS over Tor
+        let https = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .unwrap()
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(arti_connector);
+            
+        let client = Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(https);
+            
+        Self { client, inner_tor_client: tor_client }
+    }
+
+    pub fn new_isolated(&self) -> Self {
+        Self::new(self.inner_tor_client.clone(), Some(arti_client::IsolationToken::new()))
+    }
+
+    pub fn get(&self, url: &str) -> ArtiRequestBuilder {
+        ArtiRequestBuilder::new(self.client.clone(), http::Method::GET, url)
+    }
+
+    pub fn head(&self, url: &str) -> ArtiRequestBuilder {
+        ArtiRequestBuilder::new(self.client.clone(), http::Method::HEAD, url)
+    }
+
+    pub fn post(&self, url: &str) -> ArtiRequestBuilder {
+        ArtiRequestBuilder::new(self.client.clone(), http::Method::POST, url)
+    }
+}
+
+pub struct ArtiRequestBuilder {
+    client: Client<HttpsConnector<ArtiConnector>, http_body_util::Full<Bytes>>,
+    req: http::request::Builder,
+    url: String,
+    json_body: Option<String>,
+}
+
+impl ArtiRequestBuilder {
+    pub fn new(client: Client<HttpsConnector<ArtiConnector>, http_body_util::Full<Bytes>>, method: http::Method, url: &str) -> Self {
+        let req = Request::builder().method(method).uri(url);
+        Self { client, req, url: url.to_string(), json_body: None }
+    }
+
+    pub fn header(mut self, key: &str, value: &str) -> Self {
+        self.req = self.req.header(key, value);
+        self
+    }
+
+    pub fn json<T: serde::Serialize>(mut self, body: &T) -> Self {
+        let json_body = serde_json::to_string(body).unwrap_or_default();
+        self.req = self.req.header(http::header::CONTENT_TYPE, "application/json");
+        self.req = self.req.header(http::header::CONTENT_LENGTH, json_body.len().to_string());
+        // For now, we hack the url to store the JSON body since our builder structure natively uses Bytes
+        // A proper way is to store it in the struct. I'll just change the build logic.
+        Self { client: self.client, req: self.req, url: self.url, json_body: Some(json_body) }
+    }
+
+    pub async fn send(self) -> Result<ArtiResponse> {
+        let body_bytes = if let Some(json) = self.json_body {
+            Bytes::from(json)
+        } else {
+            Bytes::new()
+        };
+        let req = self.req.body(http_body_util::Full::new(body_bytes))
+            .map_err(|e| anyhow!("Failed to build request: {}", e))?;
+            
+        let res: Response<hyper::body::Incoming> = self.client.request(req).await
+            .map_err(|e| anyhow!("Request failed: {}", e))?;
+            
+        Ok(ArtiResponse { inner: res, url: self.url })
+    }
+}
+
+pub struct ArtiResponse {
+    inner: Response<hyper::body::Incoming>,
+    url: String,
+}
+
+impl ArtiResponse {
+    pub fn status(&self) -> StatusCode {
+        self.inner.status()
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        self.inner.headers()
+    }
+
+    pub fn content_length(&self) -> Option<u64> {
+        self.inner.headers().get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+    }
+
+    pub async fn text(self) -> Result<String> {
+        let body_bytes = self.inner.into_body().collect().await
+            .map_err(|e| anyhow!("Failed to read body: {}", e))?
+            .to_bytes();
+        String::from_utf8(body_bytes.to_vec())
+            .map_err(|e| anyhow!("Invalid UTF-8: {}", e))
+    }
+
+    pub async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T> {
+        let t = self.text().await?;
+        serde_json::from_str(&t).map_err(|e| anyhow!("JSON parse error: {}", e))
+    }
+
+    pub fn url(&self) -> url::Url {
+        url::Url::parse(&self.url).unwrap_or_else(|_| url::Url::parse("http://unknown").unwrap())
+    }
+
+    pub async fn bytes(self) -> Result<Bytes> {
+        let body_bytes = self.inner.into_body().collect().await
+            .map_err(|e| anyhow!("Failed to read body: {}", e))?
+            .to_bytes();
+        Ok(body_bytes)
+    }
+
+    pub fn bytes_stream(self) -> impl Stream<Item = Result<Bytes>> {
+        ArtiBodyStream { inner: self.inner.into_body() }
+    }
+}
+
+pub struct ArtiBodyStream {
+    inner: hyper::body::Incoming,
+}
+
+impl Stream for ArtiBodyStream {
+    type Item = Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use hyper::body::Body;
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    Poll::Ready(Some(Ok(data.clone())))
+                } else {
+                    Poll::Ready(None)
+                }
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(anyhow!("Stream error: {}", e)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}

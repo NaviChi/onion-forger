@@ -18,6 +18,11 @@ interface DashboardProps {
     etaSeconds: number | null;
     estimation: string;
     deltaNewFiles?: number;
+    vanguard?: {
+      current: number;
+      target: number;
+      status: string;
+    };
   };
   downloadBatchStatus: {
     totalFiles: number;
@@ -62,6 +67,8 @@ interface DashboardProps {
     nodeFailovers: number;
     throttleCount: number;
     timeoutCount: number;
+    uptimeSeconds: number;
+    consensusWeight: number;
   };
   crawlRunStatus: {
     targetKey: string;
@@ -248,6 +255,8 @@ export function Dashboard({
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>BBR Bottleneck: {downloadBatchStatus.bbrBottleneckMbps?.toFixed(2) || "0.00"} MB/s</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>EKF Var/Cov: {downloadBatchStatus.ekfCovariance?.toFixed(3) || "0.000"} P</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Total Payload: {downloadedMb} MB</div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Tor Uptime: {Math.floor((resourceMetrics.uptimeSeconds || 0) / 3600)}h {Math.floor(((resourceMetrics.uptimeSeconds || 0) % 3600) / 60)}m {(resourceMetrics.uptimeSeconds || 0) % 60}s</div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Consensus Wgt: {resourceMetrics.consensusWeight || 0} CW</div>
         </div>
       </div>
 
@@ -265,7 +274,11 @@ export function Dashboard({
             RAM {resourceMetrics.systemMemoryPercent.toFixed(1)}% ({systemMemoryGbUsed}/{systemMemoryGbTotal} GB)
           </div>
           <div className="dash-sub" data-testid="resource-worker-metrics" style={{ fontFamily: 'JetBrains Mono' }}>
-            Workers {effectiveActiveWorkers}/{effectiveWorkerTarget} | Circuits {resourceMetrics.activeCircuits}/{resourceMetrics.peakActiveCircuits}
+            {crawlStatus.vanguard ? (
+              <span style={{ color: 'var(--accent-primary)' }}>Vanguard: {crawlStatus.vanguard.status} | Circuits {resourceMetrics.activeCircuits}/{resourceMetrics.peakActiveCircuits}</span>
+            ) : (
+              <span>Workers {effectiveActiveWorkers}/{effectiveWorkerTarget} | Circuits {resourceMetrics.activeCircuits}/{resourceMetrics.peakActiveCircuits}</span>
+            )}
           </div>
           <div className="dash-sub" data-testid="resource-node-metrics" style={{ fontFamily: 'JetBrains Mono' }}>
             Node {resourceMetrics.currentNodeHost || "unresolved"} | Failovers {resourceMetrics.nodeFailovers} | 429/503 {resourceMetrics.throttleCount} | Timeouts {resourceMetrics.timeoutCount}

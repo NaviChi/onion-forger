@@ -1,0 +1,45 @@
+name: "Release Architecture Pipeline"
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish-loki-gui:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install Node.js Core
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux Build Dependencies (Ubuntu)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update && \
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - name: Install Frontend Dependencies
+        working-directory: ./loki-tor-gui
+        run: npm install
+
+      - name: Build & Compile Tauri Release Packages
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: "./loki-tor-gui"
+          tagName: "LOKI-Tor-Core-${{ github.ref_name }}"
+          releaseName: "LOKI GUI Release ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false

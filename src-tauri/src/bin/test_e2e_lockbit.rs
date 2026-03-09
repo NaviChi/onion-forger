@@ -30,7 +30,7 @@ fn main() {
 
         tor::cleanup_stale_tor_daemons();
         println!("[+] Bootstrapping Tor cluster (1 daemon)...");
-        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), 1)
+        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), 1, 0)
             .await
             .expect("Bootstrap failed");
 
@@ -55,7 +55,8 @@ fn main() {
                 agnostic_state: false,
                 resume: false,
                 resume_index: None,
-            mega_password: None,
+                stealth_ramp: false,
+                mega_password: None,
             };
 
             let frontier = CrawlerFrontier::new(

@@ -10,13 +10,13 @@ async fn main() -> Result<()> {
     let tor_client = spawn_tor_node(0, false).await?;
     let client = ArtiClient::new(tor_client, Some(arti_client::IsolationToken::new()));
 
-    let seed = "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed";
+    let seed = "http://25j35d6uf37tvfqt5pmz457yicgu35yhizojqxbfzv33dni2d73q3oad.onion/80349839-d06f-41a8-b954-3602fe60725a/";
     let uuid = "c9d2ba19-6aa1-3087-8773-f63d023179ed";
 
     let node_cache = QilinNodeCache::default();
     node_cache.seed_known_mirrors(uuid).await;
 
-    if let Some(best_node) = node_cache.discover_and_resolve(seed, uuid, &client).await {
+    if let Some(best_node) = node_cache.discover_and_resolve(seed, uuid, &client, None).await {
         println!("Resolved to Storage Node: {}", best_node.url);
 
         match client.get(&best_node.url).send().await {

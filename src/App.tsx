@@ -7,10 +7,12 @@ import { AzureConnectivityModal } from "./components/AzureConnectivityModal";
 import { VibeLoader } from "./components/VibeLoader";
 import { downloadDir, join } from "@tauri-apps/api/path";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp, Cloud, Magnet } from "lucide-react";
+import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp, Cloud, Magnet, ShieldAlert } from "lucide-react";
 import { FIXTURE_RESOURCE_METRICS, VFS_FIXTURE_STATS, isVfsFixtureMode } from "./fixtures/vfsFixture";
 
 import "./App.css";
+import * as pb from "./telemetry.js";
+import { Reader } from "protobufjs/minimal.js";
 
 
 interface DownloadProgressEvent {
@@ -36,6 +38,11 @@ interface CrawlStatusEvent {
   etaSeconds: number | null;
   estimation: string;
   deltaNewFiles?: number;
+  vanguard?: {
+    current: number;
+    target: number;
+    status: string;
+  };
 }
 
 interface DownloadBatchStartedEvent {
@@ -123,14 +130,10 @@ interface ResourceMetricsSnapshot {
   nodeFailovers: number;
   throttleCount: number;
   timeoutCount: number;
+  uptimeSeconds: number;
+  consensusWeight: number;
 }
 
-interface TelemetryBridgeUpdate {
-  crawlStatus?: CrawlStatusEvent;
-  resourceMetrics?: ResourceMetricsSnapshot;
-  batchProgress?: BatchProgressEvent;
-  downloadProgress?: DownloadProgressEvent[];
-}
 
 interface TorStatus {
   state: string;
@@ -406,6 +409,8 @@ const INITIAL_RESOURCE_METRICS: ResourceMetricsSnapshot = {
   nodeFailovers: 0,
   throttleCount: 0,
   timeoutCount: 0,
+  uptimeSeconds: 0,
+  consensusWeight: 0,
 };
 
 function App() {
@@ -464,12 +469,18 @@ function App() {
     listing: true,
     sizes: true,
     download: false,
-    circuits: 6,
+    circuits: 8,
     daemons: 1,
     agnosticState: false,
     resume: false,
-    resumeIndex: undefined as string | undefined
+    resumeIndex: undefined as string | undefined,
+    stealthRamp: true
   });
+  const [systemProfile, setSystemProfile] = useState<{
+    preset: string; circuits: number; workers: number;
+    cpuCores: number; totalRamGb: number; availableRamGb: number;
+    storageClass: string; os: string;
+  } | null>(null);
 
   const showToast = (type: "success" | "error", title: string, message: string) => {
     const id = Date.now();
@@ -478,6 +489,25 @@ function App() {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 6000);
   };
+
+  // Phase 67H: Auto-detect system profile and set recommended concurrency
+  useEffect(() => {
+    if (!isTauriRuntime) return;
+    (async () => {
+      try {
+        const profile = await invoke<{
+          preset: string; circuits: number; workers: number;
+          cpuCores: number; totalRamGb: number; availableRamGb: number;
+          storageClass: string; os: string;
+        }>("get_system_profile");
+        setSystemProfile(profile);
+        setCrawlOptions(prev => ({ ...prev, circuits: profile.circuits, daemons: 1 }));
+        setLogs(l => [...l, `[SYSTEM] Auto-detected: ${profile.os} ${profile.cpuCores}c/${profile.totalRamGb}GB/${profile.storageClass.toUpperCase()} → ${profile.preset} (${profile.circuits} circuits)`]);
+      } catch {
+        // Fallback: keep default 8 circuits
+      }
+    })();
+  }, []);
 
   // Crawl duration timer
   useEffect(() => {
@@ -524,6 +554,10 @@ function App() {
     setVfsStats(VFS_FIXTURE_STATS);
     setVfsRefreshTrigger(Date.now());
     setResourceMetrics(FIXTURE_RESOURCE_METRICS);
+    setCrawlStatus((prev) => ({
+      ...prev,
+      vanguard: { current: 6, target: 12, status: "Active (Heatmap Enabled)" }
+    }));
     setLogs((l) => [
       ...l.slice(-399),
       "[SYSTEM] Fixture VFS mode enabled for browser integrity testing.",
@@ -851,23 +885,71 @@ function App() {
         })
       );
 
-      unlistenPromises.push(
-        listen<TelemetryBridgeUpdate>("telemetry_bridge_update", (event) => {
-          const payload = event.payload;
-          if (payload.crawlStatus) {
-            setCrawlStatus(payload.crawlStatus);
+      const pollId = setInterval(async () => {
+        try {
+          const buffer = await invoke<Uint8Array>("drain_telemetry_ring");
+          if (!buffer || buffer.length === 0) return;
+
+          const reader = Reader.create(buffer);
+          let crawlStatusUpdated = false;
+          let resourceMetricsUpdated = false;
+          let batchUpdated = false;
+
+          let lastCrawlStatus: any = null;
+          let lastResourceMetrics: any = null;
+          let lastBatchProgress: any = null;
+          const downloadProgresses: any[] = [];
+
+          while (reader.pos < reader.len) {
+            const frame = pb.TelemetryFrame.decodeDelimited(reader);
+            const payloadReader = Reader.create(frame.payload);
+
+            switch (frame.kind) {
+              case 1:
+                lastResourceMetrics = pb.ResourceMetricsFrame.toObject(pb.ResourceMetricsFrame.decode(payloadReader), { longs: Number });
+                resourceMetricsUpdated = true;
+                break;
+              case 2:
+                lastCrawlStatus = pb.CrawlStatusFrame.toObject(pb.CrawlStatusFrame.decode(payloadReader), { longs: Number });
+                crawlStatusUpdated = true;
+                break;
+              case 3:
+                lastBatchProgress = pb.BatchProgressFrame.toObject(pb.BatchProgressFrame.decode(payloadReader), { longs: Number });
+                batchUpdated = true;
+                break;
+              case 4:
+                downloadProgresses.push(pb.DownloadStatusFrame.toObject(pb.DownloadStatusFrame.decode(payloadReader), { longs: Number }));
+                break;
+            }
           }
-          if (payload.resourceMetrics) {
-            setResourceMetrics(payload.resourceMetrics);
+
+          if (crawlStatusUpdated) {
+            setCrawlStatus(lastCrawlStatus as any);
           }
-          if (payload.batchProgress) {
-            applyBatchProgress(payload.batchProgress);
+          if (resourceMetricsUpdated) {
+            setResourceMetrics(lastResourceMetrics as any);
           }
-          (payload.downloadProgress || []).forEach((progress) => {
-            applyDownloadProgress(progress);
-          });
-        })
-      );
+          if (batchUpdated) {
+            applyBatchProgress({
+              ...lastBatchProgress,
+              downloadedBytes: lastBatchProgress.downloadedBytes || 0,
+            } as any);
+          }
+          downloadProgresses.forEach((dp) => applyDownloadProgress({
+            path: dp.message,
+            bytesDownloaded: 0,
+            totalBytes: null,
+            speedBps: 0,
+            activeCircuits: 0,
+            ...dp
+          } as any));
+
+        } catch (err) {
+          console.error("Telemetry ring poll failed:", err);
+        }
+      }, 250);
+
+      unlistenPromises.push(Promise.resolve(() => clearInterval(pollId)));
 
       unlistenPromises.push(
         listen<TorStatus>("tor_status", (event) => {
@@ -1411,6 +1493,14 @@ function App() {
           <CircleHelp size={22} /> Support
         </button>
         <button
+          className={`tool-btn ${inputMode === 'onion' ? 'active' : ''}`}
+          data-testid="btn-onion"
+          onClick={() => setInputMode('onion')}
+          title="Switch to Tor / Onion routing mode"
+        >
+          <ShieldAlert size={22} /> Tor Node
+        </button>
+        <button
           className={`tool-btn ${inputMode === 'mega' ? 'active' : ''}`}
           data-testid="btn-mega"
           onClick={() => setInputMode('mega')}
@@ -1665,6 +1755,18 @@ function App() {
           <span style={{ fontSize: '0.85rem', color: crawlOptions.agnosticState ? 'var(--text-main)' : 'var(--text-muted)' }}>URI-Agnostic State</span>
         </label>
 
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Vanguard Ignition: Dynamically stagger Tor circuit ramp-up to prevent server-side 503 HTTP drops on deepweb domains.">
+          <input
+            data-testid="chk-stealth-ramp"
+            type="checkbox"
+            checked={crawlOptions.stealthRamp}
+            onChange={(e) => setCrawlOptions({ ...crawlOptions, stealthRamp: e.target.checked })}
+            style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
+            disabled={isCrawling}
+          />
+          <span style={{ fontSize: '0.85rem', color: crawlOptions.stealthRamp ? 'var(--text-main)' : 'var(--text-muted)' }}>Vanguard Stealth Ramp</span>
+        </label>
+
         <button
           className="action-btn popup-hover"
           data-testid="btn-resume-index"
@@ -1700,10 +1802,10 @@ function App() {
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Concurrency:</span>
           <select
             data-testid="sel-circuits"
-            value={`${crawlOptions.daemons},${crawlOptions.circuits}`}
+            value={`${crawlOptions.circuits}`}
             onChange={(e) => {
-              const [d, c] = e.target.value.split(',').map(Number);
-              setCrawlOptions({ ...crawlOptions, daemons: d, circuits: c });
+              const circuits = Number(e.target.value);
+              setCrawlOptions({ ...crawlOptions, daemons: 1, circuits });
             }}
             disabled={isCrawling}
             style={{
@@ -1717,11 +1819,20 @@ function App() {
               cursor: isCrawling ? 'not-allowed' : 'pointer'
             }}
           >
-            <option value="1,4">1 Swarm / 4 Circuits (Low)</option>
-            <option value="1,6">1 Swarm / 6 Circuits (Standard)</option>
-            <option value="2,12">2 Swarms / 12 Circuits (High)</option>
-            <option value="4,24">4 Swarms / 24 Circuits (Ultimate Max)</option>
+            <option value="2">🔒 Stealth (2 Circuits){systemProfile?.preset === 'Stealth' ? ' ★' : ''}</option>
+            <option value="4">🛡️ Conservative (4 Circuits){systemProfile?.preset === 'Conservative' ? ' ★' : ''}</option>
+            <option value="8">⚡ Balanced (8 Circuits){systemProfile?.preset === 'Balanced' ? ' ★' : ''}</option>
+            <option value="16">🚀 Aggressive (16 Circuits){systemProfile?.preset === 'Aggressive' ? ' ★' : ''}</option>
+            <option value="24">💥 Maximum (24 Circuits){systemProfile?.preset === 'Maximum' ? ' ★' : ''}</option>
           </select>
+          {systemProfile && (
+            <span
+              style={{ fontSize: '0.72rem', color: 'var(--accent-secondary)', opacity: 0.7 }}
+              title={`Detected: ${systemProfile.cpuCores} cores, ${systemProfile.totalRamGb}GB RAM, ${systemProfile.storageClass.toUpperCase()}, ${systemProfile.os}`}
+            >
+              {systemProfile.os} · {systemProfile.cpuCores}c · {systemProfile.totalRamGb}GB
+            </span>
+          )}
         </div>
 
       </div>

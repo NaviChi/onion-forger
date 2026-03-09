@@ -158,6 +158,7 @@ fn build_batch_files(entries: &[FileEntry], output_root: &Path) -> Vec<BatchFile
                         url: entry.raw_url.clone(),
                         path: full_path.to_string_lossy().to_string(),
                         size_hint: entry.size_bytes,
+                        jwt_exp: entry.jwt_exp,
                     });
                 }
             }

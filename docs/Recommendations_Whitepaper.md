@@ -423,3 +423,30 @@ A dedicated `MultiClientPool` was engineered to instantiate and isolate multiple
     *   **Pre-Flight Expiry Check:** Before establishing the `GET Range` HTTP stream, the downloader must evaluate `entry.jwt_exp < SystemTime::now()`.
     *   **Parent-Node Hydration:** If the token is dead, the downloader must *intercept* the pull and recursively issue a lightweight `GET` request back to the file's parent directory (`/?path=/parent/folder`). Extracting the fresh HTML yields an entirely new encrypted JWT. 
     *   **In-Flight Substitution:** The downloader physically mutates the `entry.raw_url` with the fresh token and resumes the chunk transfer seamlessly.
+
+## Phase 61b: Storage Discovery Timeout Recommendation (2026-03-08)
+
+**Status: Implemented**
+
+The Qilin adapter's `discover_and_resolve()` pipeline was blocking the GUI for 4+ minutes when Tor circuits were degraded, because it lacked any timeout protection. This has been resolved with a 3-layer timeout strategy:
+
+1. **90s global timeout** on `discover_and_resolve()` — graceful fallback to direct mirror probing
+2. **20s per-HTTP-call timeouts** on Stage A (`/site/data` redirect) and Stage B (`/site/view` scrape)
+3. **Reduced probe timeouts**: `PROBE_TIMEOUT_SECS` from 15→10 and `PREFERRED_NODE_TIMEOUT_SECS` from 8→6
+
+**New Prevention Rule:** `PR-CRAWLER-012`: Every HTTP call through Tor circuits MUST use an explicit `tokio::time::timeout`. Tor's internal timeouts are too lenient for interactive GUI code paths.
+
+**Next recommended steps:**
+- Monitor the 90s global timeout in production — if targets consistently require longer discovery, consider increasing to 120s
+- Consider adding a UI-visible progress indicator during the storage discovery phase ("Resolving storage node... Stage A/B/C/D")
+- Evaluate whether Stage D's concurrent JoinSet probing should use a tighter per-batch timeout (e.g., 30s for the head batch) rather than relying solely on per-node timeouts
+
+## Phase 61b+: Stage D Batch Timeout & Discovery Progress (2026-03-08)
+
+**Status: Implemented**
+
+Both recommendations from Phase 61b are now implemented:
+1. **Stage D batch timeout (30s)** — Tournament head and tail JoinSet drains wrapped with `tokio::time::timeout(30s)`. Worst-case Stage D capped at 60s (head+tail).
+2. **Discovery progress indicator** — `emit_discovery_progress()` emits `crawl_log` events for each discovery stage, giving operators live visibility during the "Probing Target" phase.
+
+Combined with Phase 61b's global 90s timeout, the absolute worst-case discovery time is now **90 seconds** (global ceiling) instead of the previous **unbounded** duration.

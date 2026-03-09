@@ -880,3 +880,9 @@ A dedicated `MultiClientPool` was engineered to instantiate and isolate multiple
 - **Issue**: Standard auto-index instances (AlphaLocker, Play, Abyss, Genesis) performed a redundant `HEAD` request before every `GET` merely to ascertain file sizes, doubling network strain and triggering rate limit blocks (especially 429 errors from strict proxies).
 - **Fix**: Replaced solitary `HEAD` probes with integrated `GET Range: bytes=0-0` probes. The application parses either the `Content-Range` header limits or fallback `Content-Length`. Any size probe now merges neatly into the initial network connection with the same stream allocation.
 - **Prevention Rule**: Never spawn `HEAD` probes to deduce chunk bounds in adapters when `GET Range: bytes=0-0` or `bytes=0-1` accomplishes the same task safely without multiplying HTTP overhead.
+
+### Phase 67E: Tier-4 Adaptive Hydrator Addition
+- **Date**: 2026-03-08
+- **Issue**: Unknown or polymorphic SPA frameworks bypassed standard ast scraping algorithms and were defaulted to empty directory mappings unless structurally supported. Relying solely on exact-match adapters like DragonForce restricts fallback parsing on modified sites. 
+- **Fix**: The Universal Explorer now features runtime Wire Mode Detection (`parse_page_from_body`). If the DOM contains SPA cues (`__NEXT_DATA__`, `<iframe`, `token=`), the Explorer automatically leverages the Predictive State Hydrator algorithms to statically extrapolate NextJS routes/API endpoints directly out of JSON payloads without JS execution.
+- **Prevention Rule**: All new fallback/Universal explorers MUST interrogate `__NEXT_DATA__` boundaries and SPA embedded objects if autoindex HTML mapping returns zero entries to ensure data is not hidden behind deterministic dynamic routers.

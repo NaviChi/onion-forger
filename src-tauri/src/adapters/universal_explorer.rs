@@ -72,35 +72,53 @@ impl AdaptiveUniversalExplorer {
         score
     }
 
-    /// Parse page using raw HTML body directly (FIX M-4: no DOM re-serialize)
+    /// Parse page using raw HTML body directly.
+    /// Incorporates Tier-4 Adaptive Hydrator Wire Mode Detection (SPA JSON vs Autoindex)
     fn parse_page_from_body(&self, body: &str, base_url: &str) -> Option<Vec<FileEntry>> {
-        let parsed = crate::adapters::autoindex::parse_autoindex_html(body);
-
-        if parsed.is_empty() {
-            return None;
-        }
-
-        let mut entries = Vec::new();
         let base_parsed_url =
             Url::parse(base_url).unwrap_or_else(|_| Url::parse("http://unknown.onion").unwrap());
+        let host = base_parsed_url.host_str().unwrap_or("unknown.onion");
 
-        for (name, size, is_dir) in parsed {
-            if let Ok(full) = base_parsed_url.join(&name) {
-                entries.push(FileEntry {
-                    jwt_exp: None,
-                    path: full.path().to_string(),
-                    size_bytes: size,
-                    entry_type: if is_dir {
-                        EntryType::Folder
-                    } else {
-                        EntryType::File
-                    },
-                    raw_url: full.to_string(),
-                });
+        // Tier-4 Adaptive Hydrator: Mode 1 - NextJS SPA / Predictive State Mimicry
+        if body.contains("__NEXT_DATA__") || body.contains("fsguest") || body.contains("token=") {
+            let spa_entries = crate::adapters::dragonforce::parse_dragonforce_fsguest(body, host, base_url);
+            if !spa_entries.is_empty() {
+                return Some(spa_entries);
             }
         }
 
-        Some(entries)
+        // Tier-4 Adaptive Hydrator: Mode 2 - CMS UUID / Iframe Embed (Mimics LockBit/DragonForce hybrids)
+        if body.contains("<iframe") && body.contains("src=") {
+            let spa_entries = crate::adapters::dragonforce::parse_dragonforce_fsguest(body, host, base_url);
+            if !spa_entries.is_empty() {
+                return Some(spa_entries);
+            }
+        }
+
+        // Tier-4 Adaptive Hydrator: Mode 3 - Generic Autoindex
+        let parsed = crate::adapters::autoindex::parse_autoindex_html(body);
+
+        if !parsed.is_empty() {
+            let mut entries = Vec::new();
+            for (name, size, is_dir) in parsed {
+                if let Ok(full) = base_parsed_url.join(&name) {
+                    entries.push(FileEntry {
+                        jwt_exp: None,
+                        path: full.path().to_string(),
+                        size_bytes: size,
+                        entry_type: if is_dir {
+                            EntryType::Folder
+                        } else {
+                            EntryType::File
+                        },
+                        raw_url: full.to_string(),
+                    });
+                }
+            }
+            return Some(entries);
+        }
+
+        None
     }
 }
 

@@ -28,23 +28,26 @@ impl MultiClientPool {
 
             // Copy the Vanguard's localized DB cache perfectly onto all other clients.
             // This bypasses the Tor Directory Authority bot-swarm rate limits when expanding.
+            // Phase 67: Offload sync filesystem I/O to spawn_blocking to avoid blocking the async runtime
             for i in 1..count {
+                let vanguard_cache = vanguard_cache.clone();
                 let target_cache = state_root.join(format!("arti/node_{}/cache", 100 + i));
-                let _ = std::fs::remove_dir_all(&target_cache);
-                let _ = std::fs::create_dir_all(&target_cache);
-
-                for entry in walkdir::WalkDir::new(&vanguard_cache)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                {
-                    let relative_path = entry.path().strip_prefix(&vanguard_cache).unwrap();
-                    let target_path = target_cache.join(relative_path);
-                    if entry.file_type().is_dir() {
-                        let _ = std::fs::create_dir_all(&target_path);
-                    } else if entry.file_type().is_file() {
-                        let _ = std::fs::copy(entry.path(), &target_path);
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(&target_cache);
+                    let _ = std::fs::create_dir_all(&target_cache);
+                    for entry in walkdir::WalkDir::new(&vanguard_cache)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                    {
+                        let relative_path = entry.path().strip_prefix(&vanguard_cache).unwrap();
+                        let target_path = target_cache.join(relative_path);
+                        if entry.file_type().is_dir() {
+                            let _ = std::fs::create_dir_all(&target_path);
+                        } else if entry.file_type().is_file() {
+                            let _ = std::fs::copy(entry.path(), &target_path);
+                        }
                     }
-                }
+                }).await.unwrap_or_default();
             }
 
             // Now safely parallel-boot exactly what we want without overwhelming Tor consensus

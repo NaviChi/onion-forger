@@ -1,2 +1,2 @@
 test_id,adapter,url,status,matched_adapter,files,folders,entries,size_bytes,duration_secs,entries_per_sec,bytes_per_sec,tor_boot_secs,fp_secs,error,diagnosis
-qilin_1,qilin,http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed,OK,Qilin Nginx Autoindex / CMS,0,0,0,0,300.00,0.00,0.00,20.24,16.09,,Crawl monitored manually
+qilin_1,qilin,http://25j35d6uf37tvfqt5pmz457yicgu35yhizojqxbfzv33dni2d73q3oad.onion/80349839-d06f-41a8-b954-3602fe60725a/,OK,Qilin Nginx Autoindex / CMS,0,0,0,0,300.00,0.00,0.00,20.24,16.09,,Crawl monitored manually

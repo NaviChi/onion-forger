@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::bbr::BbrController;
 use crate::scorer::CircuitScorer;
@@ -151,7 +151,13 @@ pub async fn multipath_download(
     let scorer = Arc::new(CircuitScorer::new(num_circuits));
     let bbr = Arc::new(BbrController::new(num_circuits.min(8), num_circuits));
 
-    let clients_state = crate::tor_native::active_tor_clients();
+    let clients_state: Vec<crate::tor_native::SharedTorClient> = {
+        if let Some(guard) = app.state::<crate::AppState>().download_swarm_guard.lock().await.as_ref() {
+            guard.lock().await.get_arti_clients()
+        } else {
+            Vec::new()
+        }
+    };
     if clients_state.is_empty() {
         return Err(anyhow!(
             "No active Tor clients available for multipath download"
@@ -162,7 +168,7 @@ pub async fn multipath_download(
     let clients: Vec<ArtiClient> = clients_state
         .iter()
         .map(|shared_client| {
-            let tor_client = shared_client.blocking_read().clone();
+            let tor_client = shared_client.read().unwrap().clone();
             let isolation_token = arti_client::IsolationToken::new();
             ArtiClient::new((*tor_client).clone(), Some(isolation_token))
         })

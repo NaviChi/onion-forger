@@ -23,18 +23,15 @@ async fn main() {
         .build()
         .unwrap();
 
-    let url = "http://tdb5vowurjqlvgkdntq6vfv3epahdkqdhf7hqvq43hr4zb6bovpsk2yd.onion/d273fe69-4d65-4ca1-97f0-189aa4bb4741/";
+    let url = "http://25j35d6uf37tvfqt5pmz457yicgu35yhizojqxbfzv33dni2d73q3oad.onion/80349839-d06f-41a8-b954-3602fe60725a/";
     println!("[*] Fetching {}...", url);
     match client.get(url).send().await {
         Ok(resp) => {
             println!("[*] HTTP Status: {}", resp.status());
             println!("[*] Final URL: {}", resp.url());
             let html = resp.text().await.unwrap();
-            println!(
-                "[*] Fetched {} bytes. Snippet:\n{}",
-                html.len(),
-                &html[..std::cmp::min(html.len(), 500)]
-            );
+            std::fs::write("/tmp/ijzn.html", &html).unwrap();
+            println!("[*] Wrote {} bytes to /tmp/ijzn.html", html.len());
         }
         Err(e) => {
             eprintln!("Error fetching target: {}", e);

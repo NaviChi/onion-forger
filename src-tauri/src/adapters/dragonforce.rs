@@ -404,6 +404,11 @@ impl CrawlerAdapter for DragonForceAdapter {
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(4)
         });
+        let timer = crate::timer::CrawlTimer::new(app.clone());
+        timer.emit_log(&format!(
+            "[DragonForce] Bootstrapping MultiClientPool with {} independent TorClients...",
+            multi_clients
+        ));
         let _ = app.emit(
             "log",
             format!(
@@ -417,6 +422,7 @@ impl CrawlerAdapter for DragonForceAdapter {
                 .unwrap(),
         );
 
+        timer.emit_log("[DragonForce] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors...");
         let _ = app.emit("log", "[DragonForce] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors...".to_string());
         let mut preheats = Vec::new();
         for i in 0..multi_clients {
@@ -432,6 +438,7 @@ impl CrawlerAdapter for DragonForceAdapter {
             }));
         }
         futures::future::join_all(preheats).await;
+        timer.emit_log("[DragonForce] Pre-heating complete. Unleashing workers.");
         let _ = app.emit(
             "log",
             "[DragonForce] Pre-heating complete. Unleashing workers.".to_string(),

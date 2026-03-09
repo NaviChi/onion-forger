@@ -48,10 +48,28 @@ pub struct GovernorPressure {
 }
 
 #[derive(Clone, Debug)]
+pub struct RampPolicy {
+    pub initial: usize,
+    pub step: usize,
+    pub interval_ms: u64,
+}
+
+impl Default for RampPolicy {
+    fn default() -> Self {
+        Self {
+            initial: 1,
+            step: 1,
+            interval_ms: 2500,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct BootstrapBudget {
     pub target_clients: usize,
     pub minimum_ready: usize,
     pub pressure: GovernorPressure,
+    pub ramp_policy: RampPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +118,69 @@ pub fn detect_profile(output_path: Option<&Path>) -> ResourceGovernorProfile {
         recommended_arti_cap,
         recommended_quorum,
         direct_io_policy,
+    }
+}
+
+/// Phase 67H: System profile for GUI auto-selection of concurrency preset
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SystemProfile {
+    pub preset: String,
+    pub circuits: usize,
+    pub workers: usize,
+    pub cpu_cores: usize,
+    pub total_ram_gb: f64,
+    pub available_ram_gb: f64,
+    pub storage_class: String,
+    pub os: String,
+}
+
+/// Phase 67H: Returns the recommended concurrency preset based on detected hardware
+pub fn recommended_concurrency_preset() -> SystemProfile {
+    let profile = detect_profile(None);
+    let total_ram_gb = profile.total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let available_ram_gb = profile.available_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    let (preset, circuits, workers) = if total_ram_gb <= 4.5 || profile.cpu_cores <= 2 {
+        // 4GB Azure VM, ultra-low resource
+        ("Conservative", 4_usize, 4_usize)
+    } else if total_ram_gb <= 8.5 || profile.cpu_cores <= 4 {
+        // 8GB VM or low-end hardware
+        ("Balanced", 8, 8)
+    } else if total_ram_gb <= 16.5 || profile.cpu_cores <= 8 {
+        // Mid-range system
+        ("Balanced", 8, 8)
+    } else if total_ram_gb <= 32.5 || profile.cpu_cores <= 12 {
+        // High-end Mac / desktop
+        ("Aggressive", 16, 16)
+    } else {
+        // Power workstation
+        ("Maximum", 24, 16)
+    };
+
+    // Windows additional constraint
+    let (circuits, workers) = if cfg!(target_os = "windows") {
+        (circuits.min(16), workers.min(12))
+    } else {
+        (circuits, workers)
+    };
+
+    let os = if cfg!(target_os = "macos") {
+        "macOS"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "Linux"
+    };
+
+    SystemProfile {
+        preset: preset.to_string(),
+        circuits,
+        workers,
+        cpu_cores: profile.cpu_cores,
+        total_ram_gb: (total_ram_gb * 10.0).round() / 10.0,
+        available_ram_gb: (available_ram_gb * 10.0).round() / 10.0,
+        storage_class: storage_class_label(profile.storage_class).to_string(),
+        os: os.to_string(),
     }
 }
 
@@ -246,10 +327,23 @@ pub fn recommend_bootstrap_budget(
         .unwrap_or(recommended_quorum_for_cap(target_clients))
         .clamp(1, target_clients);
 
+    let ramp_initial = env_cap("CRAWLI_VANGUARD_INITIAL").unwrap_or(1);
+    let ramp_interval_ms = std::env::var("CRAWLI_VANGUARD_RAMP_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2500);
+
+    let ramp_policy = RampPolicy {
+        initial: ramp_initial.clamp(1, target_clients),
+        step: 1,
+        interval_ms: ramp_interval_ms,
+    };
+
     BootstrapBudget {
         target_clients,
         minimum_ready,
         pressure,
+        ramp_policy,
     }
 }
 

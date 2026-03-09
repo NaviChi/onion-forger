@@ -1,6 +1,6 @@
 # OnionForge: AI Engineering & Context Reference
-> **Last Updated:** 2026-03-07T15:37 CST
-> **Version:** 2.2.0
+> **Last Updated:** 2026-03-08T23:39 CST
+> **Version:** 2.3.0
 > **Authors:** Navi (User), Antigravity (AI)
 
 This document serves as the master blueprint for any AI agent tasked with maintaining, extending, or recreating the OnionForge intelligence gathering application. It contains all critical architectural decisions, environment constraints, GUI styling instructions, and API behavioral knowledge required to build this system from scratch without guessing.
@@ -144,3 +144,45 @@ By internalizing this document, you possess the context necessary to forge new a
 
 **Prevention Rule Enforced:**
 `PR-UNIFIED-ARCH-001`: Subcomponents must never drop down to rudimentary "sleep and fetch" execution. If a new module is built, it MUST instantiate `DdosGuard` (for EKF pacing) or `BbrController` (for sizing).
+
+### Phase 61: Tauri Asynchronous Reactor Deadlock Fix (2026-03-08)
+**System Audit & Verification:** The UI experienced permanent deadlocks when fetching `.onion` storage parameters during live execution, whereas raw terminal config tests demonstrated 100% correctness.
+**Architectural Upgrade:**
+1. **Tokio Panic Eradication:** Tauri executes its Event IPC `#[tauri::command]` functions outside of Tokio's asynchronous MT (multi-thread) reactor context. Attempting to force synchronous locks via `tokio::sync::RwLock` backed by `tokio::task::block_in_place` caused a silent thread panic within the UI connector, instantly freezing the crawl.
+2. **Synchronous Locking Transition:** Purged asynchronous locks from the `PhantomPool` and `TorClientSlot`. Native standard library `std::sync::RwLock` primitives are now the canonical standard for shared configuration memory.
+3. **Strict Structural Scoping:** Enforced hard `{ }` closure bounds across all background monitoring routines to guarantee that standard `!Send` lock-guards vanish entirely before reaching `.await` pause execution blocks.
+
+**Prevention Rule Enforced:** `PR-TAURI-RUNTIME-001`: Never use `tokio::sync::RwLock` for primitive configurations initialized or handled directly by Tauri IPC hooks. Use `std::sync::RwLock`.
+
+### Phase 61b: Storage Discovery Timeout Hardening (2026-03-08)
+**Root Cause:** Even after fixing the RwLock deadlock, the UI continued to hang at "Probing Target". The real stall was in `qilin_nodes.rs::discover_and_resolve()` — the 4-stage storage node discovery pipeline had **zero global timeout**. Stage A (3 HTTP retries) and Stage B (1 HTTP call) lacked per-request timeouts. Stage D probed up to 17 cached mirrors × 15s each. With degraded Tor circuits, the pipeline blocked for 4+ minutes.
+
+**3-Layer Timeout Fix:**
+1. **Global Timeout (90s):** Wrapped the entire `discover_and_resolve()` call in `qilin.rs` with `tokio::time::timeout(90s)`. On expiry, falls through to the Phase 42 direct-mirror retry logic.
+2. **Per-Stage HTTP Timeouts (20s):** Stage A and B HTTP calls now use `tokio::time::timeout(20s)`.
+3. **Reduced Probe Timeouts:** `PROBE_TIMEOUT_SECS` 15→10, `PREFERRED_NODE_TIMEOUT_SECS` 8→6.
+
+**Prevention Rule Enforced:** `PR-CRAWLER-012`: Every HTTP call through Tor circuits MUST have an explicit `tokio::time::timeout` wrapper. Never rely on Tor's built-in connection timeout alone.
+
+### Phase 61b+: Stage D Batch Timeout & Discovery Progress (2026-03-08)
+Added 30-second batch timeouts to Stage D tournament head and tail JoinSet drains. Added `emit_discovery_progress()` emitter for per-stage UI visibility during "Probing Target". The `discover_and_resolve()` function now accepts an optional `AppHandle` parameter for progress emissions. Maximum discovery worst-case reduced from 255s to ~60s for Stage D alone.
+
+### Phase 67B+C: Live Crawl Bottleneck Fixes (2026-03-08)
+**Phase 67B — MultiClientPool Size Separation:**
+`circuits_ceiling=120` was being passed directly to `MultiClientPool::new(120)`, creating 120 independent TorClients and consuming the entire 5-minute crawl window with zero entries discovered. Fix: Separated pool size (capped at 8, `CRAWLI_MULTI_CLIENTS` env var override) from `circuits_ceiling` (worker budget). Pool now creates 8 TorClients regardless of circuit budget.
+
+**Phase 67C — Governor Worker Scaling:**
+`QilinCrawlGovernor` received `available_clients=1` (frontier's single bootstrap client) instead of the MultiClientPool size (8). This capped `max_active=4` and `desired_active=4`, limiting visible workers to 2. Fix: Compute `governor_pool_size` using the same env var logic. Now `available_clients=8 → max_active=12 → desired_active=6`.
+
+**Prevention Rules:**
+- `PR-POOL-001`: NEVER use `circuits_ceiling` as TorClient pool size. Pool size must be capped at 8 and controlled separately via `CRAWLI_MULTI_CLIENTS`.
+- `PR-POOL-002`: Always run live `.onion` crawl tests after optimization changes. Synthetic benchmarks miss infrastructure-level bottlenecks.
+- `PR-GOV-001`: Always initialize governor with the actual pool size, not the frontier's bootstrap client count.
+
+### Phase 67D: Throttle-Adaptive Governor (2026-03-08)
+Three-layer adaptive throttle system: (1) Per-worker 2s cool-off after 503/429, (2) Reactive `acquire_slot()` halving within 5s of any throttle via shared `AtomicU64` timestamp, (3) Graduated re-escalation (+1 instead of +4) for 30s post-throttle. Live test: **zero 503s** (vs 4×503 pre-67D). Memory dropped from 318→264MB.
+
+**Prevention Rules:**
+- `PR-THROTTLE-001`: Per-worker cool-off required for rate-limited servers, not just queue-level backoff.
+- `PR-THROTTLE-002`: Governor re-escalation must be graduated (+1) during cooldown window, not full-speed (+4).
+

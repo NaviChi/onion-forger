@@ -1,0 +1,13 @@
+[package]
+name = "tmp_shared_mem_swarm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memmap2 = "0.9"
+bytemuck = { version = "1.14", features = ["derive"] }
+tokio = { version = "1.32", features = ["full"] }
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures = "0.3"

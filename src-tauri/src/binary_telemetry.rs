@@ -127,27 +127,55 @@ fn sink() -> &'static Option<Mutex<TelemetrySink>> {
     })
 }
 
-pub fn emit_frame(kind: EventKind, payload: impl Message) {
-    if !TELEMETRY_ENABLED.load(Ordering::Relaxed) {
-        return;
+// In-memory Shared Ring Buffer for Front-End Polling (LMAX Disruptor style)
+use crossbeam_queue::ArrayQueue;
+static TELEMETRY_RING: OnceLock<ArrayQueue<Vec<u8>>> = OnceLock::new();
+
+fn ring() -> &'static ArrayQueue<Vec<u8>> {
+    // 4096 frames ensures no missed telemetry under high load given UI 250ms polling
+    TELEMETRY_RING.get_or_init(|| ArrayQueue::new(4096))
+}
+
+#[tauri::command]
+pub fn drain_telemetry_ring() -> Vec<u8> {
+    let q = ring();
+    let mut payload = Vec::new();
+    while let Some(mut frame) = q.pop() {
+        payload.append(&mut frame);
     }
-    let Some(file_mutex) = sink().as_ref() else {
-        return;
-    };
-    let payload = payload.encode_to_vec();
+    payload
+}
+
+pub fn emit_frame(kind: EventKind, payload: impl Message) {
+    let payload_bytes = payload.encode_to_vec();
     let frame = TelemetryFrame {
         ts_ms: unix_now_ms(),
         kind: kind as u32,
-        payload,
+        payload: payload_bytes,
     };
     let encoded = frame.encode_length_delimited_to_vec();
-    if let Ok(mut sink) = file_mutex.lock() {
-        let _ = sink.file.write_all(&encoded);
-        sink.pending_frames = sink.pending_frames.saturating_add(1);
-        if sink.pending_frames >= 16 || sink.last_flush.elapsed() >= Duration::from_millis(250) {
-            let _ = sink.file.flush();
-            sink.pending_frames = 0;
-            sink.last_flush = Instant::now();
+
+    // 1. Always push to Shared Memory Ring Buffer for UI
+    let q = ring();
+    // Force push: act as true ring buffer (overwrite oldest if full)
+    let cloned = encoded.clone();
+    if let Err(element) = q.push(cloned) {
+        let _ = q.pop(); // drop oldest
+        let _ = q.push(element); // retry push
+    }
+
+    // 2. Optionally write to trace file
+    if TELEMETRY_ENABLED.load(Ordering::Relaxed) {
+        if let Some(file_mutex) = sink().as_ref() {
+            if let Ok(mut sink) = file_mutex.lock() {
+                let _ = sink.file.write_all(&encoded);
+                sink.pending_frames = std::cmp::max(sink.pending_frames + 1, 1);
+                if sink.pending_frames >= 16 || sink.last_flush.elapsed() >= Duration::from_millis(250) {
+                    let _ = sink.file.flush();
+                    sink.pending_frames = 0;
+                    sink.last_flush = Instant::now();
+                }
+            }
         }
     }
 }

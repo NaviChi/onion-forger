@@ -42,7 +42,7 @@ const HEALTH_PROBE_TIMEOUT_SECS: u64 = 45;
 
 fn canonical_test_urls() -> HashMap<&'static str, &'static str> {
     let mut m = HashMap::new();
-    m.insert("qilin",       "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed");
+    m.insert("qilin",       "http://25j35d6uf37tvfqt5pmz457yicgu35yhizojqxbfzv33dni2d73q3oad.onion/80349839-d06f-41a8-b954-3602fe60725a/");
     m.insert("lockbit",     "http://lockbit24pegjquuwbmwjlvyivmyaujf33kvlepcxyncnugm3zw73myd.onion/secret/123b67de858b6adc5dfdcfb2f6c4e8f7-caaf85ce-6aa7-370d-ba0c-25944d2230e3/manuaco.pt/unpack/");
     m.insert(
         "dragonforce",
@@ -397,6 +397,7 @@ async fn run_adapter_test(
         resume: false,
         resume_index: None,
         mega_password: None,
+        stealth_ramp: true,
     };
 
     let daemon_count = active_ports.len().max(arti_clients.len()).max(1);
@@ -998,7 +999,7 @@ fn main() {
         println!("[TOR] Bootstrapping {}-daemon arti swarm...", cli.daemons);
         let tor_start = Instant::now();
         let (guard, active_ports) =
-            match tor::bootstrap_tor_cluster(app_handle.clone(), cli.daemons).await {
+            match tor::bootstrap_tor_cluster(app_handle.clone(), cli.daemons, 0).await {
                 Ok(result) => result,
                 Err(e) => {
                     eprintln!("[TOR] FATAL: Bootstrap failed: {}", e);

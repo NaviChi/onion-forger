@@ -74,10 +74,12 @@ export const FIXTURE_RESOURCE_METRICS = {
   workerTarget: 12,
   activeCircuits: 9,
   peakActiveCircuits: 12,
-  currentNodeHost: "fixture-storage-primary.onion",
-  nodeFailovers: 1,
-  throttleCount: 2,
-  timeoutCount: 1,
+  currentNodeHost: "192.168.1.100",
+  nodeFailovers: 0,
+  throttleCount: 0,
+  timeoutCount: 0,
+  uptimeSeconds: 3600,
+  consensusWeight: 9001,
 };
 
 export function isVfsFixtureMode(): boolean {

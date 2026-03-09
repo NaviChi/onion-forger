@@ -1,0 +1,1098 @@
+{
+  "default": {
+    "guards": [
+      {
+        "id": {
+          "ed25519": "KDijFDYWR36mq1kFaMe27tUOKerJGoQDhXmin+ROJZQ",
+          "rsa": "b3d398b386faf2cb78b447fba46bf2648c3f48cd"
+        },
+        "orports": [
+          "162.55.131.67:9100",
+          "[2a01:4f8:271:5d58::2]:9100"
+        ],
+        "added_at": "2026-02-26T03:52:20Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "s1l9ZRJGD7UGz2IdinK2fr5BErZs5mycvs34z+grVvU",
+          "rsa": "1936aa678cc45d6091b659692364b8b281770727"
+        },
+        "orports": [
+          "64.65.1.108:443"
+        ],
+        "added_at": "2026-02-22T21:32:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "yzKUPOD6SaTKOdSq5Wxbu3ymziKz1Wvf7i/pezejBiM",
+          "rsa": "03d1ef3ef2be5145150c58acc72519dd860e61ba"
+        },
+        "orports": [
+          "136.243.3.194:8000",
+          "[2a01:4f8:211:1d41::2]:8000"
+        ],
+        "added_at": "2026-02-21T04:02:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "dcXLjTqmtFVHdGu3Irj7aqReDg49pwJGHABSosrnqN8",
+          "rsa": "8f9cd937d0177be8ac9e27d18604f93216dfa6a9"
+        },
+        "orports": [
+          "78.159.117.165:9001"
+        ],
+        "added_at": "2026-02-27T07:23:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "c8QIDwjEeXnpFxzncTxz7ywvlflBOZX7br07udeTap0",
+          "rsa": "11fc7d9c7d8df74326b90ec71c10173279738b8f"
+        },
+        "orports": [
+          "130.180.63.150:9001"
+        ],
+        "added_at": "2026-02-27T02:26:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "UVTN+RcHbk7HpUMiLpOTeNuoS8+TYbGymwFfDZa3AIw",
+          "rsa": "43620a053d56582673f74e0325831646e117c009"
+        },
+        "orports": [
+          "37.221.208.216:9100",
+          "[2a01:270:98d8::1]:9100"
+        ],
+        "added_at": "2026-03-03T05:07:10Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": "2026-03-03T05:07:10Z",
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "8hkwD5MSKcbMzvZSTYPtS0viF2SskkLppWXVROHp7jo",
+          "rsa": "5e24ef47236bc5fc14431fd9c2bf45e8b38b8fcd"
+        },
+        "orports": [
+          "193.182.111.132:443",
+          "[2a03:8600::a5]:443"
+        ],
+        "added_at": "2026-03-02T14:12:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "SYhWV6Ef1V2JEszf4/xdfr3RCkUQJcSg4F1I1MEiCaY",
+          "rsa": "3a85c6698f4655a2127a07f19e8d6b8a489db79c"
+        },
+        "orports": [
+          "96.9.98.17:443"
+        ],
+        "added_at": "2026-03-02T00:18:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": "2026-03-02T00:18:50Z",
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "nqgf+e0hPzIUaJsFoXWSauTDHDGIrfJAOliQrkqD/O8",
+          "rsa": "16f10f525f509f0649813dfd59138fc0e7d8e0db"
+        },
+        "orports": [
+          "37.221.66.248:9001",
+          "[2a0f:5f44:0:8220::1ca]:9001"
+        ],
+        "added_at": "2026-02-20T20:44:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "Of6qOzFiWjh8EqObI/565ERCRcDSTyILFsTjjB/+rcM",
+          "rsa": "09c375184de999ce1b4ac034190f5a9f916479f9"
+        },
+        "orports": [
+          "185.227.70.177:443",
+          "[2a12:bec0:20b:9426::1]:443"
+        ],
+        "added_at": "2026-02-22T00:58:20Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "6LhaStxOEitoEyJJuQl8lJsr/bR8m2ZBUoQY7FYVAiw",
+          "rsa": "215e3f0f14f20004eb9d57ad70f655a6f36a8571"
+        },
+        "orports": [
+          "193.189.100.194:445",
+          "[2a0f:df00:0:255::194]:445"
+        ],
+        "added_at": "2026-02-24T23:03:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "uTgDQgiy9iRfp1TU6xCL2X/rkioime2wNnTBpiGYd/M",
+          "rsa": "0ae076cd2a4201bf2d90c325211a10d2c8dd6ce9"
+        },
+        "orports": [
+          "94.130.89.176:9030",
+          "[2a01:4f8:10b:3702::2]:9030"
+        ],
+        "added_at": "2026-02-21T19:07:20Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "JRKkvyEMOdQ4MhvSNQbtqTQFEwskEDm81JSs8uy6NBM",
+          "rsa": "1ac8884b9c1d1e28dec7a24610f31e9c6d2c4fa3"
+        },
+        "orports": [
+          "202.61.205.33:9001",
+          "[2a03:4000:5b:563::1]:9001"
+        ],
+        "added_at": "2026-02-21T09:01:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "FNkEbeXufqAs/9+aZq3owCC6lBh0dv/XHjWtg7GKqDE",
+          "rsa": "dd13b93f6fa344364fad1187dcb43c398c6ef7fa"
+        },
+        "orports": [
+          "2.58.56.92:9100"
+        ],
+        "added_at": "2026-02-21T06:37:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "J5xSAf/GxrnzwL0sQcp36YlGybPxR4iBFQojImbNWKM",
+          "rsa": "d405fccf06adedf898df2f29c9348dcb623031ba"
+        },
+        "orports": [
+          "5.45.111.149:443",
+          "[2a03:4000:6:2388:df98:15f9:b34d:443]:443"
+        ],
+        "added_at": "2026-02-24T06:47:20Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": "2026-03-01T14:32:00Z",
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "0ObyF+WKOoB0Z5bWMoLB7KQbRjHRQ5bGFmP2eL8DmKg",
+          "rsa": "06913fa2410f06d704e9b915edcf3cb3f6960faa"
+        },
+        "orports": [
+          "45.132.126.13:9104"
+        ],
+        "added_at": "2026-03-03T13:41:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": "2026-03-03T13:41:40Z",
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "omzmR5HViq2uawr5QPCCNBBaGR32f4T07erXt9hSrBA",
+          "rsa": "427526ebd012cfe50fcffcbfe221effe199afa8c"
+        },
+        "orports": [
+          "88.99.94.231:4443",
+          "[2a01:4f8:10a:1f06::2]:4443"
+        ],
+        "added_at": "2026-02-20T15:39:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "vI2ZvdZRBBcquBkIGlYTCFIvV675erm3DG0eBHzH+TA",
+          "rsa": "469fb12bf25e0ea9ed889d0fe8bdc0e5ab2cd74c"
+        },
+        "orports": [
+          "87.106.107.89:443",
+          "[2a01:239:381:8e00::1]:443"
+        ],
+        "added_at": "2026-02-26T06:30:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "9EWxIsU9gJUejf2MxpxYXBM2I46mYcXWB5CyuEkXI3s",
+          "rsa": "1fb9ccbe02cf10978eab16943973ac5c548fa243"
+        },
+        "orports": [
+          "79.141.174.124:9001"
+        ],
+        "added_at": "2026-02-20T14:38:20Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "LRhoC+sF3NiVQ8yFqMOxbrWfVE61J/BwfiD7sVj3N34",
+          "rsa": "6e4915e9d86e607d68d99b98a9a63f60e5882d57"
+        },
+        "orports": [
+          "78.46.92.172:9001",
+          "[2a01:4f8:120:716d::1]:9001"
+        ],
+        "added_at": "2026-02-25T05:47:10Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "KZN/NG2pR8JIY8DEtjejEjdsQeOc7FCpnm7ct6vqB1k",
+          "rsa": "9837525a8645834ac9b5dde3db4278672ffac969"
+        },
+        "orports": [
+          "141.227.137.150:9001"
+        ],
+        "added_at": "2026-03-01T08:35:10Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "K0f/nMSs8hDstV/Neg33Wtp0vPLSbDxOXCd4chCsVpA",
+          "rsa": "0f6bf165c5cce08f82be66ab2c0c5b6be9ec5f39"
+        },
+        "orports": [
+          "168.119.209.97:9993"
+        ],
+        "added_at": "2026-02-26T09:46:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "rCZCcOEVSs8A7NFJsPVJc6qhTNeySM7Z65t/U8/WXfg",
+          "rsa": "af7ab1aa18e362cc0a58d3e23946aae43f858a12"
+        },
+        "orports": [
+          "64.65.1.46:443"
+        ],
+        "added_at": "2026-02-23T05:59:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "87AgHNPvfRi/1x6LJoFOSlxpITGhK2aAgVI1sNdXVbY",
+          "rsa": "a553e8735d0d784589eba80752536fa9a23100ba"
+        },
+        "orports": [
+          "64.65.63.40:443"
+        ],
+        "added_at": "2026-02-23T04:30:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "OrGN4D71V9vwrB+C01xAf4jYkllKfSH+LsUqJgMaNz8",
+          "rsa": "8bd121b314250a22f56eab14bdd77ee344134ddf"
+        },
+        "orports": [
+          "45.147.7.156:469",
+          "[2a12:de40:21:33ab::]:469"
+        ],
+        "added_at": "2026-02-22T20:04:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "SY350OTYbqVAsMgZBPE6i6GbE9hWb6kCVWZ1EO/7isI",
+          "rsa": "724d8a0e85f6a679a2f5c707a1ce5fb5f17e0970"
+        },
+        "orports": [
+          "72.62.90.136:9001",
+          "[2a02:4780:41:e34c::1]:9001"
+        ],
+        "added_at": "2026-03-04T00:48:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "anZEFOOOZdEnkm/Ov2qSRKmpkQMLsEkfJOy8gr6Uy1g",
+          "rsa": "2955d8c86f5848fd3469e3f38a027d3e169359d8"
+        },
+        "orports": [
+          "138.201.225.177:9100",
+          "[2a01:4f8:173:1d2e::2]:9100"
+        ],
+        "added_at": "2026-02-24T21:03:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "QAigQ2LRsgRmsBhYVldgkxx0UaXObk8niC/fek6zvnc",
+          "rsa": "cb2cce6acf50ea5db6c50b4c5b786329eb9f09a3"
+        },
+        "orports": [
+          "64.65.62.236:443"
+        ],
+        "added_at": "2026-02-25T14:04:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "9cz2iHIIEgQLwAUWLg7MjyJPnQchDwRtisP12j2DNdY",
+          "rsa": "d3e106aee8af14ae45dce8e620079d2bae137b84"
+        },
+        "orports": [
+          "109.70.100.245:9040",
+          "[2a03:e600:100:c3::10]:9040"
+        ],
+        "added_at": "2026-02-25T16:37:00Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "E23ItIbDOCwZCPcyrpe2+lPzE/8Nv/AdR5+lZ5lJ0N4",
+          "rsa": "8bbb78cefdb03b3a919743f693bec2a0c81d0417"
+        },
+        "orports": [
+          "212.227.52.236:443",
+          "[2a02:2479:44:9000::1]:443"
+        ],
+        "added_at": "2026-02-24T16:27:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "BlWI0vacvRux8HcjE7iODy7uKdxbf4wb+WSfflqy7Fo",
+          "rsa": "9907fef007e475472cf48c12ad2408ea1017cafb"
+        },
+        "orports": [
+          "62.210.181.63:28682",
+          "[2001:bc8:32d7:2006::]:28682"
+        ],
+        "added_at": "2026-03-02T21:53:00Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "e4TwyZpBL39s9H4Wi0tlL5MXO7F6nHm0ge2Q+eO1Zf0",
+          "rsa": "56909edcdffc04aa38593466f51f3fb2ac63414c"
+        },
+        "orports": [
+          "51.159.195.41:993",
+          "[2001:bc8:1201:512:da5e:d3ff:fe6c:8241]:993"
+        ],
+        "added_at": "2026-02-21T13:27:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "EBWyq/VBsbwREeIGiWrOP64OTvHUSQo3LB0IQmAv/Uk",
+          "rsa": "2708361fcf7950b6ffa8c9e0495de938803dc4d1"
+        },
+        "orports": [
+          "83.168.108.31:443"
+        ],
+        "added_at": "2026-03-02T06:23:20Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "cuJZEeKBgOhqTefouN7wuopQYKdmB3caB0IZAqCwvSI",
+          "rsa": "04762be4ca604ea28aad95aa2a9b96d35c01d0fe"
+        },
+        "orports": [
+          "98.128.175.69:701",
+          "[2001:9b1:26fe:c700::8]:701"
+        ],
+        "added_at": "2026-02-21T13:15:00Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "VAEPKOb8CKdLBcO/KE5gJu+omlturmwb9LHG9IP2br8",
+          "rsa": "94f16da2bddba092954ff8ec29f9234a69949403"
+        },
+        "orports": [
+          "77.162.229.73:443"
+        ],
+        "added_at": "2026-02-25T22:42:10Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "YK1JiTr9Pup6YDU3s3UcKOzOJjzoNCAF16dgiTIWdgU",
+          "rsa": "83c8d4a066522d230d640fe3592a810c59669b25"
+        },
+        "orports": [
+          "188.172.228.104:443",
+          "[2a0a:4cc0:3:10d::42]:443"
+        ],
+        "added_at": "2026-02-23T00:42:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "JzPGxEGUFKulqPhgbSsXjpIanjMjmY56eB7enr5lvJU",
+          "rsa": "47ec8468cf423e087fcc746665df74b2ef9d495d"
+        },
+        "orports": [
+          "45.84.107.236:443"
+        ],
+        "added_at": "2026-02-28T02:16:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "A5Y8VgVV4qwFYu+DTQyXtBkn2Xsw33VXO3/+xJpm/4w",
+          "rsa": "27b7d6c06f30bd7a3b3bf8334a414513952bf738"
+        },
+        "orports": [
+          "51.77.90.246:8080"
+        ],
+        "added_at": "2026-02-28T04:04:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "pv2fGkzufCVTdzyF5lfC2ucz/iNtaK1BOfcqN03KBsY",
+          "rsa": "d8f4634366466972842f5102fe44738326e43df0"
+        },
+        "orports": [
+          "88.99.145.25:9993",
+          "[2a01:4f8:10a:295e::2]:9993"
+        ],
+        "added_at": "2026-02-27T08:42:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "23TTAk6UhMWyhgMTTDGp2KjlPsJPK2g+reLw6QYbi+8",
+          "rsa": "ec3e2b08d191b3b4aa0bf2d91f1537ad67890695"
+        },
+        "orports": [
+          "158.220.100.158:443",
+          "[2a02:c206:3011:733::1]:443"
+        ],
+        "added_at": "2026-02-28T15:56:10Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "vqv9Vqn7rtsDSwsxCvTRrkwI7FPbbZA2+K8qmvO96Bc",
+          "rsa": "20f9308643422b92336b2992ff9ec905eaea91b9"
+        },
+        "orports": [
+          "5.135.68.65:8080",
+          "[2001:41d0:303:9d44::1]:8080"
+        ],
+        "added_at": "2026-03-03T02:32:10Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "kyHbXP9LMi3kFZblcuk5a1EQ1kbDNcHpHvSB7oYyEZQ",
+          "rsa": "f1cd870d7a8fa364e459aba70b1737d40b0b4bb3"
+        },
+        "orports": [
+          "134.102.200.101:9001",
+          "[2001:638:708:30c8::65]:9001"
+        ],
+        "added_at": "2026-03-02T03:55:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "b/Qt432Owd6WAGxzZovNv9BZMEXgcugMXtojy4XoX5I",
+          "rsa": "f66e841eaab4456f9f5db179a7fec32844ac014e"
+        },
+        "orports": [
+          "178.63.35.124:443"
+        ],
+        "added_at": "2026-03-02T22:51:00Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "SXldpGwgUZ35UNZDJYCfvNMqm7dvUmXUT2WC9AB2Pkw",
+          "rsa": "e3bf6104564d424282d1d46b1c34dc94ce212e86"
+        },
+        "orports": [
+          "109.70.100.247:9000",
+          "[2a03:e600:100:c3::8]:9000"
+        ],
+        "added_at": "2026-03-01T02:43:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "NQkKoQstshkeMT5EsV8h5rW8aL7n4bO8A2LvsPodYgo",
+          "rsa": "b646d1767a2cde8d9cdb3812f9f076d0ebbc6157"
+        },
+        "orports": [
+          "152.53.47.136:443",
+          "[2a0a:4cc0:0:2403:3887:31ff:fecd:115]:443"
+        ],
+        "added_at": "2026-02-26T05:24:10Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "IIqad116o3tpcSy26cwHQ26YLKmZb3mKYAqdB9YLyDo",
+          "rsa": "3e599e42113de174f90e213f9cb818747ba0ae36"
+        },
+        "orports": [
+          "45.157.234.148:9001",
+          "[2a0c:4ac1:3:11::148]:9001"
+        ],
+        "added_at": "2026-03-03T05:35:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "kTse4f9LodRNh9AW45ujrIR5+BNciUhmmYRKP7sk+ck",
+          "rsa": "b217c155babb1fa76551f908475e59bc097f903c"
+        },
+        "orports": [
+          "45.132.126.13:9000"
+        ],
+        "added_at": "2026-02-26T00:13:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "5jmVsWGZmx/Ofyy4lJvGXfz6LfdKdOsLv1x+AWhINVE",
+          "rsa": "6a1a6738205dbeb67175e4c26ceee697b5bbc919"
+        },
+        "orports": [
+          "64.65.63.99:443"
+        ],
+        "added_at": "2026-02-24T08:35:40Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "rwyaJLK/cqZRgllONZdn6Yuu9HFwLCatmTMwKXtosg4",
+          "rsa": "f57c29781f6aeef2718ed37df792218bdfc996b3"
+        },
+        "orports": [
+          "185.246.86.175:9001"
+        ],
+        "added_at": "2026-02-25T15:47:20Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "D3rPQ1QPXVdj/O9Q35V0ZzqqadyQ/aZUg4ts+vLrqfc",
+          "rsa": "1c0736cf3744a3b87c2d2269b8bd3388c7e60552"
+        },
+        "orports": [
+          "159.69.138.31:9001",
+          "[2a01:4f8:231:1ed8:106::106]:9001"
+        ],
+        "added_at": "2026-02-27T13:27:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "+JnRe/A/2T1jhBnI9E8URvD2kQYWek6gZuiTw5rpvyE",
+          "rsa": "44c1d767402fa32ca75b86fc309bc257ead02a77"
+        },
+        "orports": [
+          "185.38.142.146:9001",
+          "[2a02:7a60:1::220]:9001"
+        ],
+        "added_at": "2026-02-27T09:54:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "UwnQGKkP4H5GGiQOYNWHdSXSfNzQ4YnfKgJ76gfeb20",
+          "rsa": "eca08eaf2d28ca54bd487ee464182f5895de1688"
+        },
+        "orports": [
+          "94.130.52.190:9030",
+          "[2a01:4f8:10b:2a2a::2]:9030"
+        ],
+        "added_at": "2026-03-01T20:28:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": "2026-03-01T20:28:30Z",
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "txyaUtrmNIIiLfVYPU1UVk72bXV7pj24rnZhwjyaZ4g",
+          "rsa": "daf25df4ad0452b958923aa9d77c54f1a5473acd"
+        },
+        "orports": [
+          "94.23.68.187:9001"
+        ],
+        "added_at": "2026-03-02T00:26:00Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": "2026-03-02T00:26:00Z",
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "LGKR7HKBYY28G/jAY0LpwS8rqvzd3KnJADlytFZ4pqY",
+          "rsa": "5c4fe03a9a6053319d70c5b6d8939d5f5419ce4a"
+        },
+        "orports": [
+          "88.99.102.213:9090",
+          "[2a01:4f8:221:12da::2]:9090"
+        ],
+        "added_at": "2026-02-26T17:32:00Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": "2026-02-26T17:32:00Z",
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "BsQLOy5XyfhauRVYW1GfG6GaVkqDncoydAVeLtR6qBc",
+          "rsa": "8adbf02ae4e17281d1b0cde8df9b13c575b581c5"
+        },
+        "orports": [
+          "194.164.169.85:443",
+          "[2001:ba0:255:500::1]:443"
+        ],
+        "added_at": "2026-02-20T18:18:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "5ir7VwRB0BU06RpzLMLQX0y4tT/ebOlNfQE+AizJI24",
+          "rsa": "77a3adc5d455778b53c2803761916dfb7da0a790"
+        },
+        "orports": [
+          "148.251.85.195:9030",
+          "[2a01:4f8:202:6096::2]:9030"
+        ],
+        "added_at": "2026-03-02T18:57:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "C+n6TcxQojcQeM/rI7vWkpY046hJxaQd7ZP+d7QK2Cw",
+          "rsa": "0c36ae99b744e32088c9ed23d7a31f8d23ae1a58"
+        },
+        "orports": [
+          "95.216.13.120:8000",
+          "[2a01:4f9:2a:d96::2]:8000"
+        ],
+        "added_at": "2026-02-21T08:02:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "u6T0nqJlvBsGTr9PMDhhWOpkKTaxQOtUx7umnJE65hw",
+          "rsa": "8c481484574a77a1165c8a1c646da016ce3e665b"
+        },
+        "orports": [
+          "46.105.91.78:9100"
+        ],
+        "added_at": "2026-03-01T08:40:50Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "Os9wv7HiZMJnFfc2DMYCat8KrUaBFvZzVGq3+E2yLHU",
+          "rsa": "46baccce4bc3caa63d2fe770da2ae3cf401b9cf0"
+        },
+        "orports": [
+          "37.187.149.125:9001",
+          "[2001:41d0:a:557d::1]:9001"
+        ],
+        "added_at": "2026-02-21T20:29:00Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      },
+      {
+        "id": {
+          "ed25519": "jhhd9AKPfGljZezawI2pyLFUXK6s2TKEGJlFouSKtFM",
+          "rsa": "bd2a34ade4e603a272faad23aef389801bb223bb"
+        },
+        "orports": [
+          "185.220.101.210:8443",
+          "[2a0b:f4c2:2:1::210]:8443"
+        ],
+        "added_at": "2026-02-21T01:31:30Z",
+        "added_by": {
+          "crate": "tor-guardmgr",
+          "version": "0.23.0"
+        },
+        "disabled": null,
+        "confirmed_at": null,
+        "unlisted_since": null
+      }
+    ],
+    "confirmed": [
+      {
+        "ed25519": "J5xSAf/GxrnzwL0sQcp36YlGybPxR4iBFQojImbNWKM",
+        "rsa": "d405fccf06adedf898df2f29c9348dcb623031ba"
+      },
+      {
+        "ed25519": "0ObyF+WKOoB0Z5bWMoLB7KQbRjHRQ5bGFmP2eL8DmKg",
+        "rsa": "06913fa2410f06d704e9b915edcf3cb3f6960faa"
+      },
+      {
+        "ed25519": "LGKR7HKBYY28G/jAY0LpwS8rqvzd3KnJADlytFZ4pqY",
+        "rsa": "5c4fe03a9a6053319d70c5b6d8939d5f5419ce4a"
+      },
+      {
+        "ed25519": "UwnQGKkP4H5GGiQOYNWHdSXSfNzQ4YnfKgJ76gfeb20",
+        "rsa": "eca08eaf2d28ca54bd487ee464182f5895de1688"
+      },
+      {
+        "ed25519": "txyaUtrmNIIiLfVYPU1UVk72bXV7pj24rnZhwjyaZ4g",
+        "rsa": "daf25df4ad0452b958923aa9d77c54f1a5473acd"
+      },
+      {
+        "ed25519": "SYhWV6Ef1V2JEszf4/xdfr3RCkUQJcSg4F1I1MEiCaY",
+        "rsa": "3a85c6698f4655a2127a07f19e8d6b8a489db79c"
+      },
+      {
+        "ed25519": "UVTN+RcHbk7HpUMiLpOTeNuoS8+TYbGymwFfDZa3AIw",
+        "rsa": "43620a053d56582673f74e0325831646e117c009"
+      }
+    ]
+  },
+  "restricted": {
+    "guards": [],
+    "confirmed": []
+  }
+}

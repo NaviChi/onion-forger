@@ -22,13 +22,29 @@
         {
             "id": "worldleaks_1",
             "adapter": "worldleaks",
-            "name": "WorldLeaks - Company Storage",
+            "name": "WorldLeaks - Company Storage 9255",
             "url": "https://worldleaksartrjm3c6vasllvgacbi5u3mgzkluehrzhk2jz4taufuid.onion/companies/9255855374/storage",
             "expected_adapter": "WorldLeaks SPA",
             "notes": "WorldLeaks company data storage page (HTTPS)"
         },
         {
+            "id": "worldleaks_2",
+            "adapter": "worldleaks",
+            "name": "WorldLeaks - Company Storage 0015",
+            "url": "https://worldleaksartrjm3c6vasllvgacbi5u3mgzkluehrzhk2jz4taufuid.onion/companies/0015405778/storage",
+            "expected_adapter": "WorldLeaks SPA",
+            "notes": "WorldLeaks company data storage page (HTTPS)"
+        },
+        {
             "id": "abyss_1",
+            "adapter": "abyss",
+            "name": "Abyss - iamdesign.lst.7z",
+            "url": "http://vmmefm7ktazj2bwtmy46o3wxhk42tctasyyqv6ymuzlivszteyhkkyad.onion/iamdesign.lst.7z",
+            "expected_adapter": "Abyss Ransomware",
+            "notes": "Direct 7z archive download from Abyss"
+        },
+        {
+            "id": "abyss_2",
             "adapter": "abyss",
             "name": "Abyss - iamdesign.rar",
             "url": "http://vmmefm7ktazj2bwtmy46o3wxhk42tctasyyqv6ymuzlivszteyhkkyad.onion/iamdesign.rar",
@@ -49,7 +65,23 @@
             "name": "Qilin - UUID c9d2ba19",
             "url": "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed",
             "expected_adapter": "Qilin Nginx Autoindex / CMS",
-            "notes": "Qilin QData site with UUID-based storage discovery"
+            "notes": "Qilin initial CMS URL to test handoff routing"
+        },
+        {
+            "id": "tengu_1",
+            "adapter": "tengu",
+            "name": "Tengu - aa45a1",
+            "url": "http://longvqprqrb4zbxooswz4upefhtikhnyqv4gw4fkzpkc2wjpvxsucwid.onion/v/aa45a1540201f248b27801bb98b52d6e",
+            "expected_adapter": "Unknown (New Target)",
+            "notes": "Tengu onion leak page"
+        },
+        {
+            "id": "genesis_1",
+            "adapter": "genesis",
+            "name": "Genesis - .tar.gz archive",
+            "url": "http://genesis6ixpb5mcy4kudybtw5op2wqlrkocfogbnenz3c647ibqixiad.onion/download/cce17aec4f3cbc4d7db_part2.tar.gz",
+            "expected_adapter": "Generic Archive",
+            "notes": "Direct tar.gz archive from Genesis"
         }
     ]
 }

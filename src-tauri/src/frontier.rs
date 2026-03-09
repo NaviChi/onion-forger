@@ -29,6 +29,8 @@ pub struct CrawlOptions {
     /// Optional password for Mega.nz password-protected links (#P! format)
     #[serde(default)]
     pub mega_password: Option<String>,
+    #[serde(default)]
+    pub stealth_ramp: bool,
 }
 
 impl Default for CrawlOptions {
@@ -39,10 +41,11 @@ impl Default for CrawlOptions {
             download: false,
             circuits: Some(120),
             daemons: Some(4),
-            agnostic_state: false,
+            agnostic_state: true, // Phase 67N: domain-agnostic dedup for safe multi-node rotation
             resume: false,
             resume_index: None,
             mega_password: None,
+            stealth_ramp: true,
         }
     }
 }
@@ -115,14 +118,7 @@ fn env_usize(name: &str) -> Option<usize> {
 
 impl CrawlerFrontier {
     pub fn active_client_count(&self) -> usize {
-        if self.is_onion {
-            crate::tor_native::active_tor_clients()
-                .len()
-                .max(self.http_clients.len())
-                .max(1)
-        } else {
-            self.http_clients.len().max(1)
-        }
+        self.http_clients.len().max(1)
     }
 
     pub fn new(
@@ -152,11 +148,7 @@ impl CrawlerFrontier {
 
         if is_onion {
             for (idx, shared_client) in arti_clients.iter().enumerate() {
-                let tor_client_arc = if tokio::runtime::Handle::try_current().is_ok() {
-                    tokio::task::block_in_place(|| shared_client.blocking_read().clone())
-                } else {
-                    shared_client.blocking_read().clone()
-                };
+                let tor_client_arc = shared_client.read().unwrap().clone();
                 let isolation_token = arti_client::IsolationToken::new();
                 let client = crate::arti_client::ArtiClient::new(
                     (*tor_client_arc).clone(),
@@ -345,6 +337,11 @@ impl CrawlerFrontier {
         self.cancel_flag.load(Ordering::Relaxed)
     }
 
+    /// Expose whether the Vanguard stealth ramp is active for this session
+    pub fn stealth_ramp_active(&self) -> bool {
+        self.active_options.stealth_ramp
+    }
+
     /// Mark URL as visited, returns true if newly added, false if already visited
     pub fn mark_visited(&self, url: &str) -> bool {
         let state_key = if self.active_options.agnostic_state {
@@ -380,11 +377,6 @@ impl CrawlerFrontier {
             self.bbr.current_active().max(1)
         };
         let total = active.max(self.http_clients.len()).max(1);
-        let live_clients = if self.is_onion {
-            Some(crate::tor_native::active_tor_clients())
-        } else {
-            None
-        };
         let blacklist_ttl = std::time::Duration::from_secs(60);
 
         // Try up to `total` slots to find a non-blacklisted circuit
@@ -401,23 +393,6 @@ impl CrawlerFrontier {
                     self.circuit_blacklist.remove(&cid); // TTL expired, rehabilitate
                 }
             }
-            if let Some(live_clients) = &live_clients {
-                if let Some(shared_client) = live_clients.get(cid % live_clients.len().max(1)) {
-                    let tor_client_arc = if tokio::runtime::Handle::try_current().is_ok() {
-                        tokio::task::block_in_place(|| shared_client.blocking_read().clone())
-                    } else {
-                        shared_client.blocking_read().clone()
-                    };
-                    let isolation_token = arti_client::IsolationToken::new();
-                    return (
-                        cid,
-                        crate::arti_client::ArtiClient::new(
-                            (*tor_client_arc).clone(),
-                            Some(isolation_token),
-                        ),
-                    );
-                }
-            }
             return (
                 cid % self.http_clients.len().max(1),
                 self.http_clients[cid % self.http_clients.len().max(1)].clone(),
@@ -432,28 +407,12 @@ impl CrawlerFrontier {
             .map(|e| *e.key());
         if let Some(cid) = oldest {
             self.circuit_blacklist.remove(&cid);
-            return (cid, self.http_clients[cid].clone());
+            let fallback_idx = cid % self.http_clients.len().max(1);
+            return (fallback_idx, self.http_clients[fallback_idx].clone());
         }
 
         // Absolute fallback
         let cid = self.client_counter.fetch_add(1, Ordering::Relaxed) % total;
-        if let Some(live_clients) = &live_clients {
-            if let Some(shared_client) = live_clients.get(cid % live_clients.len().max(1)) {
-                let tor_client_arc = if tokio::runtime::Handle::try_current().is_ok() {
-                    tokio::task::block_in_place(|| shared_client.blocking_read().clone())
-                } else {
-                    shared_client.blocking_read().clone()
-                };
-                let isolation_token = arti_client::IsolationToken::new();
-                return (
-                    cid,
-                    crate::arti_client::ArtiClient::new(
-                        (*tor_client_arc).clone(),
-                        Some(isolation_token),
-                    ),
-                );
-            }
-        }
         let fallback_idx = cid % self.http_clients.len().max(1);
         (fallback_idx, self.http_clients[fallback_idx].clone())
     }

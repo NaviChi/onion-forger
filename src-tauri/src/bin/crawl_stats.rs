@@ -208,7 +208,7 @@ fn main() {
 
         println!("[STEP] Bootstrapping {}-daemon Tor swarm...", TOR_DAEMONS);
         let tor_start = Instant::now();
-        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), TOR_DAEMONS)
+        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), TOR_DAEMONS, 0)
             .await
             .expect("bootstrap tor cluster");
         let tor_bootstrap_secs = tor_start.elapsed().as_secs_f64();
@@ -341,6 +341,7 @@ async fn run_single_benchmark(
         agnostic_state: false,
         resume: false,
         resume_index: None,
+        stealth_ramp: false,
         mega_password: None,
     };
 
