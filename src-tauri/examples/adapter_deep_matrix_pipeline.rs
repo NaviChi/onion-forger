@@ -98,6 +98,7 @@ fn main() -> anyhow::Result<()> {
                 resume: false,
                 resume_index: None,
             mega_password: None,
+                stealth_ramp: true,
             };
             let frontier = Arc::new(CrawlerFrontier::new(
                 None,

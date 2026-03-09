@@ -1,4 +1,4 @@
-> **Last Updated:** 2026-03-07T15:37 CST
+> **Last Updated:** 2026-03-09T03:36 CST
 
 ## Phase 52B: Mega.nz + Torrent Frontend Integration (2026-03-07)
 
@@ -136,6 +136,8 @@ Issue-to-fix mapping:
 **14. High-frequency operator UI state must prefer one aggregated bridge event over multiple parallel hot listeners.**
 **15. Overlay integrity geometry checks must distinguish true layout shifts from internal scroll-container translation.**
 **16. Dynamic popovers/menus used in integrity tests must be reopened deterministically before child-control interaction.**
+**17. Protobuf frame decoding for UI state MUST request `defaults: true` (or equivalent schema normalization) so proto3 zero-value omission cannot erase render-critical numeric fields.**
+**18. Telemetry updates must merge into prior UI snapshots; never blindly replace strongly-typed state with sparse transport payloads.**
 
 # Risk
 - Estimated progress may briefly plateau in highly dynamic directory trees.
@@ -150,6 +152,7 @@ Issue-to-fix mapping:
 - 2026-03-04: Added EWMA throughput smoothing and explicit ETA confidence telemetry to stabilize download operator readouts.
 - 2026-03-06: Migrated the dashboard to `telemetry_bridge_update`, consolidating crawl/resource/batch/download listeners into one aggregated operator-plane feed.
 - 2026-03-07: Hardened the overlay integrity harness so internal `.app-container` scrolling and support-popover re-entry no longer produce false UI regressions.
+- 2026-03-09: Stabilized Start Queue rendering by normalizing/merging binary telemetry frames before Dashboard binding.
 
 # Appendices
 - Validation:
@@ -190,3 +193,79 @@ After fixing the `tokio::sync::RwLock` deadlock (Phase 61), the GUI still froze 
 * **Issue**: Playwright tests could not verify GUI batch updates because `window.dispatchEvent(new CustomEvent(...))` does not interop with Tauri`s native `listen<T>` frontend API.
 * **Exact Fix**: Refactored all 15 `App.tsx` event hooks using a custom universal `addAppListener` proxy adapter. Evaluates `isDownloadFixtureMode()` to bind to DOM `addEventListener` locally for offline DOM verification rendering the exact BBR metrics inside `Dashboard.tsx`.
 * **Prevention Rule**: PR-GUI-001 - Playwright Frontend must execute entirely decoupled from Tauri Native context using explicit Fixtures bounding simulated progress ticks over standard `CustomEvent` interfaces.
+
+## Phase 74C: React Rendering Crash on Crawl Start (2026-03-08)
+
+### Issues Found
+- "Render breaks right after I start clicking on the sync option to start the crawling process. That's when the render breaks and that dark image just shows up."
+- The Tauri `crawli` instance abruptly exited with code `0`.
+
+### Root Cause
+- `Dashboard.tsx` attempted to dynamically parse `crawlRunStatus?.stableCurrentListingPath` by invoking `.split(/[\\/]/)` during render.
+- However, when a new crawl is initiated via the Sync button, `App.tsx` correctly clears the `crawlRunStatus` state to `null`.
+- The expression `crawlRunStatus?.stableCurrentListingPath.split(...)` evaluated to `undefined.split(...)`, producing an unhandled `TypeError` that crashed the entire React tree synchronously.
+- With no Error Boundary, the UI collapsed to the Tauri `--window-background-color` (black). The user closing this dead window resulted in the graceful `Exit code: 0` backend log.
+- Separately, `ceilingStatus` was destructured without a default value, though this was not the primary crash vector.
+
+### Fixes Implemented
+- **Safe Navigation:** Implemented standard optional chaining across the entire string parsing expression (`crawlRunStatus?.stableCurrentListingPath?.split(...)`) in `Dashboard.tsx`.
+- **Default Props:** Bound robust default structures for `ceilingStatus` destructuring in `Dashboard.tsx` to handle React initialization phases securely.
+
+### Prevention Rules
+**25. Any string manipulation (split, slice, replace) performed during React render on deep property paths MUST utilize full optional chaining up to and including the invocation target.**
+**26. Do not assume backend-provided status objects are immutable; `null` is a valid state during Phase Transitions (e.g., initiating a new Sync).**
+
+## Phase 74D: Playwright Overlay Integrity Test Fixes (2026-03-09)
+
+### Issues Found
+- Running the `overlay:integrity` script against the newly verified GUI produced two false-positive interaction failures on standard VFS Tree nodes (like `vfs-toggle` or `README.txt`). 
+- The script reported `Element is outside of the viewport` while the Geometry assertions returned `UNCHANGED`.
+
+### Root Cause
+- `VfsTreeView.tsx` utilizes `@tanstack/react-virtual` with a heavy buffer `<overscan: 20>`.
+- The nodes technically exist inside the DOM tree, but their absolute offsets project them just outside the physical bounding box bounds until manually scrolled into view.
+- Standard Playwright `.click()` routines aborted with visibility constraint assertions when simulating clicks on effectively occluded controls without prior explicit viewport translation scroll requests.
+
+### Fixes Implemented
+- Modified `overlay_integrity_runner.cjs` to gracefully catch and inspect `outside of the viewport` exceptions. 
+- When intercepted, the script overrides standard Playwright safety hooks to natively propagate DOM-level events (`.evaluate((el) => el.click())`), accurately verifying the synthetic control reactivity regardless of initial geometry projection offset.
+
+### Prevention Rules
+**27. React-Virtual overscan artifacts in Playwright integrity matrices must safely trap `out-of-bound` click exceptions to invoke native DOM evaluations, otherwise false-positive UI breaks block regression runs.**
+
+## Phase 74E: Start Queue Renderer Crash (2026-03-09)
+
+### Issues Found
+- The desktop window could black-screen immediately after `Start Queue` was clicked, even though crawl startup logs continued briefly.
+- Crash occurred before meaningful queue progress rendered.
+
+### Root Cause
+- Binary telemetry polling in `App.tsx` decoded protobuf frames and directly replaced `crawlStatus` / `resourceMetrics` with sparse payload objects.
+- Proto3 omits default scalar fields (zeros), so fields like `visitedNodes`, `queuedNodes`, `systemMemoryPercent`, and related counters were intermittently absent.
+- `Dashboard.tsx` calls `.toLocaleString()` / `.toFixed()` on those fields, so missing values caused synchronous React render exceptions.
+
+### Fixes Implemented
+- Added `normalizeCrawlStatusFrame(...)` and `normalizeResourceMetricsFrame(...)` in `App.tsx` to coerce all telemetry values to stable numeric defaults.
+- Switched protobuf conversion calls to `toObject(..., { longs: Number, defaults: true })` for crawl/resource/batch frames.
+- Replaced full-object state assignment with merge-based updates (`setCrawlStatus(prev => ...)`, `setResourceMetrics(prev => ...)`) to preserve non-frame dashboard fields (`estimation`, `processThreads`, `uptimeSeconds`, etc.).
+
+### Phase 74F: Qilin Adaptive MultiClientPool Lazy Loading (2026-03-09)
+
+### Issues Found
+- The user observed extreme >120s initialization times when crawling a new target if concurrency ceilings were raised (e.g. 16 Circuits).
+- Log read: `Bootstrapping MultiClientPool with 16 TorClients`... followed 128s later by `Concurrent Pre-heating`.
+- The adaptive MultiClient framework was meant to scale into its ceiling, but instead forced a blocking massive scale-out before any requests were dispatched.
+
+### Root Cause
+- `MultiClientPool::new` mapped and initialized all `CRAWLI_MULTI_CLIENTS` entirely upfront in a `join_all` statement.
+- Because `node_100` Vanguard cache is copied to every node, doing this sequentially using `spawn_blocking` within the `new` loop incurred 10-20 seconds per client on disk I/O alone.
+- Following the copy, heavy network bootstraps took another minute to complete for all 15 clones.
+- Lastly, the `for i in 0..multi_clients { get_client(i).await }` preheat loop awaited them consecutively rather than within spawned tasks.
+
+### Fixes Implemented
+- **True Adaptive Lazy Loading**: `MultiClientPool` now drops the `clients` array to `Arc<RwLock<Option<Arc<TorClient>>>>`. Only the Vanguard (slot 0) fully warms on `MultiClientPool::new`.
+- **Just-In-Time Sub-Node Spawning**: When the governor requests a client that doesn't exist, `get_client` handles localized locking, copies the Vanguard directory immediately via `spawn_blocking`, bootstraps the client dynamically, caches it, and returns the result.
+- **Concurrent Pre-heating Setup**: `qilin.rs` and `dragonforce.rs` preheat sequences moved their `get_client().await` calls *inside* the `tokio::spawn` closures so that initial scaling hits the lazy instantiation sequentially across all sub-threads rapidly, unlocking the initial scan sequence immediately.
+
+### Prevention Rules
+**30. Pool architectures allocating heavyweight external libraries/resources MUST implement lazy instantiation (Optionals via double-checked locking) rather than strictly-sized upfront loops to comply with "Adaptive Scaling" policies.**

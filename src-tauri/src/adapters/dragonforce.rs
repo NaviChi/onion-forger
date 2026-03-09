@@ -427,10 +427,11 @@ impl CrawlerAdapter for DragonForceAdapter {
         let _ = app.emit("log", "[DragonForce] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors...".to_string());
         let mut preheats = Vec::new();
         for i in 0..multi_clients {
-            let tor_arc = multi_pool.get_client(i).await;
-            let preheat_client = crate::arti_client::ArtiClient::new((*tor_arc).clone(), None);
+            let multi_pool_clone = multi_pool.clone();
             let target_heat_url = current_url.to_string();
             preheats.push(tokio::spawn(async move {
+                let tor_arc = multi_pool_clone.get_client(i).await;
+                let preheat_client = crate::arti_client::ArtiClient::new((*tor_arc).clone(), None);
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(55),
                     preheat_client.get(&target_heat_url).send(),
@@ -581,8 +582,14 @@ impl CrawlerAdapter for DragonForceAdapter {
                     }
 
                     if fetch_success && !html.is_empty() {
-                        let mut new_files =
-                            parse_dragonforce_fsguest(&html, &dynamic_host, &next_url);
+                        let html_clone = html.clone();
+                        let dyn_host_clone = dynamic_host.clone();
+                        let curr_url_clone = next_url.clone();
+                        let mut new_files = tokio::task::spawn_blocking(move || {
+                            parse_dragonforce_fsguest(&html_clone, &dyn_host_clone, &curr_url_clone)
+                        })
+                        .await
+                        .unwrap_or_default();
                         let _is_nextjs = html.contains("__NEXT_DATA__");
 
                         for doc in &new_files {

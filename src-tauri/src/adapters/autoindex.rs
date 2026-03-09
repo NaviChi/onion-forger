@@ -179,10 +179,11 @@ impl CrawlerAdapter for AutoindexAdapter {
                     };
 
                     let _permit = f.politeness_semaphore.acquire().await.ok();
-                    let (cid, client) = f.get_client();
+                    let (cid1, client1) = f.get_client();
+                    let (cid2, client2) = f.get_client();
 
                     // Enforce predictive yield delay from CircuitScorer
-                    let delay = f.scorer.yield_delay(cid);
+                    let delay = f.scorer.yield_delay(cid1);
                     if delay > std::time::Duration::ZERO {
                         tokio::time::sleep(delay).await;
                     }
@@ -190,12 +191,29 @@ impl CrawlerAdapter for AutoindexAdapter {
                     let start_time = std::time::Instant::now();
                     let mut bytes_downloaded = 0;
 
-                    // Fetch the HTML page
+                    // Phase 73: Speculative Dual-Circuit Tor GET Racing
+                    let req1 = Box::pin(async {
+                        let res = tokio::time::timeout(
+                            std::time::Duration::from_secs(45),
+                            client1.get(&next_url).send(),
+                        ).await;
+                        (cid1, res)
+                    });
+                    
+                    let req2 = Box::pin(async {
+                        let res = tokio::time::timeout(
+                            std::time::Duration::from_secs(45),
+                            client2.get(&next_url).send(),
+                        ).await;
+                        (cid2, res)
+                    });
+                    
+                    let (winner_cid, fetch_result) = match futures::future::select(req1, req2).await {
+                        futures::future::Either::Left((res, _)) => res,
+                        futures::future::Either::Right((res, _)) => res,
+                    };
+                    
                     let (mut fetch_success, mut html) = (false, None);
-                    let fetch_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(45),
-                        client.get(&next_url).send(),
-                    ).await;
 
                     match fetch_result {
                         Ok(Ok(resp)) => {
@@ -212,14 +230,14 @@ impl CrawlerAdapter for AutoindexAdapter {
                                     html = Some(body);
                                 }
                             } else if resp.status() == 404 {
-                                f.record_failure(cid);
+                                f.record_failure(winner_cid);
                                 pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                                 continue;
                             } else {
                                 if next_url.contains("lockbit") {
                                     println!("[DEBUG LOCKBIT] Fetch failed to {}, status: {}", next_url, resp.status());
                                 }
-                                f.record_failure(cid);
+                                f.record_failure(winner_cid);
                                 pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                                 continue;
                             }
@@ -239,9 +257,9 @@ impl CrawlerAdapter for AutoindexAdapter {
                     // Report to AIMD and CircuitScorer
                     let elapsed_ms = start_time.elapsed().as_millis() as u64;
                     if fetch_success {
-                        f.record_success(cid, bytes_downloaded, elapsed_ms);
+                        f.record_success(winner_cid, bytes_downloaded, elapsed_ms);
                     } else {
-                        f.record_failure(cid);
+                        f.record_failure(winner_cid);
                         pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         continue; // Move to next URL without aborting worker
                     }
@@ -311,7 +329,7 @@ impl CrawlerAdapter for AutoindexAdapter {
                             if nf.entry_type == EntryType::File && nf.size_bytes.is_none() {
                                 if let Ok(Ok(size_resp)) = tokio::time::timeout(
                                     std::time::Duration::from_secs(10),
-                                    client.get(&nf.raw_url).header("Range", "bytes=0-0").send(),
+                                    client1.get(&nf.raw_url).header("Range", "bytes=0-0").send(),
                                 )
                                 .await
                                 {

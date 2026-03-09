@@ -254,6 +254,7 @@ async fn run_single_adapter(
         agnostic_state: false,
         resume_index: None,
         mega_password: None,
+                stealth_ramp: true,
     };
     let daemon_count = if is_onion {
         active_ports.len().max(1)

@@ -190,9 +190,10 @@ impl CrawlerAdapter for LockBitAdapter {
                     };
 
                     let _permit = f.politeness_semaphore.acquire().await.ok();
-                    let (cid, client) = f.get_client();
+                    let (cid1, client1) = f.get_client();
+                    let (cid2, client2) = f.get_client();
 
-                    let delay = f.scorer.yield_delay(cid);
+                    let delay = f.scorer.yield_delay(cid1);
                     if delay > std::time::Duration::ZERO {
                         tokio::time::sleep(delay).await;
                     }
@@ -201,11 +202,29 @@ impl CrawlerAdapter for LockBitAdapter {
                     let (mut fetch_success, mut html) = (false, None);
                     let mut bytes_downloaded = 0;
 
-                    let fetch_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(45),
-                        client.get(&next_url).send(),
-                    )
-                    .await;
+                    // Phase 73: Speculative Dual-Circuit Tor GET Racing
+                    let req1 = Box::pin(async {
+                        let res = tokio::time::timeout(
+                            std::time::Duration::from_secs(45),
+                            client1.get(&next_url).send(),
+                        )
+                        .await;
+                        (cid1, res)
+                    });
+
+                    let req2 = Box::pin(async {
+                        let res = tokio::time::timeout(
+                            std::time::Duration::from_secs(45),
+                            client2.get(&next_url).send(),
+                        )
+                        .await;
+                        (cid2, res)
+                    });
+
+                    let (winner_cid, fetch_result) = match futures::future::select(req1, req2).await {
+                        futures::future::Either::Left((res, _pending)) => res,
+                        futures::future::Either::Right((res, _pending)) => res,
+                    };
 
                     match fetch_result {
                         Ok(Ok(resp)) => {
@@ -237,7 +256,7 @@ impl CrawlerAdapter for LockBitAdapter {
 
                     let elapsed_ms = start_time.elapsed().as_millis() as u64;
                     if fetch_success {
-                        f.record_success(cid, bytes_downloaded, elapsed_ms);
+                        f.record_success(winner_cid, bytes_downloaded, elapsed_ms);
                     }
 
                     let Some(html) = html else {
@@ -250,7 +269,14 @@ impl CrawlerAdapter for LockBitAdapter {
                         continue;
                     }
 
-                    let new_files = parse_lockbit_dom(&html, &next_url);
+                    // Phase 73: HFT DOM Deserialization & Pre-Heating over spawn_blocking
+                    let new_files = {
+                        let html_clone = html.clone();
+                        let next_url_clone = next_url.clone();
+                        tokio::task::spawn_blocking(move || parse_lockbit_dom(&html_clone, &next_url_clone))
+                            .await
+                            .unwrap_or_default()
+                    };
 
                     for file in &new_files {
                         let _ = ui_tx_clone.send(file.clone()).await;

@@ -1,5 +1,11 @@
 # Lessons Learned Whitepaper
 
+## 2026-03-09 (Phase 74E: Start Queue Renderer Stability)
+- Proto3 omits default scalar values in transport payloads; UI state that depends on numeric fields must decode with defaults or normalize missing values before render.
+- Transport frame objects are not safe drop-in replacements for React view state. Always merge sparse telemetry with prior state snapshots to preserve fields not present in the wire schema.
+- If dashboard cards call `.toFixed()` / `.toLocaleString()` on hot metrics, enforce numeric invariants in one centralized mapper instead of scattering null checks in render code.
+- Keep `npm run build` plus targeted component tests (`Dashboard.test.tsx`) as a mandatory gate for telemetry-layer changes; type checks alone cannot catch runtime `undefined` numeric method calls.
+
 ## 2026-03-07 (Phase 53: Azure Enterprise Integration)
 - Adding optional fields to structs like `AppState` must use `#[cfg(feature = "...")]` — not `Option<T>` — to ensure zero-cost abstraction when feature is disabled.
 - `#[serde(default)]` on new `TargetLedger` fields ensures backward compatibility with existing JSON ledger files.

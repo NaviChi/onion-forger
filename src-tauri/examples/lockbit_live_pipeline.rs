@@ -198,6 +198,7 @@ fn main() {
             resume: false,
             resume_index: None,
             mega_password: None,
+                stealth_ramp: true,
         };
 
         let daemon_count = active_ports.len().max(1);

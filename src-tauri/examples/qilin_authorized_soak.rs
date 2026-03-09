@@ -177,6 +177,7 @@ async fn main() -> Result<()> {
                 resume: false,
                 resume_index: None,
                 mega_password: None,
+                stealth_ramp: true,
             },
             output_dir.to_string_lossy().to_string(),
             app.handle().clone(),

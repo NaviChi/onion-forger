@@ -1253,6 +1253,7 @@ dependencies = [
  "chrono",
  "crossbeam-queue",
  "dashmap",
+ "fs-mistrust",
  "futures",
  "headless_chrome",
  "hex",

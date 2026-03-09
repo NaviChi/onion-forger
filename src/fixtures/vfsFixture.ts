@@ -85,7 +85,8 @@ export const FIXTURE_RESOURCE_METRICS = {
 export function isVfsFixtureMode(): boolean {
   if (typeof window === "undefined") return false;
   const params = new URLSearchParams(window.location.search);
-  return params.get("fixture") === "vfs";
+  const val = params.get("fixture");
+  return val === "vfs" || val === "download";
 }
 
 export function normalizeVfsPath(input: string): string {

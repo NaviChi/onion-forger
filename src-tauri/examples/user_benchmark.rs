@@ -22,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         resume: false,
         resume_index: None,
         mega_password: None,
+                stealth_ramp: true,
     };
 
     println!("Bootstrapping Tor cluster...");

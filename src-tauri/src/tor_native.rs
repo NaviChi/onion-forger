@@ -145,6 +145,10 @@ pub fn build_tor_config(node_index: usize) -> Result<TorClientConfig> {
         .state_dir(arti_client::config::CfgPath::new(
             state_dir.to_string_lossy().into_owned(),
         ));
+        
+    // Phase 74: Disable strict fs-mistrust to prevent permissions panics on MacOS /tmp dirs
+    config_builder.storage().permissions().dangerously_trust_everyone();
+
     config_builder.address_filter().allow_onion_addrs(true);
     config_builder
         .stream_timeouts()

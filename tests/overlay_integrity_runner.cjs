@@ -388,7 +388,16 @@ async function runOverlayIntegrity() {
               row.rootCause = `Selected option '${target.text || target.value}'.`;
             }
           } else {
-            await locator.click({ timeout: 5000, force: true });
+            try {
+              await locator.click({ timeout: 5000, force: true });
+            } catch (err) {
+              if (err.message && err.message.includes("outside of the viewport")) {
+                // Handle React-Virtual overscan items that are technically in DOM but offset outside bounds
+                await locator.evaluate((el) => el.click());
+              } else {
+                throw err;
+              }
+            }
             row.status = "PASS";
             row.rootCause = "Interaction executed.";
           }
@@ -457,8 +466,7 @@ async function runOverlayIntegrity() {
       const safeControl = (row.control || row.signature).replace(/\|/g, "/");
       const safeCause = (row.rootCause || "").replace(/\|/g, "/");
       reportLines.push(
-        `| ${idx + 1} | ${safeControl} | ${row.tag}${row.type ? `:${row.type}` : ""} | ${row.status} | ${
-          row.geometryUnchanged ? "UNCHANGED" : "SHIFTED"
+        `| ${idx + 1} | ${safeControl} | ${row.tag}${row.type ? `:${row.type}` : ""} | ${row.status} | ${row.geometryUnchanged ? "UNCHANGED" : "SHIFTED"
         } | ${safeCause} |`
       );
     });

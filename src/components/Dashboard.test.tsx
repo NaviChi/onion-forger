@@ -65,7 +65,8 @@ describe('Dashboard', () => {
             consensusWeight: 0
         },
         crawlRunStatus: null,
-        downloadResumePlan: null
+        downloadResumePlan: null,
+        ceilingStatus: { value: 0, direction: null, lastChange: null }
     };
 
     it('renders correctly in default state', () => {

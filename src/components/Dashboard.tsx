@@ -90,6 +90,12 @@ interface DashboardProps {
     plannedFileCount: number;
     failureManifestPath: string;
   } | null;
+  // Phase 74B: Adaptive ceiling status
+  ceilingStatus: {
+    value: number;
+    direction: 'DECAY' | 'RECOVERY' | null;
+    lastChange: number | null;
+  };
   onAzureClick?: () => void;
 }
 
@@ -108,6 +114,7 @@ export function Dashboard({
   resourceMetrics,
   crawlRunStatus,
   downloadResumePlan,
+  ceilingStatus = { value: 0, direction: null, lastChange: null },
   onAzureClick,
 }: DashboardProps) {
   let phase = "IDLE";
@@ -174,8 +181,8 @@ export function Dashboard({
     resourceMetrics.workerTarget > 0 ? resourceMetrics.activeWorkers : crawlStatus.activeWorkers;
   const effectiveWorkerTarget =
     resourceMetrics.workerTarget > 0 ? resourceMetrics.workerTarget : Math.max(crawlStatus.workerTarget, 1);
-  const currentListingName = crawlRunStatus?.stableCurrentListingPath.split(/[\\/]/).pop() || "";
-  const bestListingName = crawlRunStatus?.stableBestListingPath.split(/[\\/]/).pop() || "";
+  const currentListingName = crawlRunStatus?.stableCurrentListingPath?.split(/[\\/]/).pop() || "";
+  const bestListingName = crawlRunStatus?.stableBestListingPath?.split(/[\\/]/).pop() || "";
 
   if (isCrawling) {
     phase = "PROBING TARGET";
@@ -285,6 +292,20 @@ export function Dashboard({
           <div className="dash-sub" data-testid="resource-node-metrics" style={{ fontFamily: 'JetBrains Mono' }}>
             Node {resourceMetrics.currentNodeHost || "unresolved"} | Multi-Client Rotations {resourceMetrics.multiClientRotations || 0} (Pool: {resourceMetrics.multiClientCount || 0}) | 429/503 {resourceMetrics.throttleCount} | Timeouts {resourceMetrics.timeoutCount}
           </div>
+          {ceilingStatus?.value > 0 && (
+            <div className="dash-sub" data-testid="resource-ceiling-status" style={{ fontFamily: 'JetBrains Mono' }}>
+              <span style={{
+                color: ceilingStatus.direction === 'DECAY' ? '#ef4444'
+                  : ceilingStatus.direction === 'RECOVERY' ? '#10b981'
+                    : 'var(--text-muted)'
+              }}>
+                {ceilingStatus.direction === 'DECAY' ? '▼' : ceilingStatus.direction === 'RECOVERY' ? '▲' : '●'}
+              </span>
+              {' '}Adaptive Ceiling: {ceilingStatus.value}
+              {ceilingStatus.direction && ` (${ceilingStatus.direction})`}
+              {ceilingStatus.lastChange && ` [${Math.floor((Date.now() - ceilingStatus.lastChange) / 1000)}s ago]`}
+            </div>
+          )}
         </div>
       </div>
 

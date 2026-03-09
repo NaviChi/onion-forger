@@ -1,11 +1,12 @@
 # OnionForge: AI Engineering & Context Reference
-> **Last Updated:** 2026-03-08T23:39 CST
+> **Last Updated:** 2026-03-09T03:36 CST
 > **Version:** 2.3.0
 > **Authors:** Navi (User), Antigravity (AI)
 
 This document serves as the master blueprint for any AI agent tasked with maintaining, extending, or recreating the OnionForge intelligence gathering application. It contains all critical architectural decisions, environment constraints, GUI styling instructions, and API behavioral knowledge required to build this system from scratch without guessing.
 
 Current repo state note:
+- Phase 74E hardened frontend telemetry mapping: binary protobuf frames are now decoded with defaults and merged through normalization adapters before touching React state, preventing `Start Queue` renderer crashes from sparse proto3 payloads.
 - The synthetic Qilin benchmark in `src-tauri/examples/qilin_benchmark.rs` now completes fully in both clean and hostile profiles across the `12/24/36` circuit matrix.
 - Benchmark correctness depends on the sled VFS summary, and Qilin now waits for its UI/VFS batching path to drain before returning.
 - Native Arti healing defaults are intentionally tighter than the earlier Phase 43/46 baseline: shorter probe cadence, lower anomaly threshold outside VM mode, and faster phantom-pool replenishment.
@@ -185,4 +186,3 @@ Three-layer adaptive throttle system: (1) Per-worker 2s cool-off after 503/429, 
 **Prevention Rules:**
 - `PR-THROTTLE-001`: Per-worker cool-off required for rate-limited servers, not just queue-level backoff.
 - `PR-THROTTLE-002`: Governor re-escalation must be graduated (+1) during cooldown window, not full-speed (+4).
-

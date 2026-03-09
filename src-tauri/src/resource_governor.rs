@@ -148,18 +148,18 @@ pub fn recommended_concurrency_preset() -> SystemProfile {
         ("Balanced", 8, 8)
     } else if total_ram_gb <= 16.5 || profile.cpu_cores <= 8 {
         // Mid-range system
-        ("Balanced", 8, 8)
+        ("Aggressive", 16, 16)
     } else if total_ram_gb <= 32.5 || profile.cpu_cores <= 12 {
         // High-end Mac / desktop
-        ("Aggressive", 16, 16)
+        ("Maximum", 32, 32)
     } else {
         // Power workstation
-        ("Maximum", 24, 16)
+        ("Aerospace", 64, 64)
     };
 
-    // Windows additional constraint
+    // Windows additional constraint (just keep it as is, max 64 now)
     let (circuits, workers) = if cfg!(target_os = "windows") {
-        (circuits.min(16), workers.min(12))
+        (circuits.min(32), workers.min(32))
     } else {
         (circuits, workers)
     };

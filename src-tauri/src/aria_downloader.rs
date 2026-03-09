@@ -8,6 +8,26 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use std::fs::{self, File, OpenOptions};
+
+// Phase 41: Windows NT Kernel SetFileValidData zero-filling blocks override for immense payloads
+#[cfg(target_os = "windows")]
+fn preallocate_windows_nt_blocks(file: &std::fs::File, size: u64) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = file.as_raw_handle() as *mut std::ffi::c_void;
+    extern "system" {
+        fn SetFileValidData(hFile: *mut std::ffi::c_void, ValidDataLength: i64) -> i32;
+    }
+    file.set_len(size)?;
+    unsafe {
+        SetFileValidData(handle, size as i64);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn preallocate_windows_nt_blocks(file: &std::fs::File, size: u64) -> std::io::Result<()> {
+    file.set_len(size)
+}
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1927,7 +1947,7 @@ pub async fn start_download(
         )?;
         // Pre-allocate full file size to prevent fragmentation
         if range_mode && state.content_length > 0 {
-            file.set_len(state.content_length)?;
+            preallocate_windows_nt_blocks(&file, state.content_length)?;
             let _ = app.emit(
                 "log",
                 format!(
@@ -2020,7 +2040,7 @@ pub async fn start_download(
                     if let Some((st, _)) = &local_state {
                         if st.content_length > 0 {
                             // Phase 7: HFT Memory-Mapped Virtual Disk (HDD compatibility)
-                            let _ = file.set_len(st.content_length);
+                            let _ = preallocate_windows_nt_blocks(&file, st.content_length);
                             if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(&file) } {
                                 active_mmap = Some(m);
                             }

@@ -286,18 +286,38 @@ impl CrawlerAdapter for AlphaLockerAdapter {
 
                     // Retry loop with circuit rotation
                     for attempt in 0..4 {
-                        let (retry_cid, retry_client) = if attempt == 0 {
+                        let (retry_cid1, retry_client1) = if attempt == 0 {
                             (cid, client.clone())
                         } else {
                             f.get_client()
                         };
+                        let (retry_cid2, retry_client2) = f.get_client();
+                        
+                        let next_url_clone1 = next_url.clone();
+                        let next_url_clone2 = next_url.clone();
+                        
+                        let req1 = Box::pin(async move {
+                            let res = tokio::time::timeout(
+                                std::time::Duration::from_secs(45),
+                                retry_client1.get(&next_url_clone1).send(),
+                            ).await;
+                            (retry_cid1, res)
+                        });
+                        
+                        let req2 = Box::pin(async move {
+                            let res = tokio::time::timeout(
+                                std::time::Duration::from_secs(45),
+                                retry_client2.get(&next_url_clone2).send(),
+                            ).await;
+                            (retry_cid2, res)
+                        });
+                        
+                        let (winner_cid, fetch_result) = match futures::future::select(req1, req2).await {
+                            futures::future::Either::Left((res, _)) => res,
+                            futures::future::Either::Right((res, _)) => res,
+                        };
 
-                        if let Ok(Ok(resp)) = tokio::time::timeout(
-                            std::time::Duration::from_secs(45),
-                            retry_client.get(&next_url).send(),
-                        )
-                        .await
-                        {
+                        if let Ok(Ok(resp)) = fetch_result {
                             if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
                             {
                                 tokio::time::sleep(delay).await;
@@ -313,18 +333,18 @@ impl CrawlerAdapter for AlphaLockerAdapter {
                                     html = Some(body);
                                     fetch_success = true;
                                     f.record_success(
-                                        retry_cid,
+                                        winner_cid,
                                         bytes_downloaded,
                                         start_time.elapsed().as_millis() as u64,
                                     );
                                     break;
                                 }
                             } else if resp.status().as_u16() == 404 {
-                                f.record_failure(retry_cid);
+                                f.record_failure(winner_cid);
                                 break;
                             }
                         }
-                        f.record_failure(retry_cid);
+                        f.record_failure(winner_cid);
                     }
 
                     if !fetch_success {
@@ -342,10 +362,11 @@ impl CrawlerAdapter for AlphaLockerAdapter {
                         continue;
                     }
 
-                    // Parse off-thread
+                    // Parse off-thread Phase 73 HFT DOM Preheating
                     let base_url_clone = next_url.clone();
-                    let (spawned_entries,) = tokio::task::spawn_blocking(move || {
-                        (parse_alphalocker_listing(&html, &base_url_clone),)
+                    let html_clone = html.clone();
+                    let spawned_entries = tokio::task::spawn_blocking(move || {
+                        parse_alphalocker_listing(&html_clone, &base_url_clone)
                     })
                     .await
                     .unwrap_or_default();

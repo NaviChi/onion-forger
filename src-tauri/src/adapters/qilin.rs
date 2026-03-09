@@ -10,6 +10,21 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
+
+// Phase 73: MacOS Darwin kqueue non-blocking spinlocks
+#[inline(always)]
+async fn darwin_kqueue_spinlock(ms: u64) {
+    #[cfg(target_os = "macos")]
+    {
+        for _ in 0..ms {
+            tokio::task::yield_now().await;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
 #[derive(Default)]
 pub struct QilinAdapter;
 
@@ -84,7 +99,11 @@ impl QilinRoutePlan {
     }
 
     fn current_seed_url_sync(&self) -> String {
-        self.active_seed_url.blocking_read().clone()
+        // Use try_read to avoid panicking inside async runtime
+        match self.active_seed_url.try_read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => String::new(), // fallback: caller will retry
+        }
     }
 
     async fn failover_url(
@@ -361,6 +380,11 @@ struct QilinCrawlGovernor {
     circuit_request_count: [AtomicU64; 16],
     // Phase 67L: Per-circuit error count for health scoring
     circuit_error_count: [AtomicUsize; 16],
+    // Phase 74B: EWMA error-rate decay tracking
+    last_ewma_decay_epoch_ms: AtomicU64,
+    // Phase 74B: Ceiling change tracking for frontend logging
+    last_ceiling_change_epoch_ms: AtomicU64,
+    prev_ceiling_value: AtomicUsize,
     telemetry: Option<RuntimeTelemetry>,
 }
 
@@ -425,6 +449,9 @@ impl QilinCrawlGovernor {
             circuit_latency_sum_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             circuit_request_count: std::array::from_fn(|_| AtomicU64::new(0)),
             circuit_error_count: std::array::from_fn(|_| AtomicUsize::new(0)),
+            last_ewma_decay_epoch_ms: AtomicU64::new(0),
+            last_ceiling_change_epoch_ms: AtomicU64::new(0),
+            prev_ceiling_value: AtomicUsize::new(max_active),
             telemetry,
         }
     }
@@ -543,6 +570,141 @@ impl QilinCrawlGovernor {
             my_avg > best_avg.saturating_mul(18) / 10
         } else {
             false
+        }
+    }
+
+    /// Phase 74: Thompson Sampling circuit selection for smart work distribution.
+    /// Uses Box-Muller transform over per-circuit latency statistics to balance
+    /// exploitation (fast circuits) with exploration (untested circuits).
+    /// Returns (best_cid, thompson_score) — higher score = preferred circuit.
+    fn thompson_sample_circuit(&self) -> Option<(usize, f64)> {
+        let mut best: Option<(usize, f64)> = None;
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+
+        for i in 0..16 {
+            let count = self.circuit_request_count[i].load(Ordering::Relaxed);
+            if count == 0 {
+                // Untested circuits get infinite score (explore first)
+                return Some((i, f64::MAX));
+            }
+
+            let sum = self.circuit_latency_sum_ms[i].load(Ordering::Relaxed);
+            let errors = self.circuit_error_count[i].load(Ordering::Relaxed) as f64;
+            let avg_speed = count as f64 / (sum.max(1) as f64); // requests per ms (higher=faster)
+
+            // Penalize high-error circuits
+            let error_penalty = if count > 5 {
+                1.0 - (errors / (count as f64 + errors)).min(0.8)
+            } else {
+                1.0
+            };
+
+            // Box-Muller transform for Thompson Sampling: N(mean, variance)
+            let variance = if count >= 5 {
+                let mean_ms = sum as f64 / count as f64;
+                // Estimate variance from mean (heuristic for streaming data)
+                (mean_ms * 0.3).max(10.0)
+            } else {
+                500.0 // High variance = explore
+            };
+
+            let std_dev = variance.sqrt();
+            let u1 = (((now_nanos ^ (now_nanos >> 12) ^ (i as u128 * 7919)) % 10000) as f64 / 10000.0).max(0.0001);
+            let u2 = (((now_nanos ^ (now_nanos >> 20) ^ (i as u128 * 6271)) % 10000) as f64 / 10000.0).max(0.0001);
+            let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+
+            let score = (avg_speed + z0 * std_dev * 0.001) * error_penalty;
+
+            if best.is_none() || score > best.unwrap().1 {
+                best = Some((i, score));
+            }
+        }
+        best
+    }
+
+    /// Phase 74B: EWMA error-rate decay — reduces per-circuit error counts by 25%
+    /// every 30s so previously-bad circuits get second chances.
+    fn apply_ewma_error_decay(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last_decay = self.last_ewma_decay_epoch_ms.load(Ordering::Relaxed);
+
+        // Decay every 30 seconds
+        if now_ms.saturating_sub(last_decay) < 30_000 {
+            return;
+        }
+
+        // CAS to prevent multiple concurrent decays
+        if self.last_ewma_decay_epoch_ms
+            .compare_exchange(last_decay, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        // Apply 0.75 decay factor to all circuit error counts
+        for i in 0..16 {
+            let current = self.circuit_error_count[i].load(Ordering::Relaxed);
+            if current > 0 {
+                let decayed = (current * 3) / 4; // 75% retention = 25% decay
+                self.circuit_error_count[i].store(decayed, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Phase 74B: Adaptive circuit ceiling based on throttle rate.
+    /// Ramps down from max→half when 503 count exceeds threshold,
+    /// recovers aggressively (+4) after 60s cooldown.
+    /// Returns (new_ceiling, changed:bool) for frontend event logging.
+    fn adaptive_ceiling_update(&self) -> usize {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last_throttle = self.last_throttle_epoch_ms.load(Ordering::Relaxed);
+        let window_throttles = self.throttles_in_window.load(Ordering::Relaxed);
+        let current_ceiling = self.adaptive_ramp_ceiling.load(Ordering::Relaxed);
+
+        // Heavy throttle burst: >3 in 10s window → halve the ceiling
+        if window_throttles > 3 && now_ms.saturating_sub(last_throttle) < 10_000 {
+            let halved = (current_ceiling / 2).max(self.min_active);
+            if halved < current_ceiling {
+                self.adaptive_ramp_ceiling.store(halved, Ordering::Relaxed);
+                self.last_ceiling_change_epoch_ms.store(now_ms, Ordering::Relaxed);
+                self.prev_ceiling_value.store(current_ceiling, Ordering::Relaxed);
+            }
+            return halved;
+        }
+
+        // Phase 74B: Aggressive recovery — +4 per 60s since last throttle
+        if last_throttle > 0 && now_ms.saturating_sub(last_throttle) > 60_000 {
+            let recovered = (current_ceiling + 4).min(self.max_active);
+            if recovered > current_ceiling {
+                self.adaptive_ramp_ceiling.store(recovered, Ordering::Relaxed);
+                self.last_ceiling_change_epoch_ms.store(now_ms, Ordering::Relaxed);
+                self.prev_ceiling_value.store(current_ceiling, Ordering::Relaxed);
+            }
+            return recovered;
+        }
+
+        current_ceiling
+    }
+
+    /// Phase 74B: Check if ceiling changed since last query and return change info
+    fn ceiling_change_info(&self) -> Option<(usize, usize)> {
+        let prev = self.prev_ceiling_value.load(Ordering::Relaxed);
+        let current = self.adaptive_ramp_ceiling.load(Ordering::Relaxed);
+        if prev != current {
+            // Acknowledge the change
+            self.prev_ceiling_value.store(current, Ordering::Relaxed);
+            Some((prev, current))
+        } else {
+            None
         }
     }
 
@@ -681,11 +843,15 @@ impl QilinCrawlGovernor {
             .clamp(self.min_active, self.max_active);
         let pressure = pressure_budget.pressure.total_pressure;
 
-        let mut next = current.min(pressure_cap).max(self.min_active);
+        // Phase 74: Apply adaptive ceiling decay/recovery
+        let adaptive_cap = self.adaptive_ceiling_update();
+        let effective_cap = pressure_cap.min(adaptive_cap);
+
+        let mut next = current.min(effective_cap).max(self.min_active);
         if pressure >= 0.85 {
-            next = ((current * 2) / 3).max(self.min_active).min(pressure_cap);
+            next = ((current * 2) / 3).max(self.min_active).min(effective_cap);
         } else if pressure >= 0.70 {
-            next = ((current * 4) / 5).max(self.min_active).min(pressure_cap);
+            next = ((current * 4) / 5).max(self.min_active).min(effective_cap);
         } else if throttles > 0 || circuit_failures >= 2 {
             next = ((current * 2) / 3).max(self.min_active);
         } else if timeouts >= 3 && timeouts >= successes.max(1) {
@@ -1112,17 +1278,17 @@ impl CrawlerAdapter for QilinAdapter {
         });
 
         let reserve_for_downloads = frontier.active_options.download;
-        // Phase 67C: Use actual pool size instead of frontier.active_client_count() (which is 1).
-        // Compute the same value that multi_clients will have (env var override, capped at 8).
-        let governor_pool_size = std::env::var("CRAWLI_MULTI_CLIENTS")
+        // Phase 74: Separate governor worker pool size from TorClient multi_clients pool.
+        // Cap max_active at qilin_workers (e.g. 64) while multi_clients limits underlying Tor circuits.
+        let qilin_workers = std::env::var("CRAWLI_QILIN_WORKERS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            // Phase 67G: Raised cap from 8→16 for higher concurrency
-            .unwrap_or_else(|| frontier.active_options.circuits.unwrap_or(120).min(16))
-            .min(16)
+            .unwrap_or_else(|| frontier.active_options.circuits.unwrap_or(120).min(64))
+            .min(128)
             .max(1);
+            
         let governor = Arc::new(QilinCrawlGovernor::new(
-            governor_pool_size,
+            qilin_workers,
             reserve_for_downloads,
             telemetry.clone(),
         ));
@@ -1173,22 +1339,45 @@ impl CrawlerAdapter for QilinAdapter {
                     }
 
                     if let Some((next, pressure)) = governor.rebalance(pending_now) {
+                        // Phase 74B: Apply EWMA error decay during each rebalance
+                        governor.apply_ewma_error_decay();
+
                         let latency = governor.circuit_latency_summary();
                         let adaptive_to = governor.adaptive_timeout_secs();
+                        let ceiling = governor.adaptive_ramp_ceiling.load(Ordering::Relaxed);
+
+                        // Phase 74B: Emit ceiling change events to Tauri frontend
+                        if let Some((prev_ceil, new_ceil)) = governor.ceiling_change_info() {
+                            let direction = if new_ceil < prev_ceil { "DECAY" } else { "RECOVERY" };
+                            let _ = app.emit(
+                                "crawl_log",
+                                format!(
+                                    "[PHASE 74] Adaptive ceiling {}: {} → {} (throttle window={})",
+                                    direction, prev_ceil, new_ceil,
+                                    governor.throttles_in_window.load(Ordering::Relaxed)
+                                ),
+                            );
+                            println!(
+                                "[PHASE 74] Adaptive ceiling {}: {} → {} (throttle window={})",
+                                direction, prev_ceil, new_ceil,
+                                governor.throttles_in_window.load(Ordering::Relaxed)
+                            );
+                        }
+
                         let _ = app.emit(
                             "log",
                             format!(
-                                "[Qilin] Governor: workers={} pending={} in_flight={} pressure={:.2} entries={} timeout={}s latency=[{}]",
+                                "[Qilin] Governor: workers={} pending={} in_flight={} pressure={:.2} entries={} timeout={}s ceiling={} latency=[{}]",
                                 next, pending_now, in_flight, pressure,
                                 discovered_entries_gov.load(Ordering::Relaxed),
-                                adaptive_to, latency
+                                adaptive_to, ceiling, latency
                             ),
                         );
                         println!(
-                            "[Qilin] Governor: workers={} pending={} in_flight={} pressure={:.2} entries={} timeout={}s latency=[{}]",
+                            "[Qilin] Governor: workers={} pending={} in_flight={} pressure={:.2} entries={} timeout={}s ceiling={} latency=[{}]",
                             next, pending_now, in_flight, pressure,
                             discovered_entries_gov.load(Ordering::Relaxed),
-                            adaptive_to, latency
+                            adaptive_to, ceiling, latency
                         );
                     } else if idle_rounds == 0 {
                         // Phase 67E+F: Periodic progress with latency
@@ -1216,23 +1405,32 @@ impl CrawlerAdapter for QilinAdapter {
         // circuits_ceiling controls how many workers/circuits operate; pool size controls
         // how many actual TorClient instances are created. Creating 120 TorClients is catastrophic.
         let circuits_ceiling = frontier.active_options.circuits.unwrap_or(120);
+        
+        let qilin_workers = std::env::var("CRAWLI_QILIN_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| circuits_ceiling.min(64))
+            .min(128)
+            .max(1);
+
         let multi_clients = std::env::var("CRAWLI_MULTI_CLIENTS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            // Phase 67G: Raised cap from 8→16 for higher concurrency
-            .unwrap_or_else(|| circuits_ceiling.min(16))
-            .min(16)
+            // Phase 74: Cap at 8 TorClients normally to prevent Mac OS overload
+            .unwrap_or_else(|| circuits_ceiling.min(8))
+            .min(8)
             .max(1);
+
         let timer = crate::timer::CrawlTimer::new(app.clone());
         timer.emit_log(&format!(
-            "[Qilin] Bootstrapping MultiClientPool with {} TorClients (circuits_ceiling={})",
-            multi_clients, circuits_ceiling
+            "[Qilin] Bootstrapping MultiClientPool with {} TorClients (Multiplexing {} workers)",
+            multi_clients, qilin_workers
         ));
         let _ = app.emit(
             "log",
             format!(
-                "[Qilin] Bootstrapping MultiClientPool with {} TorClients (circuits_ceiling={})",
-                multi_clients, circuits_ceiling
+                "[Qilin] Bootstrapping MultiClientPool with {} TorClients (Multiplexing {} workers)",
+                multi_clients, qilin_workers
             ),
         );
         let multi_pool = Arc::new(
@@ -1247,14 +1445,20 @@ impl CrawlerAdapter for QilinAdapter {
             "[Qilin] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors..."
                 .to_string(),
         );
-        // Phase 67: Fire-and-Forget preheat — block only until FIRST client is hot,
-        // then spawn remaining warmups as background tasks.
+        // Phase 67/74: Fire-and-Forget lazily-evaluated preheat.
+        // Phase 67/74: Fire-and-Forget lazily-evaluated preheat.
+        // Spawns tasks to get_client() concurrently so lazy-booting unblocks setup.
+        // Lazy-loading 74: Only preheat the circuits we are actually about to use in max_concurrent
+        // (the starting target, e.g. 6), NOT the entire ceiling (16), to prevent massive 
+        // upfront network/CPU stalling during the initial scan wave.
         let mut preheats = Vec::new();
-        for i in 0..multi_clients {
-            let tor_arc = multi_pool.get_client(i).await;
-            let preheat_client = crate::arti_client::ArtiClient::new((*tor_arc).clone(), None);
+        let preheat_limit = std::cmp::min(multi_clients, max_concurrent.max(2));
+        for i in 0..preheat_limit {
+            let multi_pool_clone = multi_pool.clone();
             let target_heat_url = actual_seed_url.clone();
             preheats.push(tokio::spawn(async move {
+                let tor_arc = multi_pool_clone.get_client(i).await;
+                let preheat_client = crate::arti_client::ArtiClient::new((*tor_arc).clone(), None);
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(20),
                     preheat_client.get(&target_heat_url).send(),
@@ -1327,7 +1531,7 @@ impl CrawlerAdapter for QilinAdapter {
                             );
                             return;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        darwin_kqueue_spinlock(100).await;
                         slept += 100;
                     }
                     let current_workers = f.active_workers();
@@ -1395,7 +1599,7 @@ impl CrawlerAdapter for QilinAdapter {
                                             {
                                                 break;
                                             }
-                                            tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                                            darwin_kqueue_spinlock(idle_sleep_ms).await;
                                             idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                             continue;
                                         }
@@ -1417,7 +1621,7 @@ impl CrawlerAdapter for QilinAdapter {
                                     {
                                         break;
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                                    darwin_kqueue_spinlock(idle_sleep_ms).await;
                                     idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                     continue;
                                 }
@@ -1458,7 +1662,7 @@ impl CrawlerAdapter for QilinAdapter {
                                     {
                                         break;
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                                    darwin_kqueue_spinlock(idle_sleep_ms).await;
                                     idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                     continue;
                                 }
@@ -1469,7 +1673,7 @@ impl CrawlerAdapter for QilinAdapter {
                                 {
                                     break;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                                darwin_kqueue_spinlock(idle_sleep_ms).await;
                                 idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                 continue;
                             }
@@ -1495,7 +1699,7 @@ impl CrawlerAdapter for QilinAdapter {
                     };
                     let delay = f.scorer.yield_delay(cid);
                     if delay > std::time::Duration::ZERO {
-                        tokio::time::sleep(delay).await;
+                        darwin_kqueue_spinlock(delay.as_millis() as u64).await;
                     }
 
                     struct TaskGuard {
@@ -1533,23 +1737,28 @@ impl CrawlerAdapter for QilinAdapter {
                         );
                     }
 
-                    // Phase 67: Speculative dual-circuit GET racing — fire on 2 circuits, take fastest
+                    // Phase 67/74: Speculative dual-circuit GET racing — fire on 2 circuits, take fastest
+                    // Lazy-loading 74: Must ensure get_client() is strictly inside the async timeout block,
+                    // otherwise speculative fetching forces a sync block waiting for the new circuit.
                     let start_time = std::time::Instant::now();
                     let resp_result: Result<Result<crate::arti_client::ArtiResponse, anyhow::Error>, _> = if multi_clients >= 2 {
-                        // Build a speculative request on a different circuit
                         let adaptive_timeout = std::time::Duration::from_secs(crawl_governor.adaptive_timeout_secs());
                         let spec_cid = (worker_idx + 1) % multi_clients;
-                        let spec_tor = pool_clone.get_client(spec_cid).await;
-                        let spec_client = crate::arti_client::ArtiClient::new((*spec_tor).clone(), None);
+                        
+                        let p_clone = pool_clone.clone();
                         let spec_url = next_url.clone();
+                        
+                        let spec_fut = tokio::time::timeout(adaptive_timeout, async move {
+                            let spec_tor = p_clone.get_client(spec_cid).await;
+                            let spec_client = crate::arti_client::ArtiClient::new((*spec_tor).clone(), None);
+                            spec_client.get(&spec_url).send().await
+                        });
+
                         let primary_fut = tokio::time::timeout(
                             adaptive_timeout,
                             client.get(&next_url).send(),
                         );
-                        let spec_fut = tokio::time::timeout(
-                            adaptive_timeout,
-                            spec_client.get(&spec_url).send(),
-                        );
+                        
                         tokio::select! {
                             biased; // Prefer primary circuit
                             r = primary_fut => r,
@@ -1572,7 +1781,7 @@ impl CrawlerAdapter for QilinAdapter {
                         let status = resp.status();
 
                         if let Some(delay) = ddos.record_response(status.as_u16()) {
-                            tokio::time::sleep(delay).await;
+                            darwin_kqueue_spinlock(delay.as_millis() as u64).await;
                         }
 
                         effective_url = resp.url().as_str().to_string();
@@ -1580,16 +1789,23 @@ impl CrawlerAdapter for QilinAdapter {
                         if status.is_success() {
                             f.record_success(cid, 4096, elapsed_ms);
                             crawl_governor.record_success_with_latency(cid, elapsed_ms);
-                            // Phase 67I: Periodic circuit re-evaluation (every 20 requests)
+                            // Phase 74: Thompson Sampling circuit re-evaluation (every 20 requests)
                             worker_req_count += 1;
                             if worker_req_count % 20 == 0 && crawl_governor.should_repin(cid) {
-                                if let Some((best_cid, best_avg)) = crawl_governor.best_latency_circuit() {
-                                    let my_count = crawl_governor.circuit_request_count[cid].load(Ordering::Relaxed);
-                                    let my_avg = if my_count > 0 {
-                                        crawl_governor.circuit_latency_sum_ms[cid].load(Ordering::Relaxed) / my_count
-                                    } else { 0 };
-                                    println!("[Qilin Worker {}] Re-pinning: c{}({}ms) → c{}({}ms)", worker_idx, cid, my_avg, best_cid, best_avg);
-                                    worker_client = None; // Force re-evaluation on next iteration
+                                // Phase 74: Use Thompson Sampling for smarter circuit selection
+                                if let Some((thompson_cid, _score)) = crawl_governor.thompson_sample_circuit() {
+                                    if thompson_cid != cid {
+                                        let my_count = crawl_governor.circuit_request_count[cid].load(Ordering::Relaxed);
+                                        let my_avg = if my_count > 0 {
+                                            crawl_governor.circuit_latency_sum_ms[cid].load(Ordering::Relaxed) / my_count
+                                        } else { 0 };
+                                        let ts_count = crawl_governor.circuit_request_count[thompson_cid].load(Ordering::Relaxed);
+                                        let ts_avg = if ts_count > 0 {
+                                            crawl_governor.circuit_latency_sum_ms[thompson_cid].load(Ordering::Relaxed) / ts_count
+                                        } else { 0 };
+                                        println!("[Qilin Worker {}] Thompson re-pin: c{}({}ms) → c{}({}ms)", worker_idx, cid, my_avg, thompson_cid, ts_avg);
+                                        worker_client = None; // Force re-evaluation on next iteration
+                                    }
                                 }
                             }
                             // Phase 67: Offload UTF-8 conversion to spawn_blocking for large HTML pages
@@ -2171,7 +2387,7 @@ impl CrawlerAdapter for QilinAdapter {
                                     );
                                     return;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                darwin_kqueue_spinlock(100).await;
                                 slept += 100;
                             }
                             let current_workers = f.active_workers();
@@ -2236,7 +2452,7 @@ impl CrawlerAdapter for QilinAdapter {
                                                     {
                                                         break;
                                                     }
-                                                    tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                                                    darwin_kqueue_spinlock(idle_sleep_ms).await;
                                                     idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                                     continue;
                                                 }
@@ -2258,7 +2474,7 @@ impl CrawlerAdapter for QilinAdapter {
                                             {
                                                 break;
                                             }
-                                            tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                                            darwin_kqueue_spinlock(idle_sleep_ms).await;
                                             idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                             continue;
                                         }
@@ -2299,7 +2515,7 @@ impl CrawlerAdapter for QilinAdapter {
                                             {
                                                 break;
                                             }
-                                            tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                                            darwin_kqueue_spinlock(idle_sleep_ms).await;
                                             idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                             continue;
                                         }
@@ -2310,7 +2526,7 @@ impl CrawlerAdapter for QilinAdapter {
                                         {
                                             break;
                                         }
-                                        tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                                        darwin_kqueue_spinlock(idle_sleep_ms).await;
                                         idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 150);
                                         continue;
                                     }
@@ -2329,7 +2545,7 @@ impl CrawlerAdapter for QilinAdapter {
                             };
                             let delay = f.scorer.yield_delay(cid);
                             if delay > std::time::Duration::ZERO {
-                                tokio::time::sleep(delay).await;
+                                darwin_kqueue_spinlock(delay.as_millis() as u64).await;
                             }
 
                             struct TaskGuard {
@@ -2383,7 +2599,7 @@ impl CrawlerAdapter for QilinAdapter {
                                 let status = resp.status();
 
                                 if let Some(delay) = ddos.record_response(status.as_u16()) {
-                                    tokio::time::sleep(delay).await;
+                                    darwin_kqueue_spinlock(delay.as_millis() as u64).await;
                                 }
 
                                 effective_url = resp.url().as_str().to_string();
@@ -2391,11 +2607,15 @@ impl CrawlerAdapter for QilinAdapter {
                                 if status.is_success() {
                                     f.record_success(cid, 4096, elapsed_ms);
                                     crawl_governor.record_success_with_latency(cid, elapsed_ms);
-                                    // Phase 67I: Circuit re-evaluation in secondary loop
+                                    // Phase 74: Thompson Sampling in secondary loop
                                     worker_req_count += 1;
                                     if worker_req_count % 20 == 0 && crawl_governor.should_repin(cid) {
-                                        println!("[Qilin Worker] Secondary re-pin from c{}", cid);
-                                        worker_client = None;
+                                        if let Some((ts_cid, _)) = crawl_governor.thompson_sample_circuit() {
+                                            if ts_cid != cid {
+                                                println!("[Qilin Worker] Thompson secondary re-pin c{} → c{}", cid, ts_cid);
+                                                worker_client = None;
+                                            }
+                                        }
                                     }
                                     if let Ok(body) = resp.text().await {
                                         html = Some(body);
@@ -2915,6 +3135,9 @@ mod tests {
             circuit_error_count: std::array::from_fn(|_| AtomicUsize::new(0)),
             adaptive_ramp_ceiling: std::sync::Arc::new(AtomicUsize::new(12)),
             throttles_in_window: std::sync::Arc::new(AtomicUsize::new(0)),
+            last_ewma_decay_epoch_ms: AtomicU64::new(0),
+            last_ceiling_change_epoch_ms: AtomicU64::new(0),
+            prev_ceiling_value: AtomicUsize::new(12),
             telemetry: None,
         };
 

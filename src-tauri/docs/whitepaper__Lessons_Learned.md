@@ -19,3 +19,10 @@
 **Fix:** Separated `targets/<target_key>/` (metrics/logs) from physical `downloads/<target_key>/` and implemented human-readable `listing_windows.txt` exports so the user doesn't need to perform OS-level searches across thousands of JSON shards.
 **Prevention Rule:**
 * ALWAYS write target manifests sequentially to a deterministic folder. Use `target_key` hashing for safe routing.
+
+### Lesson 4: blocking_read Panics Inside Async Runtimes (Phase 74B)
+**Issue:** `tokio::sync::RwLock::blocking_read()` panics when called from within the tokio async runtime. This occurred in `QilinRoutePlan::current_seed_url_sync()` across 6 call sites, causing worker panics during 20-min soak tests.
+**Fix:** Replaced `blocking_read()` with `try_read()` + empty-string fallback. Since `current_seed_url_sync` is used for best-effort URL reads (the caller retries), an empty fallback on lock contention is safe.
+**Prevention Rule:**
+* NEVER use `blocking_read()` or `blocking_write()` from `tokio::sync::RwLock` inside async contexts. Always use `try_read()` / `try_write()` or the async `.read().await` / `.write().await` variants.
+* If the call site cannot be made async, use `try_read()` with a sensible fallback value.

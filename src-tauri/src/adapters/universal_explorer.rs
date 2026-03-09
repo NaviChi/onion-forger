@@ -220,23 +220,42 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
                 );
             }
 
-            let (cid, client) = frontier.get_client();
+            let (cid1, client1) = frontier.get_client();
+            let (cid2, client2) = frontier.get_client();
 
             // FIX H-4: Check body cache before fetching
+            // Phase 73: Speculative Dual-Circuit Tor GET Racing
             let body = if let Some(cached) = body_cache.remove(&link.url) {
                 Some(cached)
             } else {
-                // FIX H-3: Add telemetry
                 let start = std::time::Instant::now();
-                match client.get(&link.url).send().await {
+                let link_clone1 = link.url.clone();
+                let link_clone2 = link.url.clone();
+                
+                let req1 = Box::pin(async {
+                    let res = client1.get(&link_clone1).send().await;
+                    (cid1, res)
+                });
+                
+                let req2 = Box::pin(async {
+                    let res = client2.get(&link_clone2).send().await;
+                    (cid2, res)
+                });
+                
+                let (winner_cid, fetch_result) = match futures::future::select(req1, req2).await {
+                    futures::future::Either::Left((res, _)) => res,
+                    futures::future::Either::Right((res, _)) => res,
+                };
+
+                match fetch_result {
                     Ok(resp) => {
                         let text = resp.text().await.ok();
                         let len = text.as_ref().map(|t| t.len() as u64).unwrap_or(0);
-                        frontier.record_success(cid, len, start.elapsed().as_millis() as u64);
+                        frontier.record_success(winner_cid, len, start.elapsed().as_millis() as u64);
                         text
                     }
                     Err(_) => {
-                        frontier.record_failure(cid);
+                        frontier.record_failure(winner_cid);
                         None
                     }
                 }
@@ -251,26 +270,31 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
                     results.extend(entries);
                 }
 
-                // Extract children synchronously — Html is !Send
+                // Phase 73: HFT DOM Deserialization & Pre-Heating over spawn_blocking
                 let raw_children = {
-                    let document = Html::parse_document(&body);
-                    let selector = Selector::parse("a[href]").unwrap();
-                    let mut raw = Vec::new();
-                    for element in document.select(&selector) {
-                        if let Some(href) = element.value().attr("href") {
-                            if let Ok(full) = Url::parse(&link.url).and_then(|u| u.join(href)) {
-                                // FIX H-1: Hard domain boundary — reject off-host links
-                                let link_host = full.host_str().map(|h| h.to_string());
-                                if link_host != root_host {
-                                    continue;
+                    let body_clone = body.clone();
+                    let link_url_clone = link.url.clone();
+                    let root_host_clone = root_host.clone();
+                    
+                    tokio::task::spawn_blocking(move || {
+                        let document = Html::parse_document(&body_clone);
+                        let selector = Selector::parse("a[href]").unwrap();
+                        let mut raw = Vec::new();
+                        for element in document.select(&selector) {
+                            if let Some(href) = element.value().attr("href") {
+                                if let Ok(full) = Url::parse(&link_url_clone).and_then(|u| u.join(href)) {
+                                    // FIX H-1: Hard domain boundary — reject off-host links
+                                    let link_host = full.host_str().map(|h| h.to_string());
+                                    if link_host != root_host_clone {
+                                        continue;
+                                    }
+                                    let text: String = element.text().collect();
+                                    raw.push((full.to_string(), text));
                                 }
-                                let text: String = element.text().collect();
-                                raw.push((full.to_string(), text));
                             }
                         }
-                    }
-                    raw
-                    // `document` dropped here — safe for .await below
+                        raw
+                    }).await.unwrap_or_default()
                 };
 
                 // Score and deduplicate children

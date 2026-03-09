@@ -592,6 +592,10 @@ function App() {
   const perFileDownloadedBytesRef = useRef<Record<string, number>>({});
   const activeDownloadOutputDirRef = useRef("");
   const processedLogCountRef = useRef(0);
+  // Phase 74B: Adaptive ceiling tracking for Dashboard
+  const [ceilingStatus, setCeilingStatus] = useState<{ value: number; direction: 'DECAY' | 'RECOVERY' | null; lastChange: number | null }>({
+    value: 0, direction: null, lastChange: null
+  });
 
   const [crawlOptions, setCrawlOptions] = useState({
     listing: true,
@@ -749,6 +753,20 @@ function App() {
           const adapterMatch = payload.match(/Match found:\s*(.+)$/);
           if (adapterMatch && adapterMatch[1]) {
             setActiveAdapter(adapterMatch[1].trim());
+          }
+          // Phase 74B: Extract ceiling change events
+          const ceilingMatch = payload.match(/\[PHASE 74\] Adaptive ceiling (DECAY|RECOVERY): (\d+) → (\d+)/);
+          if (ceilingMatch) {
+            setCeilingStatus({
+              value: parseInt(ceilingMatch[3]),
+              direction: ceilingMatch[1] as 'DECAY' | 'RECOVERY',
+              lastChange: Date.now()
+            });
+          }
+          // Also extract ceiling= from governor logs
+          const govCeilingMatch = payload.match(/ceiling=(\d+)/);
+          if (govCeilingMatch && !ceilingMatch) {
+            setCeilingStatus(prev => ({ ...prev, value: parseInt(govCeilingMatch[1]) }));
           }
           setLogs((l) => [...l.slice(-399), `> ${payload}`]);
         })
@@ -1566,7 +1584,31 @@ function App() {
   });
 
   return (
-    <div className="app-container">
+    <div
+      className={`app-container ${isDragOver ? 'global-drag-active' : ''}`}
+      onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+          setIsDragOver(false);
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setIsDragOver(false);
+        const file = e.dataTransfer.files?.[0];
+        const textStr = e.dataTransfer.getData("text");
+        if (file && file.name.endsWith('.torrent')) {
+          setInputMode('torrent');
+          const path = (file as any).path || file.name;
+          setUrl(path);
+          setLogs((l) => [...l.slice(-399), `[SYSTEM] .torrent file loaded: ${path}`]);
+        } else if (textStr && textStr.trim().startsWith("magnet:?")) {
+          setInputMode('torrent');
+          setUrl(textStr.trim());
+          setLogs((l) => [...l.slice(-399), `[SYSTEM] Magnet link loaded: ${textStr.substring(0, 40)}...`]);
+        }
+      }}
+    >
       {/* Toast Manager Overlay */}
       <div className="toast-container">
         {toasts.map(t => (
@@ -1725,23 +1767,7 @@ function App() {
         </div>
       )}
 
-      <div
-        className={`url-bar ${isDragOver ? 'drag-over' : ''}`}
-        onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
-        onDragLeave={() => setIsDragOver(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setIsDragOver(false);
-          const file = e.dataTransfer.files[0];
-          if (file && file.name.endsWith('.torrent')) {
-            setInputMode('torrent');
-            // In Tauri, we get the real path; in browser context use the name
-            const path = (file as any).path || file.name;
-            setUrl(path);
-            setLogs((l) => [...l.slice(-399), `[SYSTEM] .torrent file dropped: ${path}`]);
-          }
-        }}
-      >
+      <div className="url-bar">
         <div className="input-group">
           <span className="input-label">
             {inputMode === "mega" ? "MEGA.NZ" : inputMode === "torrent" ? "TORRENT" : "Target Source"}
@@ -1966,11 +1992,13 @@ function App() {
               cursor: isCrawling ? 'not-allowed' : 'pointer'
             }}
           >
-            <option value="2">🔒 Stealth (2 Circuits){systemProfile?.preset === 'Stealth' ? ' ★' : ''}</option>
-            <option value="4">🛡️ Conservative (4 Circuits){systemProfile?.preset === 'Conservative' ? ' ★' : ''}</option>
-            <option value="8">⚡ Balanced (8 Circuits){systemProfile?.preset === 'Balanced' ? ' ★' : ''}</option>
-            <option value="16">🚀 Aggressive (16 Circuits){systemProfile?.preset === 'Aggressive' ? ' ★' : ''}</option>
-            <option value="24">💥 Maximum (24 Circuits){systemProfile?.preset === 'Maximum' ? ' ★' : ''}</option>
+            <option value="2">🔒 Stealth (2 Workers){systemProfile?.preset === 'Stealth' ? ' ★' : ''}</option>
+            <option value="4">🛡️ Conservative (4 Workers){systemProfile?.preset === 'Conservative' ? ' ★' : ''}</option>
+            <option value="8">⚡ Balanced (8 Workers){systemProfile?.preset === 'Balanced' ? ' ★' : ''}</option>
+            <option value="16">🚀 Aggressive (16 Workers){systemProfile?.preset === 'Aggressive' ? ' ★' : ''}</option>
+            <option value="32">💥 Maximum (32 Workers){systemProfile?.preset === 'Maximum' ? ' ★' : ''}</option>
+            <option value="64">💀 Aerospace (64 Workers){systemProfile?.preset === 'Aerospace' ? ' ★' : ''}</option>
+            <option value="128">💀💀 Aerospace+ (128 Workers){systemProfile?.preset === 'Aerospace+' ? ' ★' : ''}</option>
           </select>
           {systemProfile && (
             <span
@@ -1999,6 +2027,7 @@ function App() {
         resourceMetrics={resourceMetrics}
         crawlRunStatus={lastCrawlResult}
         downloadResumePlan={downloadResumePlan}
+        ceilingStatus={ceilingStatus}
         onAzureClick={() => setShowAzureModal(true)}
       />
 

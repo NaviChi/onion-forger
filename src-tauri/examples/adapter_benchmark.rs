@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
         resume: false,
         resume_index: None,
         mega_password: None,
+                stealth_ramp: true,
     };
 
     println!("Initializing Tor & Crawler components...");

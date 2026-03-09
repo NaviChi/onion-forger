@@ -44,8 +44,8 @@ test.describe('Crawli React Application', () => {
         await expect(page.getByTestId('resource-metrics-card')).toBeVisible();
         await expect(page.getByTestId('resource-process-cpu')).toContainText('CPU 18.4%');
         await expect(page.getByTestId('resource-process-memory')).toContainText('RSS 412.0 MB');
-        await expect(page.getByTestId('resource-worker-metrics')).toContainText('Workers 6/12');
-        await expect(page.getByTestId('resource-node-metrics')).toContainText('fixture-storage-primary.onion');
+        await expect(page.getByTestId('resource-worker-metrics')).toContainText('Vanguard: Active (Heatmap Enabled) | Circuits 9/12');
+        await expect(page.getByTestId('resource-node-metrics')).toContainText('192.168.1.100');
     });
 
 });
