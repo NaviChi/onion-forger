@@ -1,5 +1,18 @@
 > **Last Updated:** 2026-03-10T06:00 CDT
 
+## Phase 96: Windows Portable CLI Audit + Dedicated Console Binary (2026-03-10)
+Implemented in this pass:
+- **`src-tauri/src/bin/crawli_cli.rs`:** Added a dedicated console binary that calls `crawli_lib::run_cli()` and bypasses the Windows GUI-subsystem problem for terminal operators.
+- **`src-tauri/src/cli.rs` + `src-tauri/src/lib.rs`:** Refactored CLI startup so the shared parser/dispatcher can be invoked from both the GUI-aware main binary and the dedicated CLI binary without duplicating backend logic.
+- **Windows release workflows:** Updated both `.github/workflows/release.yml` and `.github/workflows/release-windows-portable.yml` to build `crawli-cli.exe`, package it next to `crawli.exe`, and include `crawli-cli.cmd` plus a portable README.
+
+Validated behavior:
+- `cargo check --manifest-path 'crawli/src-tauri/Cargo.toml' --bin crawli-cli`
+- `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' --lib cli::tests`
+- `cargo build --manifest-path 'crawli/src-tauri/Cargo.toml' --bin crawli-cli`
+- `./crawli/src-tauri/target/debug/crawli-cli --help`
+- `./crawli/src-tauri/target/debug/crawli-cli detect-input-mode --input 'https://proof.ovh.net/files/10Gb.dat' --compact-json`
+
 ## Phase 86C: Arti Hot-Start + Hinted Warmup Bypass (2026-03-10)
 Implemented in this pass:
 - `src-tauri/src/multi_client_pool.rs` now seeds Qilin/DragonForce follow-on pools from already-hot Arti swarm clients and derives additional slots from isolated handles instead of cold-bootstrapping a second pool.

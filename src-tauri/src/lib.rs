@@ -2525,6 +2525,11 @@ pub fn run() {
     run_gui();
 }
 
+pub fn run_cli() {
+    install_runtime_prereqs();
+    std::process::exit(cli::run_cli_from_env());
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

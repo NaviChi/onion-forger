@@ -1,3 +1,18 @@
+## Phase 96: Windows Portable CLI Audit + Dedicated Console Binary
+- **Date**: 2026-03-10
+- **Action**: Audited the shipped Windows portable artifact after operator reports that CLI commands did not work. Added a dedicated console binary (`crawli-cli`) plus portable packaging changes so Windows terminal usage no longer depends on the GUI-subsystem `crawli.exe`.
+- **Validation Commands**:
+  - `cargo check --manifest-path 'crawli/src-tauri/Cargo.toml' --bin crawli-cli`
+  - `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' --lib cli::tests`
+  - `cargo build --manifest-path 'crawli/src-tauri/Cargo.toml' --bin crawli-cli`
+  - `./crawli/src-tauri/target/debug/crawli-cli --help`
+  - `./crawli/src-tauri/target/debug/crawli-cli detect-input-mode --input 'https://proof.ovh.net/files/10Gb.dat' --compact-json`
+- **Result**:
+  - Root cause was confirmed in code and packaging: `src-tauri/src/main.rs` builds `crawli.exe` with `windows_subsystem = "windows"`, and the portable workflow only copied `crawli.exe` into the release zip.
+  - The new dedicated console binary now boots the same shared backend CLI surface through `crawli_lib::run_cli()` and prints normal terminal help/output.
+  - Local smoke validation succeeded: `crawli-cli --help` printed the full command catalog and `detect-input-mode` returned `{"input":"https://proof.ovh.net/files/10Gb.dat","mode":"direct"}`.
+  - Windows portable packaging now builds and copies `crawli-cli.exe`, a `crawli-cli.cmd` wrapper, and `README.txt` in addition to the GUI `crawli.exe`.
+
 
 ## Phase 95: Clearnet Direct-File Audit + Direct Mode Fix
 - **Date**: 2026-03-10

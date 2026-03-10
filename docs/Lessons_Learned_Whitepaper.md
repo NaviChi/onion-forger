@@ -1,5 +1,10 @@
 # Lessons Learned Whitepaper
 
+## 2026-03-10 (Phase 96: Windows Portable CLI Audit + Dedicated Console Binary)
+- **PR-CLI-WIN-096-001:** Do not ship a Windows portable artifact with only the GUI-subsystem executable when the product promises CLI support. A console-facing surface must be packaged as a dedicated console binary (`crawli-cli.exe`) or terminal use will appear broken even though the shared backend CLI code exists.
+- **PR-CLI-WIN-096-002:** Windows portable packages should include an explicit operator affordance for terminal use. Shipping `crawli-cli.cmd` and a portable README is cheap and prevents the operator from guessing whether `crawli.exe` or the console binary is the correct surface.
+- **LESSON-CLI-WIN-096-001:** The main binary’s runtime CLI dispatch was not the bug. The failure was packaging plus subsystem choice: `crawli.exe` was built as a Windows GUI binary, so the operator saw “commands do not work” even though `cli::try_run_from_env()` was wired correctly.
+
 ## 2026-03-10 (Phase 95: Clearnet Direct-File Audit + Direct Mode Fix)
 - **PR-DIRECT-095-001:** Do not classify every non-MEGA/non-torrent target as `onion`. URL mode detection must inspect the hostname, not just fall through to an onion default, or clearnet archives get misrouted before download policy even starts.
 - **PR-DIRECT-095-002:** Clearnet direct-download policy must stay separate from onion policy. The March 10, 2026 direct benchmark improved only after the clearnet path stopped inheriting onion-era handshake culling and excessive first-wave fan-out.

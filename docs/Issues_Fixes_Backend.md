@@ -22,6 +22,22 @@
   - the old `~55s` `storage resolved -> first circuit hot` delay was eliminated
   - residual blockers became root durability and phantom-pool depletion, not fingerprinting or second-pool bootstrap
 
+## Phase 96: Windows Portable CLI Audit + Dedicated Console Binary (2026-03-10)
+
+### Issues Found
+1. **Windows Portable Shipped Only `crawli.exe`** — the release workflows packaged the GUI-subsystem executable only, even though the backend had a valid shared CLI path.
+2. **Operator-Facing CLI Looked Broken on Windows** — `src-tauri/src/main.rs` deliberately marks the main binary with `windows_subsystem = "windows"`, which is correct for GUI launch but not a reliable terminal-facing surface.
+3. **Portable Package Had No Explicit CLI Surface** — there was no `crawli-cli.exe`, no wrapper, and no README clarifying which executable should be used from PowerShell/cmd.
+
+### Fixes Implemented
+1. **Dedicated Console Binary** in `src-tauri/src/bin/crawli_cli.rs` — added a separate `crawli-cli` target that calls `crawli_lib::run_cli()`.
+2. **Shared CLI Entry Helper** in `src-tauri/src/cli.rs` / `src-tauri/src/lib.rs` — extracted reusable CLI startup so both the GUI-aware main binary and the console binary share the same dispatcher and backend logic.
+3. **Portable Packaging Repair** in `.github/workflows/release.yml` and `.github/workflows/release-windows-portable.yml` — Windows releases now build and copy `crawli-cli.exe`, `crawli-cli.cmd`, and `README.txt` alongside `crawli.exe`.
+
+### Prevention Rules
+- **P96-1:** If Windows GUI and CLI modes share a codebase, ship them as separate operator-facing binaries unless console attachment is deliberately engineered and validated.
+- **P96-2:** Portable archives must tell the operator which executable is GUI and which is CLI. Do not make CLI discovery implicit.
+
 ## Phase 84: Qilin Frontier Telemetry Alignment + Compact CLI Summary + Live GUI Parity (2026-03-10)
 
 ### Issues Found

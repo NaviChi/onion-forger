@@ -338,12 +338,7 @@ impl From<InitiateDownloadArgs> for crate::DownloadArgs {
 }
 
 #[cfg(not(test))]
-pub(crate) fn try_run_from_env() -> Option<i32> {
-    let args = std::env::args().collect::<Vec<_>>();
-    if !should_run_cli_mode(&args) {
-        return None;
-    }
-
+fn parse_and_run_cli_args(args: Vec<String>) -> i32 {
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(err) => {
@@ -352,7 +347,7 @@ pub(crate) fn try_run_from_env() -> Option<i32> {
                 _ => 2,
             };
             let _ = err.print();
-            return Some(exit_code);
+            return exit_code;
         }
     };
 
@@ -360,16 +355,37 @@ pub(crate) fn try_run_from_env() -> Option<i32> {
         let mut cmd = Cli::command();
         let _ = cmd.print_help();
         println!();
-        return Some(0);
+        return 0;
     }
 
-    Some(match run_cli(cli) {
+    match run_cli(cli) {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("CLI error: {err}");
             1
         }
-    })
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn try_run_from_env() -> Option<i32> {
+    let args = std::env::args().collect::<Vec<_>>();
+    if !should_run_cli_mode(&args) {
+        return None;
+    }
+
+    Some(parse_and_run_cli_args(args))
+}
+
+#[cfg(not(test))]
+pub(crate) fn run_cli_from_env() -> i32 {
+    let args = std::env::args().collect::<Vec<_>>();
+    parse_and_run_cli_args(args)
+}
+
+#[cfg(test)]
+pub(crate) fn run_cli_from_env() -> i32 {
+    0
 }
 
 #[cfg(test)]
