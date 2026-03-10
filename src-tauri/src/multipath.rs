@@ -152,7 +152,13 @@ pub async fn multipath_download(
     let bbr = Arc::new(BbrController::new(num_circuits.min(8), num_circuits));
 
     let clients_state: Vec<crate::tor_native::SharedTorClient> = {
-        if let Some(guard) = app.state::<crate::AppState>().download_swarm_guard.lock().await.as_ref() {
+        if let Some(guard) = app
+            .state::<crate::AppState>()
+            .download_swarm_guard
+            .lock()
+            .await
+            .as_ref()
+        {
             guard.lock().await.get_arti_clients()
         } else {
             Vec::new()

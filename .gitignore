@@ -34,3 +34,11 @@ dist-ssr
 # Generated crawl indices
 src-tauri/crawl_index_*.txt
 tmp/
+
+# Database artifacts
+*.sqlite
+*.sqlite-*
+*.db
+*.db-shm
+*.db-wal
+*.journal

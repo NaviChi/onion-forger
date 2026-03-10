@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::{OnceLock, RwLock as StdRwLock};
 use std::time::Instant;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tor_rtcompat::PreferredRuntime;
@@ -32,14 +32,20 @@ const HEALTH_PROBE_INTERVAL_SECS: u64 = 15;
 const HEALTH_PROBE_TIMEOUT_SECS: u64 = 20;
 const MAX_CONSECUTIVE_PROBE_ANOMALIES: u8 = 3;
 const PHANTOM_POOL_BOOTSTRAP_DELAY_SECS: u64 = 10;
-const PHANTOM_POOL_REPLENISH_INTERVAL_SECS: u64 = 20;
+// Phase 76 PR-PHANTOM-POOL-002: Replenish must be ≤10s under active crawling
+const PHANTOM_POOL_REPLENISH_INTERVAL_SECS: u64 = 8;
+const DEFAULT_PHANTOM_POOL_SIZE: usize = 4;
 const MEMORY_MONITOR_WARMUP_DELAY_SECS: u64 = 30;
 const MEMORY_MONITOR_INTERVAL_SECS: u64 = 20;
-const DEFAULT_ARTI_CONNECT_TIMEOUT_SECS: u64 = 15;
-const DEFAULT_ARTI_REQUEST_TIMEOUT_SECS: u64 = 35;
+// Phase 76D: Increased from 15→30 to accommodate v3 HS rendezvous cold-start latency.
+// First-time HS descriptor fetch + intro-point negotiation + rendezvous circuit build
+// routinely takes 20-45s. The old 15s timeout caused false "Connect" failures.
+const DEFAULT_ARTI_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_ARTI_REQUEST_TIMEOUT_SECS: u64 = 45;
 const DEFAULT_ARTI_REQUEST_MAX_RETRIES: u32 = 8;
-const DEFAULT_ARTI_HS_DESC_FETCH_ATTEMPTS: u32 = 5;
-const DEFAULT_ARTI_HS_INTRO_REND_ATTEMPTS: u32 = 5;
+// Phase 76D: Bumped from 5→7 — allows more HS directory authority retries
+const DEFAULT_ARTI_HS_DESC_FETCH_ATTEMPTS: u32 = 7;
+const DEFAULT_ARTI_HS_INTRO_REND_ATTEMPTS: u32 = 7;
 const DEFAULT_ARTI_PREEMPTIVE_THRESHOLD: usize = 6;
 const DEFAULT_ARTI_PREEMPTIVE_MIN_EXIT_CIRCS: usize = 1;
 const DEFAULT_ARTI_PREEMPTIVE_PREDICTION_LIFETIME_SECS: u64 = 20 * 60;
@@ -145,9 +151,12 @@ pub fn build_tor_config(node_index: usize) -> Result<TorClientConfig> {
         .state_dir(arti_client::config::CfgPath::new(
             state_dir.to_string_lossy().into_owned(),
         ));
-        
+
     // Phase 74: Disable strict fs-mistrust to prevent permissions panics on MacOS /tmp dirs
-    config_builder.storage().permissions().dangerously_trust_everyone();
+    config_builder
+        .storage()
+        .permissions()
+        .dangerously_trust_everyone();
 
     config_builder.address_filter().allow_onion_addrs(true);
     config_builder
@@ -373,12 +382,21 @@ async fn install_client(
     isolation_cache.write().unwrap().clear();
 }
 
-fn health_probe_target() -> (String, u16) {
+fn default_health_probe_host(traffic_class: crate::tor::SwarmTrafficClass) -> &'static str {
+    match traffic_class {
+        crate::tor::SwarmTrafficClass::OnionService => "none",
+        crate::tor::SwarmTrafficClass::Mixed | crate::tor::SwarmTrafficClass::Clearnet => {
+            DEFAULT_HEALTH_PROBE_HOST
+        }
+    }
+}
+
+fn health_probe_target(traffic_class: crate::tor::SwarmTrafficClass) -> (String, u16) {
     let host = std::env::var("CRAWLI_TOR_HEALTH_PROBE_HOST")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_HEALTH_PROBE_HOST.to_string());
+        .unwrap_or_else(|| default_health_probe_host(traffic_class).to_string());
     let port = std::env::var("CRAWLI_TOR_HEALTH_PROBE_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
@@ -395,13 +413,10 @@ async fn probe_client_connectivity(
     if probe_host.eq_ignore_ascii_case("none") {
         return Ok(10.0);
     }
-    let mut prefs = arti_client::StreamPrefs::new();
-    prefs.connect_to_onion_services(arti_client::config::BoolOrAuto::Explicit(true));
-
     let started = Instant::now();
     match tokio::time::timeout(
         std::time::Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECS),
-        tor_client.connect_with_prefs((probe_host.to_string(), probe_port), &prefs),
+        tor_client.connect((probe_host.to_string(), probe_port)),
     )
     .await
     {
@@ -422,9 +437,28 @@ fn should_rotate_on_onion_connect_error(error_text: &str) -> bool {
         || error_text.contains("operation timed out")
 }
 
+fn take_live_isolated_replacement(
+    node_idx: usize,
+    live_clients: &Arc<StdRwLock<Vec<SharedTorClient>>>,
+) -> Option<(usize, Arc<TorClient<PreferredRuntime>>)> {
+    let candidate_slot = {
+        let slots = live_clients.read().unwrap();
+        slots
+            .iter()
+            .enumerate()
+            .find(|(idx, _)| *idx != node_idx)
+            .or_else(|| slots.get(node_idx).map(|slot| (node_idx, slot)))
+            .or_else(|| slots.first().map(|slot| (0, slot)))
+            .map(|(idx, slot)| (idx, slot.clone()))
+    }?;
+    let live_client = candidate_slot.1.read().unwrap().clone();
+    Some((candidate_slot.0, Arc::new(live_client.isolated_client())))
+}
+
 async fn take_phantom_or_bootstrap(
     node_idx: usize,
     phantom_pool: &Arc<StdRwLock<Vec<Arc<TorClient<PreferredRuntime>>>>>,
+    live_clients: Option<&Arc<StdRwLock<Vec<SharedTorClient>>>>,
     is_vm: bool,
 ) -> Result<Arc<TorClient<PreferredRuntime>>> {
     {
@@ -436,6 +470,18 @@ async fn take_phantom_or_bootstrap(
                 pool.len()
             );
             return Ok(phantom);
+        }
+    }
+
+    if let Some(live_clients) = live_clients {
+        if let Some((source_idx, replacement)) =
+            take_live_isolated_replacement(node_idx, live_clients)
+        {
+            eprintln!(
+                "[Aerospace Healing] Circuit {} replenished from live client slot {} while phantom pool rebuilds.",
+                node_idx, source_idx
+            );
+            return Ok(replacement);
         }
     }
 
@@ -510,8 +556,13 @@ impl ArtiSwarm {
             }
             (clients[target_idx].clone(), caches[target_idx].clone())
         };
-        let replacement =
-            take_phantom_or_bootstrap(target_idx, &self.phantom_pool, self.is_vm).await?;
+        let replacement = take_phantom_or_bootstrap(
+            target_idx,
+            &self.phantom_pool,
+            Some(&self.clients),
+            self.is_vm,
+        )
+        .await?;
         install_client(&client_slot, &isolation_cache, replacement).await;
         Ok(())
     }
@@ -748,7 +799,6 @@ async fn handle_socks_connection(
     let mut tor_stream = None;
     for attempt in 1..=max_retries {
         let mut prefs = arti_client::StreamPrefs::new();
-        prefs.connect_to_onion_services(arti_client::config::BoolOrAuto::Explicit(true));
         if let Some(token) = isolation_token {
             prefs.set_isolation(token);
         }
@@ -868,7 +918,8 @@ fn spawn_health_monitor(
                         Ok(rtt_ms) => {
                             let baseline_ms = circuit.latency_kalman.predict();
                             let predicted_ms = circuit.latency_kalman.update(rtt_ms);
-                            let is_slow = baseline_ms > 0.0 && rtt_ms > baseline_ms * drift_multiplier;
+                            let is_slow =
+                                baseline_ms > 0.0 && rtt_ms > baseline_ms * drift_multiplier;
 
                             if is_slow {
                                 circuit.anomaly_streak = circuit.anomaly_streak.saturating_add(1);
@@ -906,7 +957,7 @@ fn spawn_health_monitor(
             }
 
             for (idx, client_slot, isolation_cache) in degraded {
-                match take_phantom_or_bootstrap(idx, &phantom_pool, is_vm).await {
+                match take_phantom_or_bootstrap(idx, &phantom_pool, Some(&clients), is_vm).await {
                     Ok(replacement) => {
                         install_client(&client_slot, &isolation_cache, replacement).await;
                     }
@@ -1088,6 +1139,21 @@ pub async fn bootstrap_arti_cluster(
     daemon_count: usize,
     node_offset: usize,
 ) -> Result<(ArtiSwarm, Vec<u16>)> {
+    bootstrap_arti_cluster_for_traffic(
+        app,
+        daemon_count,
+        node_offset,
+        crate::tor::SwarmTrafficClass::Mixed,
+    )
+    .await
+}
+
+pub async fn bootstrap_arti_cluster_for_traffic(
+    app: AppHandle,
+    daemon_count: usize,
+    node_offset: usize,
+    traffic_class: crate::tor::SwarmTrafficClass,
+) -> Result<(ArtiSwarm, Vec<u16>)> {
     let requested = daemon_count.max(1);
     let governor_profile = crate::resource_governor::detect_profile(None);
     // PR-CRAWLER-016: Do not hardcode daemon instantiation. Respect user requested concurrency
@@ -1095,7 +1161,7 @@ pub async fn bootstrap_arti_cluster(
     let target = requested.min(governor_profile.recommended_arti_cap).max(1);
     let min_ready = (target / 2).max(1);
     let is_vm = detect_vm_environment();
-    let (probe_host, probe_port) = health_probe_target();
+    let (probe_host, probe_port) = health_probe_target(traffic_class);
     let shutdown = Arc::new(AtomicBool::new(false));
     let owner_id = NEXT_SWARM_ID.fetch_add(1, Ordering::Relaxed);
     let started_at = Instant::now();
@@ -1105,22 +1171,28 @@ pub async fn bootstrap_arti_cluster(
         crate::tor::TorStatusEvent {
             state: "starting".to_string(),
             message: format!(
-                "Bootstrapping {} native arti Tor circuits via {} runtime (ready quorum {}/{})...",
+                "Bootstrapping {} native arti Tor circuits via {} runtime (ready quorum {}/{}, traffic={:?})...",
                 target,
                 runtime_label(),
                 min_ready,
                 requested,
+                traffic_class,
             ),
             daemon_count: target,
             ports: vec![],
+            runtime: Some(runtime_label().to_string()),
+            traffic_class: Some(format!("{traffic_class:?}")),
+            ready_clients: Some(0),
+            managed_port_count: Some(0),
+            health_probe_target: Some(format!("{}:{}", probe_host, probe_port)),
         },
     );
 
     let timer = crate::timer::CrawlTimer::new(app.clone());
 
     timer.emit_log(&format!(
-        "[Tor Swarm] Phase 43B: Native arti engine ({}) . target={} quorum={} requested={}. Health probe: {}:{}. VM mode: {}",
-        runtime_label(), target, min_ready, requested, probe_host, probe_port, is_vm
+        "[Tor Swarm] Phase 43B: Native arti engine ({}) . target={} quorum={} requested={} traffic={:?}. Health probe: {}:{}. VM mode: {}",
+        runtime_label(), target, min_ready, requested, traffic_class, probe_host, probe_port, is_vm
     ));
     timer.emit_log(&format!(
         "[Tor Swarm] Governor Profile: cpu={} total={}GiB avail={}GiB (Class: {}) Target Rec={} Direct IO={}",
@@ -1141,7 +1213,8 @@ pub async fn bootstrap_arti_cluster(
     for i in 0..target {
         let vm = is_vm;
         let global_node_idx = node_offset + i;
-        client_futures.spawn(async move { (global_node_idx, spawn_tor_node(global_node_idx, vm).await) });
+        client_futures
+            .spawn(async move { (global_node_idx, spawn_tor_node(global_node_idx, vm).await) });
     }
 
     while clients_count.load(Ordering::Relaxed) < min_ready {
@@ -1157,7 +1230,8 @@ pub async fn bootstrap_arti_cluster(
                     &clients_count,
                 );
                 timer.emit_log(&format!(
-                    "[Tor Swarm] Node {} built directory consensus and is online.", idx
+                    "[Tor Swarm] Node {} built directory consensus and is online.",
+                    idx
                 ));
             }
             Some(Ok((_idx, Err(e)))) => eprintln!("Arti node failed to create: {}", e),
@@ -1183,6 +1257,15 @@ pub async fn bootstrap_arti_cluster(
     );
 
     let ready_ports = socks_ports_arc.read().unwrap().clone();
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        state.telemetry.set_swarm_metrics(
+            runtime_label(),
+            traffic_class,
+            clients_count.load(Ordering::Relaxed),
+            ready_ports.len(),
+            format!("{}:{}", probe_host, probe_port),
+        );
+    }
 
     let _ = app.emit(
         "tor_status",
@@ -1195,6 +1278,11 @@ pub async fn bootstrap_arti_cluster(
             ),
             daemon_count: clients_count.load(Ordering::Relaxed),
             ports: ready_ports.clone(),
+            runtime: Some(runtime_label().to_string()),
+            traffic_class: Some(format!("{traffic_class:?}")),
+            ready_clients: Some(clients_count.load(Ordering::Relaxed)),
+            managed_port_count: Some(ready_ports.len()),
+            health_probe_target: Some(format!("{}:{}", probe_host, probe_port)),
         },
     );
 
@@ -1217,13 +1305,17 @@ pub async fn bootstrap_arti_cluster(
         isolation_caches_arc.clone(),
         circuit_health.clone(),
         phantom_pool.clone(),
-        probe_host,
+        probe_host.clone(),
         probe_port,
         is_vm,
         shutdown.clone(),
     );
 
-    let phantom_size = std::cmp::max(2, clients_count.load(Ordering::Relaxed).max(1) / 3);
+    // Phase 76 PR-PHANTOM-POOL-002: Pool must be ≥4 standbys
+    let phantom_size = env_usize("CRAWLI_PHANTOM_POOL_SIZE")
+        .unwrap_or(DEFAULT_PHANTOM_POOL_SIZE)
+        .clamp(2, 8)
+        .max(clients_count.load(Ordering::Relaxed).max(1) / 2);
     spawn_phantom_pool_builder(phantom_size, phantom_pool.clone(), is_vm, shutdown.clone());
 
     spawn_memory_pressure_monitor(
@@ -1237,6 +1329,7 @@ pub async fn bootstrap_arti_cluster(
         let clients_arc_bg = clients_arc.clone();
         let isolation_caches_bg = isolation_caches_arc.clone();
         let clients_count_bg = clients_count.clone();
+        let socks_ports_arc_bg = socks_ports_arc.clone();
         tokio::spawn(async move {
             while let Some(result) = client_futures.join_next().await {
                 match result {
@@ -1252,6 +1345,7 @@ pub async fn bootstrap_arti_cluster(
                         );
 
                         let ready_now = clients_count_bg.load(Ordering::Relaxed);
+                        let ready_ports_bg = socks_ports_arc_bg.read().unwrap().clone();
                         let _ = app_bg.emit(
                             "crawl_log",
                             format!(
@@ -1268,9 +1362,23 @@ pub async fn bootstrap_arti_cluster(
                                     ready_now, target
                                 ),
                                 daemon_count: ready_now,
-                                ports: vec![],
+                                ports: ready_ports_bg.clone(),
+                                runtime: Some(runtime_label().to_string()),
+                                traffic_class: Some(format!("{traffic_class:?}")),
+                                ready_clients: Some(ready_now),
+                                managed_port_count: Some(ready_ports_bg.len()),
+                                health_probe_target: Some(format!("{}:{}", probe_host, probe_port)),
                             },
                         );
+                        if let Some(state) = app_bg.try_state::<crate::AppState>() {
+                            state.telemetry.set_swarm_metrics(
+                                runtime_label(),
+                                traffic_class,
+                                ready_now,
+                                ready_ports_bg.len(),
+                                format!("{}:{}", probe_host, probe_port),
+                            );
+                        }
                     }
                     Ok((_idx, Err(err))) => {
                         eprintln!("Background arti node failed to create: {}", err)
@@ -1373,7 +1481,8 @@ mod dual_swarm_tests {
         let (crawl_res, download_res) = tokio::join!(crawl_node_future, download_node_future);
 
         let _crawl_client = crawl_res.expect("Crawl swarm Arti node 0 failed to bootstrap");
-        let _download_client = download_res.expect("Download swarm Arti node 128 failed to bootstrap");
+        let _download_client =
+            download_res.expect("Download swarm Arti node 128 failed to bootstrap");
 
         println!("[TEST] Both swarms instantiated and bound unique sub-directories correctly.");
     }

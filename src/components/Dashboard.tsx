@@ -3,6 +3,13 @@ import "./Dashboard.css";
 import { VibeLoader } from "./VibeLoader";
 import { VfsTreeView } from "./VfsTreeView";
 
+interface EfficiencyHistory {
+  requestsPerEntry: number[];
+  requestSuccessRate: number[];
+  activeCircuits: number[];
+  fingerprintLatencyMs: number[];
+}
+
 interface DashboardProps {
   isCrawling: boolean;
   torStatus: any;
@@ -71,7 +78,21 @@ interface DashboardProps {
     consensusWeight: number;
     multiClientRotations?: number;
     multiClientCount?: number;
+    swarmRuntimeLabel?: string | null;
+    swarmTrafficClass?: string | null;
+    swarmClientCount?: number;
+    managedPortCount?: number;
+    healthProbeTarget?: string | null;
+    totalRequests?: number;
+    successfulRequests?: number;
+    failedRequests?: number;
+    fingerprintLatencyMs?: number;
+    cachedRouteHits?: number;
+    subtreeReroutes?: number;
+    subtreeQuarantineHits?: number;
+    offWinnerChildRequests?: number;
   };
+  efficiencyHistory?: EfficiencyHistory;
   crawlRunStatus: {
     targetKey: string;
     bestPriorCount: number;
@@ -99,6 +120,42 @@ interface DashboardProps {
   onAzureClick?: () => void;
 }
 
+function Sparkline({ values, stroke }: { values: number[]; stroke: string }) {
+  const width = 148;
+  const height = 38;
+  const padding = 4;
+  const samples = values.length > 0 ? values : [0];
+  const min = Math.min(...samples);
+  const max = Math.max(...samples);
+  const range = Math.max(max - min, 1);
+  const points = samples
+    .map((value, index) => {
+      const x =
+        samples.length === 1
+          ? width / 2
+          : padding + (index / (samples.length - 1)) * (width - padding * 2);
+      const y =
+        height -
+        padding -
+        ((value - min) / range) * (height - padding * 2);
+      return `${x},${Number.isFinite(y) ? y : height / 2}`;
+    })
+    .join(" ");
+
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden="true">
+      <polyline
+        fill="none"
+        stroke={stroke}
+        strokeWidth="2.25"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        points={points}
+      />
+    </svg>
+  );
+}
+
 export function Dashboard({
   isCrawling,
   torStatus,
@@ -112,6 +169,12 @@ export function Dashboard({
   elapsed,
   downloadElapsed,
   resourceMetrics,
+  efficiencyHistory = {
+    requestsPerEntry: [],
+    requestSuccessRate: [],
+    activeCircuits: [],
+    fingerprintLatencyMs: [],
+  },
   crawlRunStatus,
   downloadResumePlan,
   ceilingStatus = { value: 0, direction: null, lastChange: null },
@@ -181,6 +244,35 @@ export function Dashboard({
     resourceMetrics.workerTarget > 0 ? resourceMetrics.activeWorkers : crawlStatus.activeWorkers;
   const effectiveWorkerTarget =
     resourceMetrics.workerTarget > 0 ? resourceMetrics.workerTarget : Math.max(crawlStatus.workerTarget, 1);
+  const totalRequests = resourceMetrics.totalRequests || 0;
+  const successfulRequests = resourceMetrics.successfulRequests || 0;
+  const failedRequests = resourceMetrics.failedRequests || 0;
+  const settledRequests = successfulRequests + failedRequests;
+  const requestsPerEntry =
+    totalRequests > 0 ? totalRequests / Math.max(vfsCount, 1) : 0;
+  const requestSuccessRate =
+    settledRequests > 0 ? (successfulRequests / settledRequests) * 100 : 0;
+  const fingerprintLatencyMs = resourceMetrics.fingerprintLatencyMs || 0;
+  const cachedRouteHits = resourceMetrics.cachedRouteHits || 0;
+  const subtreeReroutes = resourceMetrics.subtreeReroutes || 0;
+  const subtreeQuarantineHits = resourceMetrics.subtreeQuarantineHits || 0;
+  const offWinnerChildRequests = resourceMetrics.offWinnerChildRequests || 0;
+  const swarmClientCount =
+    resourceMetrics.swarmClientCount ||
+    torStatus?.ready_clients ||
+    torStatus?.daemon_count ||
+    0;
+  const managedPortCount =
+    resourceMetrics.managedPortCount ||
+    torStatus?.managed_port_count ||
+    torStatus?.ports?.length ||
+    0;
+  const swarmRuntimeLabel =
+    resourceMetrics.swarmRuntimeLabel || torStatus?.runtime || "unknown";
+  const swarmTrafficClass =
+    resourceMetrics.swarmTrafficClass || torStatus?.traffic_class || "mixed";
+  const healthProbeTarget =
+    resourceMetrics.healthProbeTarget || torStatus?.health_probe_target || "n/a";
   const currentListingName = crawlRunStatus?.stableCurrentListingPath?.split(/[\\/]/).pop() || "";
   const bestListingName = crawlRunStatus?.stableBestListingPath?.split(/[\\/]/).pop() || "";
 
@@ -306,6 +398,53 @@ export function Dashboard({
               {ceilingStatus.lastChange && ` [${Math.floor((Date.now() - ceilingStatus.lastChange) / 1000)}s ago]`}
             </div>
           )}
+        </div>
+      </div>
+
+      <div className="dash-card resource-card" data-testid="swarm-efficiency-card">
+        <div className="dash-icon"><Network size={24} /></div>
+        <div className="dash-info">
+          <div className="dash-title">SWARM EFFICIENCY</div>
+          <div className="dash-value">
+            Req/Entry {requestsPerEntry.toFixed(2)} | Success {requestSuccessRate.toFixed(1)}%
+          </div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>
+            Fingerprint {fingerprintLatencyMs} ms | Cache Hits {cachedRouteHits}
+          </div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>
+            Swarm {swarmClientCount} clients / {managedPortCount} ports / {swarmRuntimeLabel} / {swarmTrafficClass}
+          </div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>
+            Probe {healthProbeTarget} | Requests {totalRequests} | Failures {failedRequests}
+          </div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>
+            Subtree reroutes {subtreeReroutes} | Quarantine hits {subtreeQuarantineHits} | Off-winner child reqs {offWinnerChildRequests}
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+              gap: '8px',
+              marginTop: '10px',
+            }}
+          >
+            <div>
+              <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Req/Entry</div>
+              <Sparkline values={efficiencyHistory.requestsPerEntry} stroke="var(--accent-primary)" />
+            </div>
+            <div>
+              <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Success %</div>
+              <Sparkline values={efficiencyHistory.requestSuccessRate} stroke="#22c55e" />
+            </div>
+            <div>
+              <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Circuits</div>
+              <Sparkline values={efficiencyHistory.activeCircuits} stroke="#60a5fa" />
+            </div>
+            <div>
+              <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Fingerprint ms</div>
+              <Sparkline values={efficiencyHistory.fingerprintLatencyMs} stroke="#f59e0b" />
+            </div>
+          </div>
         </div>
       </div>
 

@@ -7,6 +7,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 
 // Phase 41: Windows NT Kernel SetFileValidData zero-filling blocks override for immense payloads
@@ -102,16 +103,22 @@ impl DownloadLogger {
 
 struct ActiveCircuitGuard {
     counter: Arc<AtomicUsize>,
+    load: usize,
 }
 impl ActiveCircuitGuard {
     fn new(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self { counter }
+        Self::with_load(counter, 1)
+    }
+
+    fn with_load(counter: Arc<AtomicUsize>, load: usize) -> Self {
+        let load = load.max(1);
+        counter.fetch_add(load, Ordering::Relaxed);
+        Self { counter, load }
     }
 }
 impl Drop for ActiveCircuitGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.counter.fetch_sub(self.load, Ordering::Relaxed);
     }
 }
 
@@ -198,6 +205,101 @@ fn build_piece_spans(
     spans
 }
 
+fn piece_len_for_index(content_length: u64, piece_size: u64, piece_idx: usize) -> u64 {
+    let start = piece_idx as u64 * piece_size;
+    if start >= content_length {
+        return 0;
+    }
+    (((piece_idx as u64) + 1) * piece_size).min(content_length) - start
+}
+
+fn normalize_download_state(
+    state: &mut DownloadState,
+    effective_circuits: usize,
+    piece_size: u64,
+    total_pieces: usize,
+) {
+    state.chunk_size = piece_size;
+    if total_pieces == 0 {
+        state.piece_mode = false;
+        state.total_pieces = 0;
+        if state.current_offsets.len() != effective_circuits {
+            state.current_offsets = vec![0; effective_circuits];
+        }
+        if state.completed_chunks.len() != effective_circuits {
+            state.completed_chunks = vec![false; effective_circuits];
+        }
+        return;
+    }
+
+    state.piece_mode = true;
+    state.total_pieces = total_pieces;
+    if state.completed_pieces.len() != total_pieces {
+        state.completed_pieces.resize(total_pieces, false);
+    }
+    if state.current_offsets.len() != total_pieces {
+        state.current_offsets.resize(total_pieces, 0);
+    }
+}
+
+fn estimate_downloaded_bytes(state: &DownloadState, effective_circuits: usize) -> u64 {
+    if state.piece_mode && state.total_pieces > 0 && state.chunk_size > 0 {
+        let mut downloaded = 0u64;
+        for piece_idx in 0..state.total_pieces {
+            let piece_len = piece_len_for_index(state.content_length, state.chunk_size, piece_idx);
+            if piece_len == 0 {
+                continue;
+            }
+            if state
+                .completed_pieces
+                .get(piece_idx)
+                .copied()
+                .unwrap_or(false)
+            {
+                downloaded = downloaded.saturating_add(piece_len);
+            } else {
+                downloaded = downloaded.saturating_add(
+                    state
+                        .current_offsets
+                        .get(piece_idx)
+                        .copied()
+                        .unwrap_or(0)
+                        .min(piece_len),
+                );
+            }
+        }
+        return downloaded;
+    }
+
+    let mut downloaded = 0u64;
+    for (i, &done) in state
+        .completed_chunks
+        .iter()
+        .enumerate()
+        .take(effective_circuits)
+    {
+        if done {
+            let end_byte = if i == effective_circuits.saturating_sub(1) {
+                state.content_length.saturating_sub(1)
+            } else {
+                ((i as u64 + 1) * state.chunk_size).saturating_sub(1)
+            };
+            let start_byte = i as u64 * state.chunk_size;
+            downloaded = downloaded.saturating_add(end_byte.saturating_sub(start_byte) + 1);
+        } else {
+            downloaded = downloaded.saturating_add(
+                state
+                    .current_offsets
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(state.chunk_size),
+            );
+        }
+    }
+    downloaded
+}
+
 // Health monitoring: kill circuits below this fraction of median speed
 const MIN_SPEED_RATIO: f64 = 0.20; // 20% of median = too slow
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
@@ -242,6 +344,15 @@ fn download_initial_active_budget(
     scaled_circuits
         .min(dynamic_budget)
         .max(DEFAULT_DOWNLOAD_INITIAL_ACTIVE_MIN.min(scaled_circuits))
+}
+
+fn handshake_keep_count(results_len: usize, target_workers: usize, is_onion: bool) -> usize {
+    let results_len = results_len.max(1);
+    if is_onion {
+        ((results_len as f64 * (1.0 - HANDSHAKE_CULL_RATIO)) as usize).max(1)
+    } else {
+        target_workers.clamp(1, results_len)
+    }
 }
 
 /// UCB1 Multi-Armed Bandit circuit scorer.
@@ -452,6 +563,59 @@ fn backoff_duration(retries: usize) -> Duration {
     Duration::from_millis(base_ms.min(30_000))
 }
 
+#[derive(Clone, Default)]
+struct IntervalTracker {
+    intervals: Vec<(u64, u64)>,
+}
+
+impl IntervalTracker {
+    fn new() -> Self {
+        Self {
+            intervals: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+
+        let mut new_intervals = Vec::with_capacity(self.intervals.len() + 1);
+        let mut merged = false;
+        let mut cs = start;
+        let mut ce = end;
+
+        for &i in &self.intervals {
+            if merged {
+                new_intervals.push(i);
+            } else if ce < i.0 {
+                new_intervals.push((cs, ce));
+                new_intervals.push(i);
+                merged = true;
+            } else if cs > i.1 {
+                new_intervals.push(i);
+            } else {
+                cs = cs.min(i.0);
+                ce = ce.max(i.1);
+            }
+        }
+        if !merged {
+            new_intervals.push((cs, ce));
+        }
+        self.intervals = new_intervals;
+    }
+
+    fn contiguous_up_to(&self) -> u64 {
+        if self.intervals.is_empty() {
+            0
+        } else if self.intervals[0].0 == 0 {
+            self.intervals[0].1
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct DownloadState {
     pub completed_chunks: Vec<bool>,
@@ -600,6 +764,186 @@ fn publish_batch_progress(app: &AppHandle, progress: BatchProgressEvent) {
             ekf_covariance: None,
         },
     );
+}
+
+fn batch_speed_mbps(downloaded_bytes: u64, batch_started_at: Instant) -> f64 {
+    let elapsed_secs = batch_started_at.elapsed().as_secs_f64();
+    if elapsed_secs > 0.0 {
+        (downloaded_bytes as f64 / elapsed_secs) / 1_048_576.0
+    } else {
+        0.0
+    }
+}
+
+fn batch_swarm_send_timeout(is_onion: bool) -> Duration {
+    let default_secs = if is_onion { 45 } else { 30 };
+    Duration::from_secs(
+        env_usize("CRAWLI_BATCH_SWARM_SEND_TIMEOUT_SECS")
+            .unwrap_or(default_secs)
+            .max(5) as u64,
+    )
+}
+
+fn batch_swarm_body_timeout(is_onion: bool) -> Duration {
+    let default_secs = if is_onion { 90 } else { 60 };
+    Duration::from_secs(
+        env_usize("CRAWLI_BATCH_SWARM_BODY_TIMEOUT_SECS")
+            .unwrap_or(default_secs)
+            .max(10) as u64,
+    )
+}
+
+fn batch_swarm_first_byte_timeout(is_onion: bool) -> Duration {
+    let default_secs = if is_onion { 18 } else { 10 };
+    Duration::from_secs(
+        env_usize("CRAWLI_BATCH_SWARM_FIRST_BYTE_TIMEOUT_SECS")
+            .unwrap_or(default_secs)
+            .max(3) as u64,
+    )
+}
+
+fn batch_no_byte_requeue_limit() -> u8 {
+    env_usize("CRAWLI_BATCH_NO_BYTE_REQUEUE_LIMIT")
+        .unwrap_or(2)
+        .clamp(0, 8) as u8
+}
+
+fn batch_first_wave_width(parallelism: usize) -> usize {
+    parallelism.max(1).saturating_mul(4)
+}
+
+fn batch_entry_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(|host| host.to_ascii_lowercase())
+}
+
+fn remap_queued_file_to_next_alternate(
+    queued_file: &mut QueuedBatchFile,
+) -> Option<(String, String)> {
+    let next_url = queued_file
+        .entry
+        .alternate_urls
+        .get(queued_file.alternate_url_cursor)?
+        .clone();
+    let old_host = batch_entry_host(&queued_file.entry.url)?;
+    let new_host = batch_entry_host(&next_url)?;
+    if old_host == new_host {
+        queued_file.alternate_url_cursor = queued_file.alternate_url_cursor.saturating_add(1);
+        queued_file.entry.url = next_url;
+        return None;
+    }
+    queued_file.entry.url = next_url;
+    queued_file.alternate_url_cursor = queued_file.alternate_url_cursor.saturating_add(1);
+    Some((old_host, new_host))
+}
+
+fn diversify_first_wave_by_host(
+    files: Vec<BatchFileEntry>,
+    wave_width: usize,
+) -> Vec<BatchFileEntry> {
+    if files.len() <= 1 || wave_width <= 1 {
+        return files;
+    }
+
+    let original = files;
+    let mut host_buckets: HashMap<String, VecDeque<usize>> = HashMap::new();
+    let mut host_order = Vec::new();
+    let mut unknown_indices = VecDeque::new();
+
+    for (idx, file) in original.iter().enumerate() {
+        if let Some(host) = batch_entry_host(&file.url) {
+            let bucket = host_buckets.entry(host.clone()).or_insert_with(|| {
+                host_order.push(host.clone());
+                VecDeque::new()
+            });
+            bucket.push_back(idx);
+        } else {
+            unknown_indices.push_back(idx);
+        }
+    }
+
+    let mut first_wave = Vec::new();
+    let target = wave_width.min(original.len());
+
+    while first_wave.len() < target {
+        let mut advanced = false;
+        for host in &host_order {
+            if first_wave.len() >= target {
+                break;
+            }
+            if let Some(bucket) = host_buckets.get_mut(host) {
+                if let Some(idx) = bucket.pop_front() {
+                    first_wave.push(idx);
+                    advanced = true;
+                }
+            }
+        }
+        if first_wave.len() >= target {
+            break;
+        }
+        if let Some(idx) = unknown_indices.pop_front() {
+            first_wave.push(idx);
+            advanced = true;
+        }
+        if !advanced {
+            break;
+        }
+    }
+
+    if first_wave.is_empty() {
+        return original;
+    }
+
+    let picked: HashSet<usize> = first_wave.iter().copied().collect();
+    let mut diversified = Vec::with_capacity(original.len());
+    for idx in first_wave {
+        diversified.push(original[idx].clone());
+    }
+    for (idx, file) in original.into_iter().enumerate() {
+        if !picked.contains(&idx) {
+            diversified.push(file);
+        }
+    }
+
+    diversified
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchBodyReadFailure {
+    FirstByteTimeout,
+    BodyTimeout,
+    Stream,
+}
+
+async fn read_batch_response_body(
+    resp: crate::arti_client::ArtiResponse,
+    first_byte_timeout: Duration,
+    body_timeout: Duration,
+) -> std::result::Result<Vec<u8>, BatchBodyReadFailure> {
+    use futures::StreamExt;
+
+    let mut stream = resp.bytes_stream();
+    let mut body = Vec::new();
+
+    let first_chunk = match tokio::time::timeout(first_byte_timeout, stream.next()).await {
+        Ok(Some(Ok(chunk))) if !chunk.is_empty() => chunk,
+        Ok(Some(Ok(_))) => return Err(BatchBodyReadFailure::Stream),
+        Ok(Some(Err(_))) | Ok(None) => return Err(BatchBodyReadFailure::Stream),
+        Err(_) => return Err(BatchBodyReadFailure::FirstByteTimeout),
+    };
+    body.extend_from_slice(&first_chunk);
+
+    let deadline = tokio::time::Instant::now() + body_timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => body.extend_from_slice(&chunk),
+            Ok(Some(Err(_))) => return Err(BatchBodyReadFailure::Stream),
+            Ok(None) => return Ok(body),
+            Err(_) => return Err(BatchBodyReadFailure::BodyTimeout),
+        }
+    }
 }
 
 fn publish_download_progress(
@@ -814,6 +1158,37 @@ async fn probe_target(
     })
 }
 
+async fn probe_target_with_alternates(
+    client: &crate::arti_client::ArtiClient,
+    entry: &mut BatchFileEntry,
+    app: &AppHandle,
+) -> Result<ProbeResult> {
+    let primary_probe = probe_target(client, &entry.url, app).await?;
+    if primary_probe.content_length > 0 || entry.alternate_urls.is_empty() {
+        return Ok(primary_probe);
+    }
+
+    let current_host = batch_entry_host(&entry.url).unwrap_or_else(|| "-".to_string());
+    for alternate_url in entry.alternate_urls.clone() {
+        let alternate_probe = probe_target(client, &alternate_url, app).await?;
+        if alternate_probe.content_length == 0 {
+            continue;
+        }
+        let alternate_host = batch_entry_host(&alternate_url).unwrap_or_else(|| "-".to_string());
+        let _ = app.emit(
+            "log",
+            format!(
+                "[*] Probe remap: {} switched {} -> {} before transfer",
+                entry.path, current_host, alternate_host
+            ),
+        );
+        entry.url = alternate_url;
+        return Ok(alternate_probe);
+    }
+
+    Ok(primary_probe)
+}
+
 fn get_arti_client(
     is_onion: bool,
     circuit_id: usize,
@@ -846,6 +1221,8 @@ pub struct BatchFileEntry {
     pub path: String,
     pub size_hint: Option<u64>,
     pub jwt_exp: Option<u64>,
+    #[serde(default)]
+    pub alternate_urls: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -859,16 +1236,92 @@ pub struct BatchProgressEvent {
     pub active_circuits: Option<usize>,
 }
 
-/// Size threshold: files above this use the full work queue + steal mode (existing start_download).
-/// Files below this are downloaded as whole files, one per circuit, concurrently.
-const BATCH_LARGE_THRESHOLD: u64 = 100 * 1_048_576; // 100MB
-const BATCH_MICRO_THRESHOLD: u64 = 5 * 1_048_576; // 5MB
+/// Files at or below the micro threshold are fetched whole, one per request, inside the
+/// background micro swarm. Mid-size files stay in the small-file swarm. Files above the large
+/// threshold enter the parallel range pipeline.
+const DEFAULT_BATCH_MICRO_THRESHOLD: u64 = 5 * 1_048_576; // 5MB
+const DEFAULT_BATCH_LARGE_THRESHOLD_CLEARNET: u64 = 100 * 1_048_576; // 100MB
+const DEFAULT_BATCH_LARGE_THRESHOLD_ONION: u64 = 24 * 1_048_576; // 24MB
+const DEFAULT_BATCH_LARGE_THRESHOLD_ONION_HEAVY: u64 = 16 * 1_048_576; // 16MB
 
 #[derive(Clone)]
 struct ScheduledBatchFile {
     entry: BatchFileEntry,
     estimated_size: u64,
     enqueue_order: usize,
+}
+
+#[derive(Clone)]
+struct QueuedBatchFile {
+    entry: BatchFileEntry,
+    requeue_count: u8,
+    alternate_url_cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchLanePlan {
+    micro_parallelism: usize,
+    small_parallelism: usize,
+    large_pipeline_circuits: usize,
+    overlap_large_phase: bool,
+}
+
+impl BatchLanePlan {
+    fn serial(budget: &crate::resource_governor::DownloadBudget) -> Self {
+        Self {
+            micro_parallelism: budget.micro_swarm_circuits.max(1),
+            small_parallelism: budget.small_file_parallelism.max(1),
+            large_pipeline_circuits: budget.circuit_cap.max(1),
+            overlap_large_phase: false,
+        }
+    }
+}
+
+fn plan_batch_lanes(
+    budget: &crate::resource_governor::DownloadBudget,
+    is_onion: bool,
+    total_files: usize,
+    large_files: &[BatchFileEntry],
+) -> BatchLanePlan {
+    let mut plan = BatchLanePlan::serial(budget);
+
+    if !is_onion || large_files.is_empty() || budget.circuit_cap < 8 {
+        return plan;
+    }
+
+    let known_large_bytes: u64 = large_files.iter().filter_map(|file| file.size_hint).sum();
+    let enough_large_work =
+        large_files.len() >= 2 || known_large_bytes >= 128 * 1_048_576 || total_files >= 1_024;
+
+    if !enough_large_work {
+        return plan;
+    }
+
+    let large_pipeline_circuits = (budget.circuit_cap / 4)
+        .clamp(3, 4)
+        .min(budget.circuit_cap.saturating_sub(2).max(1));
+    let residual_parallelism = budget
+        .circuit_cap
+        .saturating_sub(large_pipeline_circuits)
+        .max(2);
+    let micro_parallelism = budget
+        .micro_swarm_circuits
+        .min((residual_parallelism + 1) / 2)
+        .max(1);
+    let small_parallelism = budget
+        .small_file_parallelism
+        .min(
+            residual_parallelism
+                .saturating_sub(micro_parallelism)
+                .max(1),
+        )
+        .max(1);
+
+    plan.micro_parallelism = micro_parallelism;
+    plan.small_parallelism = small_parallelism;
+    plan.large_pipeline_circuits = large_pipeline_circuits;
+    plan.overlap_large_phase = true;
+    plan
 }
 
 fn srpt_scheduler_enabled() -> bool {
@@ -887,6 +1340,38 @@ fn srpt_starvation_interval() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(12)
+}
+
+fn env_threshold_bytes(name: &str) -> Option<u64> {
+    env_usize(name).map(|value| value as u64 * 1_048_576)
+}
+
+fn batch_micro_threshold_bytes() -> u64 {
+    env_threshold_bytes("CRAWLI_BATCH_MICRO_THRESHOLD_MIB")
+        .unwrap_or(DEFAULT_BATCH_MICRO_THRESHOLD)
+        .max(1_048_576)
+}
+
+fn batch_large_threshold_bytes(
+    is_onion: bool,
+    file_count: usize,
+    requested_circuits: usize,
+) -> u64 {
+    let micro_threshold = batch_micro_threshold_bytes();
+    let configured = env_threshold_bytes("CRAWLI_BATCH_LARGE_THRESHOLD_MIB");
+    let default_threshold = if is_onion {
+        if file_count >= 1024 || requested_circuits >= 16 {
+            DEFAULT_BATCH_LARGE_THRESHOLD_ONION_HEAVY
+        } else {
+            DEFAULT_BATCH_LARGE_THRESHOLD_ONION
+        }
+    } else {
+        DEFAULT_BATCH_LARGE_THRESHOLD_CLEARNET
+    };
+
+    configured
+        .unwrap_or(default_threshold)
+        .max(micro_threshold.saturating_add(1_048_576))
 }
 
 fn schedule_srpt_with_starvation(mut files: Vec<ScheduledBatchFile>) -> Vec<BatchFileEntry> {
@@ -941,21 +1426,41 @@ async fn process_swarm(
     _jwt_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     total_files: usize,
     active_client_ptrs: Vec<crate::tor_native::SharedTorClient>,
+    batch_started_at: Instant,
 ) {
     if files.is_empty() {
         return;
     }
     let total_sub = files.len();
-    let next_file = Arc::new(AtomicUsize::new(0));
+    let queue = Arc::new(tokio::sync::Mutex::new(
+        files
+            .into_iter()
+            .map(|entry| QueuedBatchFile {
+                entry,
+                requeue_count: 0,
+                alternate_url_cursor: 0,
+            })
+            .collect::<VecDeque<_>>(),
+    ));
     let phase_completed = Arc::new(AtomicUsize::new(0));
     let phase_bytes = Arc::new(AtomicU64::new(0));
     let phase_bbr = Arc::new(BbrController::new(parallelism, parallelism));
+    let send_timeout = batch_swarm_send_timeout(is_onion);
+    let first_byte_timeout = batch_swarm_first_byte_timeout(is_onion);
+    let body_timeout = batch_swarm_body_timeout(is_onion);
+    let no_byte_requeue_limit = batch_no_byte_requeue_limit();
 
     let _ = app.emit(
         "log",
         format!(
-            "[*] {}: {} files across {} circuits",
-            phase_name, total_sub, parallelism
+            "[*] {}: {} files across {} circuits (send_timeout={}s first_byte_timeout={}s body_timeout={}s requeue_limit={})",
+            phase_name,
+            total_sub,
+            parallelism,
+            send_timeout.as_secs(),
+            first_byte_timeout.as_secs(),
+            body_timeout.as_secs(),
+            no_byte_requeue_limit
         ),
     );
 
@@ -968,8 +1473,7 @@ async fn process_swarm(
             Err(_) => continue,
         };
 
-        let task_files = files.clone();
-        let task_next = Arc::clone(&next_file);
+        let task_queue = Arc::clone(&queue);
         let task_phase_completed = Arc::clone(&phase_completed);
         let task_phase_bytes = Arc::clone(&phase_bytes);
         let task_overall_completed = Arc::clone(&overall_completed);
@@ -980,15 +1484,27 @@ async fn process_swarm(
         let task_control = control.clone();
         let task_bbr = Arc::clone(&phase_bbr);
         let task_telemetry = batch_telemetry.clone();
+        let task_send_timeout = send_timeout;
+        let task_first_byte_timeout = first_byte_timeout;
+        let task_body_timeout = body_timeout;
+        let task_is_onion = is_onion;
+        let task_no_byte_requeue_limit = no_byte_requeue_limit;
+        let task_phase_name = phase_name.to_string();
 
         tasks.spawn(async move {
+            let mut client = client;
             loop {
-                if task_control.interruption_reason().is_some() { break; }
+                if task_control.interruption_reason().is_some() {
+                    break;
+                }
 
-                let file_idx = task_next.fetch_add(1, Ordering::Relaxed);
-                if file_idx >= task_files.len() { break; }
-
-                let entry = &task_files[file_idx];
+                let Some(mut queued_file) = ({
+                    let mut queue = task_queue.lock().await;
+                    queue.pop_front()
+                }) else {
+                    break;
+                };
+                let entry = queued_file.entry.clone();
 
                 if let Some(dir) = Path::new(&entry.path).parent() {
                     let _ = fs::create_dir_all(dir);
@@ -998,11 +1514,14 @@ async fn process_swarm(
                 let mut retries = 0;
                 let mut success = false;
                 let mut downloaded_len = 0u64;
+                let mut should_requeue = false;
                 while retries < 5 && !success {
                     let resp = match tokio::time::timeout(
-                        Duration::from_secs(120),
-                        client.get(&entry.url).header("Connection", "close").send()
-                    ).await {
+                        task_send_timeout,
+                        client.get(&entry.url).header("Connection", "close").send(),
+                    )
+                    .await
+                    {
                         Ok(Ok(r)) if r.status().is_success() => r,
                         Ok(Ok(r)) => {
                             let status = r.status();
@@ -1012,37 +1531,111 @@ async fn process_swarm(
                                 task_bbr.on_reject();
                                 let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} hit HTTP {}. Re-isolating circuit locally...", circuit_id, status));
                                 // With isolated_client() native regeneration, no global rotation is needed.
-                                // Since we create a single `client` per circuit thread in process_swarm and 
+                                // Since we create a single `client` per circuit thread in process_swarm and
                                 // don't share it, we don't actually need to rotate the token here if we
                                 // regenerate the stream internally, but for pure idempotency we just pause.
                             } else {
                                 task_bbr.on_reject();
-                            }                          retries += 1;
+                            }
+                            retries += 1;
+                            if task_is_onion && retries >= 2 {
+                                client = client.new_isolated();
+                            }
                             let active = task_bbr.current_active();
                             let base = backoff_duration(retries);
-                            let bbr_pause = if circuit_id >= active { Duration::from_millis(2000) } else { Duration::ZERO };
+                            let bbr_pause = if circuit_id >= active {
+                                Duration::from_millis(2000)
+                            } else {
+                                Duration::ZERO
+                            };
                             tokio::time::sleep(base + bbr_pause).await;
                             continue;
                         }
                         Ok(Err(err)) => {
                             task_bbr.on_reject();
-                            if err.to_string().contains("connect") || err.to_string().contains("request") {
+                            if queued_file.requeue_count < task_no_byte_requeue_limit {
+                                let remap_note = remap_queued_file_to_next_alternate(&mut queued_file)
+                                    .map(|(from_host, to_host)| {
+                                        format!("; remapped {} -> {}", from_host, to_host)
+                                    })
+                                    .unwrap_or_default();
+                                let _ = task_app.emit(
+                                    "log",
+                                    format!(
+                                        "[~] {}: requeueing {} after connection stall on circuit {} ({}){}",
+                                        task_phase_name,
+                                        entry.path,
+                                        circuit_id,
+                                        err,
+                                        remap_note
+                                    ),
+                                );
+                                if task_is_onion {
+                                    client = client.new_isolated();
+                                }
+                                should_requeue = true;
+                                break;
+                            }
+                            if err.to_string().contains("connect")
+                                || err.to_string().contains("request")
+                            {
                                 let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} connection reset. Re-isolating circuit locally...", circuit_id));
-                            }                          retries += 1;
+                            }
+                            retries += 1;
+                            if task_is_onion && retries >= 2 {
+                                client = client.new_isolated();
+                            }
                             let active = task_bbr.current_active();
                             let base = backoff_duration(retries);
-                            let bbr_pause = if circuit_id >= active { Duration::from_millis(2000) } else { Duration::ZERO };
+                            let bbr_pause = if circuit_id >= active {
+                                Duration::from_millis(2000)
+                            } else {
+                                Duration::ZERO
+                            };
                             tokio::time::sleep(base + bbr_pause).await;
                             continue;
                         }
                         Err(_) => {
                             task_bbr.on_timeout();
-                            retries += 1; tokio::time::sleep(backoff_duration(retries)).await; continue;
+                            if queued_file.requeue_count < task_no_byte_requeue_limit {
+                                let remap_note = remap_queued_file_to_next_alternate(&mut queued_file)
+                                    .map(|(from_host, to_host)| {
+                                        format!("; remapped {} -> {}", from_host, to_host)
+                                    })
+                                    .unwrap_or_default();
+                                let _ = task_app.emit(
+                                    "log",
+                                    format!(
+                                        "[~] {}: requeueing {} after send timeout on circuit {}{}",
+                                        task_phase_name,
+                                        entry.path,
+                                        circuit_id,
+                                        remap_note
+                                    ),
+                                );
+                                if task_is_onion {
+                                    client = client.new_isolated();
+                                }
+                                should_requeue = true;
+                                break;
+                            }
+                            retries += 1;
+                            if task_is_onion {
+                                client = client.new_isolated();
+                            }
+                            tokio::time::sleep(backoff_duration(retries)).await;
+                            continue;
                         }
                     };
 
-                    match tokio::time::timeout(Duration::from_secs(300), resp.bytes()).await {
-                        Ok(Ok(bytes)) => {
+                    match read_batch_response_body(
+                        resp,
+                        task_first_byte_timeout,
+                        task_body_timeout,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => {
                             let len = bytes.len() as u64;
                             if fs::write(&entry.path, &bytes).is_ok() {
                                 downloaded_len = len;
@@ -1050,7 +1643,48 @@ async fn process_swarm(
                                 task_bbr.on_success(len, 1000);
                             }
                         }
-                        _ => { retries += 1; tokio::time::sleep(backoff_duration(retries)).await; }
+                        Err(BatchBodyReadFailure::FirstByteTimeout) => {
+                            task_bbr.on_timeout();
+                            if queued_file.requeue_count < task_no_byte_requeue_limit {
+                                let host =
+                                    batch_entry_host(&entry.url).unwrap_or_else(|| "-".to_string());
+                                let remap_note = remap_queued_file_to_next_alternate(&mut queued_file)
+                                    .map(|(from_host, to_host)| {
+                                        format!("; remapped {} -> {}", from_host, to_host)
+                                    })
+                                    .unwrap_or_default();
+                                let _ = task_app.emit(
+                                    "log",
+                                    format!(
+                                        "[~] {}: requeueing no-byte stall for {} on host {} (circuit {}, pass {}/{}){}",
+                                        task_phase_name,
+                                        entry.path,
+                                        host,
+                                        circuit_id,
+                                        queued_file.requeue_count + 1,
+                                        task_no_byte_requeue_limit,
+                                        remap_note
+                                    ),
+                                );
+                                if task_is_onion {
+                                    client = client.new_isolated();
+                                }
+                                should_requeue = true;
+                                break;
+                            }
+                            retries += 1;
+                            if task_is_onion {
+                                client = client.new_isolated();
+                            }
+                            tokio::time::sleep(backoff_duration(retries)).await;
+                        }
+                        Err(BatchBodyReadFailure::BodyTimeout | BatchBodyReadFailure::Stream) => {
+                            retries += 1;
+                            if task_is_onion {
+                                client = client.new_isolated();
+                            }
+                            tokio::time::sleep(backoff_duration(retries)).await;
+                        }
                     }
                 }
 
@@ -1060,6 +1694,8 @@ async fn process_swarm(
                     task_overall_bytes.fetch_add(downloaded_len, Ordering::Relaxed);
                     let completed = task_overall_completed.fetch_add(1, Ordering::Relaxed) + 1;
                     let failed = task_overall_failed.load(Ordering::Relaxed);
+                    let overall_bytes = task_overall_bytes.load(Ordering::Relaxed);
+                    let speed_mbps = batch_speed_mbps(overall_bytes, batch_started_at);
                     publish_batch_progress(
                         &task_app,
                         BatchProgressEvent {
@@ -1067,8 +1703,8 @@ async fn process_swarm(
                             failed,
                             total: total_files,
                             current_file: entry.path.clone(),
-                            speed_mbps: 0.0,
-                            downloaded_bytes: task_overall_bytes.load(Ordering::Relaxed),
+                            speed_mbps,
+                            downloaded_bytes: overall_bytes,
                             active_circuits: Some(
                                 task_active_batch_circuits.load(Ordering::Relaxed),
                             ),
@@ -1079,9 +1715,15 @@ async fn process_swarm(
                             task_active_batch_circuits.load(Ordering::Relaxed),
                         );
                     }
+                } else if should_requeue {
+                    queued_file.requeue_count = queued_file.requeue_count.saturating_add(1);
+                    let mut queue = task_queue.lock().await;
+                    queue.push_back(queued_file);
                 } else {
                     let failed = task_overall_failed.fetch_add(1, Ordering::Relaxed) + 1;
                     let completed = task_overall_completed.load(Ordering::Relaxed);
+                    let overall_bytes = task_overall_bytes.load(Ordering::Relaxed);
+                    let speed_mbps = batch_speed_mbps(overall_bytes, batch_started_at);
                     publish_batch_progress(
                         &task_app,
                         BatchProgressEvent {
@@ -1089,8 +1731,8 @@ async fn process_swarm(
                             failed,
                             total: total_files,
                             current_file: entry.path.clone(),
-                            speed_mbps: 0.0,
-                            downloaded_bytes: task_overall_bytes.load(Ordering::Relaxed),
+                            speed_mbps,
+                            downloaded_bytes: overall_bytes,
                             active_circuits: Some(
                                 task_active_batch_circuits.load(Ordering::Relaxed),
                             ),
@@ -1122,6 +1764,185 @@ async fn process_swarm(
     );
 }
 
+async fn process_large_pipeline(
+    app: AppHandle,
+    files: Vec<BatchFileEntry>,
+    requested_circuits: usize,
+    force_tor: bool,
+    output_dir: Option<String>,
+    control: DownloadControl,
+    overall_completed: Arc<AtomicUsize>,
+    overall_failed: Arc<AtomicUsize>,
+    overall_downloaded_bytes: Arc<AtomicU64>,
+    active_batch_circuits: Arc<AtomicUsize>,
+    batch_telemetry: Option<crate::runtime_metrics::RuntimeTelemetry>,
+    jwt_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+    total_files: usize,
+    batch_started_at: Instant,
+) {
+    if files.is_empty() {
+        return;
+    }
+
+    let _ = app.emit(
+        "log",
+        format!(
+            "[*] Phase 2 (Large): {} files with reserved {}-circuit lane",
+            files.len(),
+            requested_circuits
+        ),
+    );
+
+    for (i, file) in files.iter().enumerate() {
+        if control.interruption_reason().is_some() {
+            break;
+        }
+
+        if let Some(cutoff) = env_usize("CRAWLI_DOWNLOAD_CUTOFF_BYTES") {
+            if overall_downloaded_bytes.load(Ordering::Relaxed) >= (cutoff as u64) {
+                let remaining = total_files
+                    .saturating_sub(overall_completed.load(Ordering::Relaxed))
+                    .saturating_sub(overall_failed.load(Ordering::Relaxed));
+                let _ = app.emit(
+                    "log",
+                    format!(
+                        "[SYSTEM] Download scale limit reached ({} bytes cut-off). Halting remaining {} large files...",
+                        cutoff, remaining
+                    ),
+                );
+                break;
+            }
+        }
+
+        let _ = app.emit(
+            "log",
+            format!(
+                "[*] Phase 2: Large file {}/{}: {}",
+                i + 1,
+                files.len(),
+                file.path
+            ),
+        );
+
+        publish_batch_progress(
+            &app,
+            BatchProgressEvent {
+                completed: overall_completed.load(Ordering::Relaxed),
+                failed: overall_failed.load(Ordering::Relaxed),
+                total: total_files,
+                current_file: file.path.clone(),
+                speed_mbps: batch_speed_mbps(
+                    overall_downloaded_bytes.load(Ordering::Relaxed),
+                    batch_started_at,
+                ),
+                downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
+                active_circuits: Some(active_batch_circuits.load(Ordering::Relaxed)),
+            },
+        );
+
+        let inner_control = DownloadControl::new();
+        let _active_guard =
+            ActiveCircuitGuard::with_load(Arc::clone(&active_batch_circuits), requested_circuits);
+        let result = start_download(
+            app.clone(),
+            file.clone(),
+            requested_circuits,
+            force_tor,
+            output_dir.clone(),
+            inner_control,
+            Arc::clone(&jwt_cache),
+        )
+        .await;
+
+        match result {
+            Ok(()) => {
+                let bytes = std::fs::metadata(&file.path)
+                    .map(|meta| meta.len())
+                    .ok()
+                    .or(file.size_hint)
+                    .unwrap_or(0);
+                if bytes > 0 {
+                    overall_downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+                let completed = overall_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let overall_bytes = overall_downloaded_bytes.load(Ordering::Relaxed);
+                publish_batch_progress(
+                    &app,
+                    BatchProgressEvent {
+                        completed,
+                        failed: overall_failed.load(Ordering::Relaxed),
+                        total: total_files,
+                        current_file: file.path.clone(),
+                        speed_mbps: batch_speed_mbps(overall_bytes, batch_started_at),
+                        downloaded_bytes: overall_bytes,
+                        active_circuits: Some(active_batch_circuits.load(Ordering::Relaxed)),
+                    },
+                );
+            }
+            Err(err) => {
+                let failed = overall_failed.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = app.emit(
+                    "log",
+                    format!("[!] Large file failed: {} ({})", file.path, err),
+                );
+                publish_batch_progress(
+                    &app,
+                    BatchProgressEvent {
+                        completed: overall_completed.load(Ordering::Relaxed),
+                        failed,
+                        total: total_files,
+                        current_file: file.path.clone(),
+                        speed_mbps: batch_speed_mbps(
+                            overall_downloaded_bytes.load(Ordering::Relaxed),
+                            batch_started_at,
+                        ),
+                        downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
+                        active_circuits: Some(active_batch_circuits.load(Ordering::Relaxed)),
+                    },
+                );
+            }
+        }
+
+        if let Some(telemetry) = &batch_telemetry {
+            telemetry.set_active_circuits(active_batch_circuits.load(Ordering::Relaxed));
+        }
+    }
+}
+
+async fn wait_for_large_overlap_window(
+    overall_completed: &Arc<AtomicUsize>,
+    overall_downloaded_bytes: &Arc<AtomicU64>,
+    control: &DownloadControl,
+) -> bool {
+    let min_completed = env_usize("CRAWLI_BATCH_LARGE_OVERLAP_MIN_COMPLETIONS").unwrap_or(24);
+    let min_bytes = env_usize("CRAWLI_BATCH_LARGE_OVERLAP_MIN_BYTES")
+        .map(|value| value as u64)
+        .unwrap_or(32 * 1_048_576);
+    let max_wait_secs = env_usize("CRAWLI_BATCH_LARGE_OVERLAP_MAX_WAIT_SECS")
+        .unwrap_or(45)
+        .max(5) as u64;
+    let deadline = Instant::now() + Duration::from_secs(max_wait_secs);
+
+    loop {
+        if control.interruption_reason().is_some() {
+            return false;
+        }
+
+        if overall_completed.load(Ordering::Relaxed) >= min_completed
+            || overall_downloaded_bytes.load(Ordering::Relaxed) >= min_bytes
+        {
+            return true;
+        }
+
+        if Instant::now() >= deadline {
+            return overall_completed.load(Ordering::Relaxed) > 0
+                || overall_downloaded_bytes.load(Ordering::Relaxed) > 0;
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 pub async fn start_batch_download(
     app: AppHandle,
     files: Vec<BatchFileEntry>,
@@ -1132,6 +1953,7 @@ pub async fn start_batch_download(
 ) -> Result<()> {
     let _download_session_guard =
         telemetry_handle(&app).map(crate::runtime_metrics::DownloadSessionGuard::new);
+    let batch_started_at = Instant::now();
     let requested_circuits = num_circuits.max(1);
     let overall_completed = Arc::new(AtomicUsize::new(0));
     let overall_failed = Arc::new(AtomicUsize::new(0));
@@ -1142,7 +1964,7 @@ pub async fn start_batch_download(
         Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let is_onion = files
         .first()
-        .map(|f| f.url.contains(".onion"))
+        .map(|f| crate::url_targets_onion(&f.url))
         .unwrap_or(false)
         || force_tor;
     let batch_download_budget = crate::resource_governor::recommend_download_budget(
@@ -1251,12 +2073,22 @@ pub async fn start_batch_download(
         let mut download_guard = state.download_swarm_guard.lock().await;
 
         let needs_bootstrap = match download_guard.as_ref() {
-            Some(arc) => arc.lock().await.native_swarm.is_none() || arc.lock().await.get_arti_clients().is_empty(),
+            Some(arc) => {
+                arc.lock().await.native_swarm.is_none()
+                    || arc.lock().await.get_arti_clients().is_empty()
+            }
             None => true,
         };
 
         if needs_bootstrap {
-            match crate::tor::bootstrap_tor_cluster(app.clone(), batch_circuit_cap, 128).await {
+            match crate::tor::bootstrap_tor_cluster_for_traffic(
+                app.clone(),
+                batch_circuit_cap,
+                128,
+                crate::tor::SwarmTrafficClass::OnionService,
+            )
+            .await
+            {
                 Ok((new_guard, _ports)) => {
                     *download_guard = Some(std::sync::Arc::new(tokio::sync::Mutex::new(new_guard)));
                 }
@@ -1283,6 +2115,9 @@ pub async fn start_batch_download(
         active_ports.push(0);
     }
 
+    let micro_threshold = batch_micro_threshold_bytes();
+    let large_threshold = batch_large_threshold_bytes(is_onion, files.len(), requested_circuits);
+
     // -- Probe all files and sort into small vs large --
     let sniff_client = get_arti_client(is_onion, 0, &active_client_ptrs)?;
     let mut micro_candidates: Vec<ScheduledBatchFile> = Vec::new();
@@ -1292,7 +2127,12 @@ pub async fn start_batch_download(
 
     let _ = app.emit(
         "log",
-        format!("[*] Batch: probing {} files...", files.len()),
+        format!(
+            "[*] Batch: probing {} files... thresholds micro<={:.1}MB large>{:.1}MB",
+            files.len(),
+            micro_threshold as f64 / 1_048_576.0,
+            large_threshold as f64 / 1_048_576.0
+        ),
     );
 
     for file in &files {
@@ -1303,13 +2143,13 @@ pub async fn start_batch_download(
         // Smart Skip Idempotency (redundant fallback)
         if let Some(hint) = file.size_hint {
             if hint > 0 {
-                if hint <= BATCH_MICRO_THRESHOLD {
+                if hint <= micro_threshold {
                     micro_candidates.push(ScheduledBatchFile {
                         entry: file.clone(),
                         estimated_size: hint,
                         enqueue_order,
                     });
-                } else if hint <= BATCH_LARGE_THRESHOLD {
+                } else if hint <= large_threshold {
                     small_candidates.push(ScheduledBatchFile {
                         entry: file.clone(),
                         estimated_size: hint,
@@ -1327,34 +2167,35 @@ pub async fn start_batch_download(
             }
         }
 
-        match probe_target(&sniff_client, &file.url, &app).await {
+        let mut probed_file = file.clone();
+        match probe_target_with_alternates(&sniff_client, &mut probed_file, &app).await {
             Ok(probe) => {
-                let estimated_size = file.size_hint.unwrap_or(probe.content_length);
-                if probe.content_length <= BATCH_MICRO_THRESHOLD {
+                let estimated_size = probed_file.size_hint.unwrap_or(probe.content_length);
+                if probe.content_length <= micro_threshold {
                     micro_candidates.push(ScheduledBatchFile {
-                        entry: file.clone(),
+                        entry: probed_file.clone(),
                         estimated_size,
                         enqueue_order,
                     });
-                } else if probe.content_length <= BATCH_LARGE_THRESHOLD {
+                } else if probe.content_length <= large_threshold {
                     small_candidates.push(ScheduledBatchFile {
-                        entry: file.clone(),
+                        entry: probed_file.clone(),
                         estimated_size,
                         enqueue_order,
                     });
                 } else {
                     large_candidates.push(ScheduledBatchFile {
-                        entry: file.clone(),
+                        entry: probed_file.clone(),
                         estimated_size,
                         enqueue_order,
                     });
                 }
             }
             Err(_) => small_candidates.push(ScheduledBatchFile {
-                entry: file.clone(),
-                estimated_size: file
+                entry: probed_file.clone(),
+                estimated_size: probed_file
                     .size_hint
-                    .unwrap_or(BATCH_LARGE_THRESHOLD.saturating_sub(1)),
+                    .unwrap_or(large_threshold.saturating_sub(1)),
                 enqueue_order,
             }),
         }
@@ -1366,6 +2207,15 @@ pub async fn start_batch_download(
     let micro_files = schedule_srpt_with_starvation(micro_candidates);
     let small_files = schedule_srpt_with_starvation(small_candidates);
     let large_files = schedule_srpt_with_starvation(large_candidates);
+    let lane_plan = plan_batch_lanes(&batch_download_budget, is_onion, total_files, &large_files);
+    let micro_files = diversify_first_wave_by_host(
+        micro_files,
+        batch_first_wave_width(lane_plan.micro_parallelism),
+    );
+    let small_files = diversify_first_wave_by_host(
+        small_files,
+        batch_first_wave_width(lane_plan.small_parallelism),
+    );
 
     let _ = app.emit(
         "log",
@@ -1383,10 +2233,26 @@ pub async fn start_batch_download(
     let _ = app.emit(
         "log",
         format!(
-            "[+] Batch routing: {} micro (bg) + {} small (concurrent) + {} large (pipeline)",
+            "[+] Batch routing: {} micro (bg) + {} small (concurrent) + {} large ({})",
             micro_files.len(),
             small_files.len(),
-            large_files.len()
+            large_files.len(),
+            if lane_plan.overlap_large_phase {
+                "overlapped pipeline"
+            } else {
+                "serial pipeline"
+            }
+        ),
+    );
+
+    let _ = app.emit(
+        "log",
+        format!(
+            "[*] Batch lane plan: micro_parallel={} small_parallel={} large_lane={} overlap={}",
+            lane_plan.micro_parallelism,
+            lane_plan.small_parallelism,
+            lane_plan.large_pipeline_circuits,
+            lane_plan.overlap_large_phase
         ),
     );
 
@@ -1402,7 +2268,7 @@ pub async fn start_batch_download(
         let active_batch_circuits_clone = Arc::clone(&active_batch_circuits);
         let control_clone = control.clone();
         let batch_telemetry_clone = batch_telemetry.clone();
-        let micro_parallelism = batch_download_budget.micro_swarm_circuits;
+        let micro_parallelism = lane_plan.micro_parallelism;
         let total = total_files;
         let micro_jwt_cache = Arc::clone(&jwt_cache);
         let active_client_ptrs_clone = active_client_ptrs.clone();
@@ -1425,11 +2291,66 @@ pub async fn start_batch_download(
                 micro_jwt_cache,
                 total,
                 active_client_ptrs_clone,
+                batch_started_at,
             )
             .await;
         })
     } else {
         tokio::spawn(async move {}) // No-op if empty
+    };
+
+    let large_pipeline_handle = if lane_plan.overlap_large_phase && !large_files.is_empty() {
+        let app_clone = app.clone();
+        let large_files_clone = large_files.clone();
+        let control_clone = control.clone();
+        let overall_completed_clone = Arc::clone(&overall_completed);
+        let overall_failed_clone = Arc::clone(&overall_failed);
+        let overall_downloaded_bytes_clone = Arc::clone(&overall_downloaded_bytes);
+        let active_batch_circuits_clone = Arc::clone(&active_batch_circuits);
+        let batch_telemetry_clone = batch_telemetry.clone();
+        let jwt_cache_clone = Arc::clone(&jwt_cache);
+        let output_dir_clone = output_dir.clone();
+        let large_pipeline_circuits = lane_plan.large_pipeline_circuits;
+
+        tokio::spawn(async move {
+            let overlap_ready = wait_for_large_overlap_window(
+                &overall_completed_clone,
+                &overall_downloaded_bytes_clone,
+                &control_clone,
+            )
+            .await;
+            if !overlap_ready {
+                let _ = app_clone.emit(
+                    "log",
+                    "[*] Phase 2 overlap parked; no early useful completions yet. Large files stay in serial fallback.".to_string(),
+                );
+                return false;
+            }
+            let _ = app_clone.emit(
+                "log",
+                "[*] Phase 2 overlap armed after early useful completions.".to_string(),
+            );
+            process_large_pipeline(
+                app_clone,
+                large_files_clone,
+                large_pipeline_circuits,
+                force_tor,
+                output_dir_clone,
+                control_clone,
+                overall_completed_clone,
+                overall_failed_clone,
+                overall_downloaded_bytes_clone,
+                active_batch_circuits_clone,
+                batch_telemetry_clone,
+                jwt_cache_clone,
+                total_files,
+                batch_started_at,
+            )
+            .await;
+            true
+        })
+    } else {
+        tokio::spawn(async move { false })
     };
 
     // -- Phase 1: Download small files concurrently (one file per circuit) --
@@ -1438,7 +2359,7 @@ pub async fn start_batch_download(
             "Phase 1 (Small)",
             app.clone(),
             small_files,
-            small_file_parallelism,
+            lane_plan.small_parallelism,
             active_ports.clone(),
             daemon_count,
             is_onion,
@@ -1451,105 +2372,40 @@ pub async fn start_batch_download(
             Arc::clone(&jwt_cache),
             total_files,
             active_client_ptrs.clone(),
+            batch_started_at,
         )
         .await;
     }
 
-    // -- Phase 2: Download large files with full pipeline (tournament + steal) --
-    for (i, file) in large_files.iter().enumerate() {
-        if control.interruption_reason().is_some() {
-            break;
-        }
+    let overlap_processed = large_pipeline_handle.await.unwrap_or(false);
 
-        let _ = app.emit(
-            "log",
-            format!(
-                "[*] Phase 2: Large file {}/{}: {}",
-                i + 1,
-                large_files.len(),
-                file.path
-            ),
-        );
-
-        publish_batch_progress(
-            &app,
-            BatchProgressEvent {
-                completed: overall_completed.load(Ordering::Relaxed),
-                failed: overall_failed.load(Ordering::Relaxed),
-                total: total_files,
-                current_file: file.path.clone(),
-                speed_mbps: 0.0,
-                downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
-                active_circuits: None,
-            },
-        );
-
-        let inner_control = DownloadControl::new();
-        let result = start_download(
+    if ((!lane_plan.overlap_large_phase) || !overlap_processed) && !large_files.is_empty() {
+        process_large_pipeline(
             app.clone(),
-            file.clone(),
+            large_files,
             batch_circuit_cap,
             force_tor,
             output_dir.clone(),
-            inner_control,
+            control.clone(),
+            Arc::clone(&overall_completed),
+            Arc::clone(&overall_failed),
+            Arc::clone(&overall_downloaded_bytes),
+            Arc::clone(&active_batch_circuits),
+            batch_telemetry.clone(),
             Arc::clone(&jwt_cache),
+            total_files,
+            batch_started_at,
         )
         .await;
-
-        match result {
-            Ok(()) => {
-                let bytes = std::fs::metadata(&file.path)
-                    .map(|meta| meta.len())
-                    .ok()
-                    .or(file.size_hint)
-                    .unwrap_or(0);
-                if bytes > 0 {
-                    overall_downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
-                }
-                let completed = overall_completed.fetch_add(1, Ordering::Relaxed) + 1;
-                publish_batch_progress(
-                    &app,
-                    BatchProgressEvent {
-                        completed,
-                        failed: overall_failed.load(Ordering::Relaxed),
-                        total: total_files,
-                        current_file: file.path.clone(),
-                        speed_mbps: 0.0,
-                        downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
-                        active_circuits: None,
-                    },
-                );
-            }
-            Err(err) => {
-                let failed = overall_failed.fetch_add(1, Ordering::Relaxed) + 1;
-                let _ = app.emit(
-                    "log",
-                    format!("[!] Large file failed: {} ({})", file.path, err),
-                );
-                publish_batch_progress(
-                    &app,
-                    BatchProgressEvent {
-                        completed: overall_completed.load(Ordering::Relaxed),
-                        failed,
-                        total: total_files,
-                        current_file: file.path.clone(),
-                        speed_mbps: 0.0,
-                        downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
-                        active_circuits: None,
-                    },
-                );
-            }
-        }
     }
 
+    // Phase 0: Ensure micro background swarm has finished
+    let _ = micro_swarm_handle.await;
     let completed = overall_completed.load(Ordering::Relaxed);
     let failed = overall_failed.load(Ordering::Relaxed);
     if let Some(telemetry) = &batch_telemetry {
         telemetry.set_active_circuits(0);
     }
-
-    // Phase 0: Ensure micro background swarm has finished
-    let _ = micro_swarm_handle.await;
 
     publish_batch_progress(
         &app,
@@ -1558,7 +2414,10 @@ pub async fn start_batch_download(
             failed,
             total: total_files,
             current_file: "Batch complete".to_string(),
-            speed_mbps: 0.0,
+            speed_mbps: batch_speed_mbps(
+                overall_downloaded_bytes.load(Ordering::Relaxed),
+                batch_started_at,
+            ),
             downloaded_bytes: overall_downloaded_bytes.load(Ordering::Relaxed),
             active_circuits: Some(0),
         },
@@ -1587,7 +2446,7 @@ pub async fn start_download(
     let _download_session_guard =
         telemetry_handle(&app).map(crate::runtime_metrics::DownloadSessionGuard::new);
     let requested_circuits = num_circuits.max(1);
-    let is_onion = entry.url.contains(".onion") || force_tor;
+    let is_onion = crate::url_targets_onion(&entry.url) || force_tor;
     let download_telemetry = telemetry_handle(&app);
     let state_file_path = format!("{}.ariaforge_state", entry.path);
     // Download to a temp file with .ariaforge extension, rename on completion
@@ -1654,7 +2513,10 @@ pub async fn start_download(
         let mut download_guard = state.download_swarm_guard.lock().await;
 
         let needs_bootstrap = match download_guard.as_ref() {
-            Some(arc) => arc.lock().await.native_swarm.is_none() || arc.lock().await.get_arti_clients().is_empty(),
+            Some(arc) => {
+                arc.lock().await.native_swarm.is_none()
+                    || arc.lock().await.get_arti_clients().is_empty()
+            }
             None => true,
         };
 
@@ -1665,7 +2527,13 @@ pub async fn start_download(
                     .to_string(),
             );
 
-            match crate::tor::bootstrap_tor_cluster(app.clone(), bootstrap_budget.circuit_cap, 128).await
+            match crate::tor::bootstrap_tor_cluster_for_traffic(
+                app.clone(),
+                bootstrap_budget.circuit_cap,
+                128,
+                crate::tor::SwarmTrafficClass::OnionService,
+            )
+            .await
             {
                 Ok((new_guard, _ports)) => {
                     *download_guard = Some(std::sync::Arc::new(tokio::sync::Mutex::new(new_guard)));
@@ -1675,14 +2543,14 @@ pub async fn start_download(
                     );
                 }
                 Err(e) => {
-                    return Err(anyhow::anyhow!("Failed to bootstrap Aria Forge Tor cluster: {}", e));
+                    return Err(anyhow::anyhow!(
+                        "Failed to bootstrap Aria Forge Tor cluster: {}",
+                        e
+                    ));
                 }
             }
         } else {
-            logger.log(
-                &app,
-                "[✓] Reusing active TorForge client slots".to_string(),
-            );
+            logger.log(&app, "[✓] Reusing active TorForge client slots".to_string());
         }
 
         if let Some(arc) = download_guard.as_ref() {
@@ -1798,7 +2666,7 @@ pub async fn start_download(
         }
     }
 
-    let probe = probe_target(&sniff_client, &entry.url, &app).await?;
+    let probe = probe_target_with_alternates(&sniff_client, &mut entry, &app).await?;
     let range_mode = probe.supports_ranges;
     let download_budget = crate::resource_governor::recommend_download_budget(
         requested_circuits,
@@ -1867,6 +2735,19 @@ pub async fn start_download(
         etag: probe.etag.clone(),
         last_modified: probe.last_modified.clone(),
     };
+    let piece_size = if range_mode {
+        compute_piece_size(state.content_length, effective_circuits)
+    } else {
+        0
+    };
+    let total_pieces = if range_mode {
+        state.content_length.div_ceil(piece_size) as usize
+    } else {
+        0
+    };
+    if range_mode {
+        normalize_download_state(&mut state, effective_circuits, piece_size, total_pieces);
+    }
 
     let mut is_resuming = false;
     let mut starting_total_downloaded = 0u64;
@@ -1879,24 +2760,16 @@ pub async fn start_download(
                     && parsed.etag == state.etag
                     && parsed.last_modified == state.last_modified
                 {
-                    if parsed.current_offsets.len() != effective_circuits {
-                        parsed.current_offsets = vec![0; effective_circuits];
-                    }
+                    normalize_download_state(
+                        &mut parsed,
+                        effective_circuits,
+                        piece_size,
+                        total_pieces,
+                    );
                     state = parsed;
                     is_resuming = true;
-                    for (i, &done) in state.completed_chunks.iter().enumerate() {
-                        if done {
-                            let end_byte = if i == effective_circuits - 1 {
-                                state.content_length.saturating_sub(1)
-                            } else {
-                                ((i as u64 + 1) * state.chunk_size).saturating_sub(1)
-                            };
-                            let start_byte = i as u64 * state.chunk_size;
-                            starting_total_downloaded += end_byte.saturating_sub(start_byte) + 1;
-                        } else {
-                            starting_total_downloaded += state.current_offsets[i];
-                        }
-                    }
+                    starting_total_downloaded =
+                        estimate_downloaded_bytes(&state, effective_circuits);
                     let done = state.completed_chunks.iter().filter(|done| **done).count();
                     let _ = app.emit(
                         "log",
@@ -1919,15 +2792,7 @@ pub async fn start_download(
     }
 
     if range_mode {
-        let piece_size = compute_piece_size(state.content_length, effective_circuits);
-        let total_pieces = state.content_length.div_ceil(piece_size) as usize;
-        if !state.piece_mode || state.total_pieces != total_pieces {
-            state.piece_mode = true;
-            state.total_pieces = total_pieces;
-            if state.completed_pieces.len() != total_pieces {
-                state.completed_pieces = vec![false; total_pieces];
-            }
-        }
+        normalize_download_state(&mut state, effective_circuits, piece_size, total_pieces);
     }
 
     let resume_if_range = preferred_if_range(&state.etag, &state.last_modified);
@@ -1983,7 +2848,7 @@ pub async fn start_download(
 
     let writer_app = app.clone();
     let writer_logger = logger.clone();
-    let writer_handle = tokio::task::spawn_blocking(move || -> Result<()> {
+    let writer_handle = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let mut active_filepath = String::new();
         let mut active_file: Option<File> = None;
         let mut active_mmap: Option<memmap2::MmapMut> = None;
@@ -1992,6 +2857,32 @@ pub async fn start_download(
         let mut pieces_since_flush = 0u32; // Throttle state saves
         let mut last_write_end: u64 = u64::MAX; // Phase 4.5: track for write coalescing
         let mut idle_polls = 0u32;
+
+        let mut hash_byte_offset: u64 = 0;
+        #[allow(unused_imports)]
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        let mut disk_intervals = IntervalTracker::new();
+
+        if let Some((st, _)) = &local_state {
+            if st.piece_mode && !st.completed_pieces.is_empty() && st.chunk_size > 0 {
+                for (i, &done) in st.completed_pieces.iter().enumerate() {
+                    if done {
+                        let p_start = i as u64 * st.chunk_size;
+                        let p_end = (p_start + st.chunk_size).min(st.content_length);
+                        disk_intervals.add(p_start, p_end);
+                    }
+                }
+            } else if !st.piece_mode && !st.completed_chunks.is_empty() && st.chunk_size > 0 {
+                for (i, &done) in st.completed_chunks.iter().enumerate() {
+                    if done {
+                        let c_start = i as u64 * st.chunk_size;
+                        let c_end = (c_start + st.chunk_size).min(st.content_length);
+                        disk_intervals.add(c_start, c_end);
+                    }
+                }
+            }
+        }
 
         loop {
             let msg = match rx.pop() {
@@ -2073,10 +2964,52 @@ pub async fn start_download(
                     // If mmap failed to allocate (e.g. low 4GB RAM or fragmented hard drive),
                     // fallback to standard file writes.
                     if msg.offset != last_write_end {
+                        use std::io::{Seek, SeekFrom};
                         file.seek(SeekFrom::Start(msg.offset))?;
                     }
+                    use std::io::Write;
                     file.write_all(&msg.data)?;
                     last_write_end = msg.offset + msg.data.len() as u64;
+                }
+
+                if msg.offset == hash_byte_offset {
+                    hasher.update(&msg.data);
+                    hash_byte_offset += msg.data.len() as u64;
+                }
+                disk_intervals.add(msg.offset, msg.offset + msg.data.len() as u64);
+
+                let new_contiguous = disk_intervals.contiguous_up_to();
+                if new_contiguous > hash_byte_offset {
+                    let to_hash_len = (new_contiguous - hash_byte_offset) as usize;
+                    if let Some(mmap) = active_mmap.as_ref() {
+                        let start_idx = hash_byte_offset as usize;
+                        let end_idx = start_idx + to_hash_len;
+                        if end_idx <= mmap.len() {
+                            hasher.update(&mmap[start_idx..end_idx]);
+                            hash_byte_offset = new_contiguous;
+                        }
+                    } else if active_file.is_some() {
+                        if let Ok(mut r) = File::open(&active_filepath) {
+                            use std::io::{Read, Seek, SeekFrom};
+                            if r.seek(SeekFrom::Start(hash_byte_offset)).is_ok() {
+                                let mut buffer = vec![0u8; 1_048_576];
+                                let mut bytes_to_read = to_hash_len;
+                                while bytes_to_read > 0 {
+                                    let chunk_size = bytes_to_read.min(buffer.len());
+                                    if let Ok(n) = r.read(&mut buffer[..chunk_size]) {
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        hasher.update(&buffer[..n]);
+                                        bytes_to_read -= n;
+                                        hash_byte_offset += n as u64;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if let Some((state, _)) = local_state.as_mut() {
@@ -2084,9 +3017,18 @@ pub async fn start_download(
                         let chunk_start = msg.chunk_id as u64 * state.chunk_size;
                         let written_global = msg.offset + msg.data.len() as u64;
                         let chunk_offset = written_global.saturating_sub(chunk_start);
+                        let piece_len = piece_len_for_index(
+                            state.content_length,
+                            state.chunk_size,
+                            msg.chunk_id,
+                        );
 
                         if chunk_offset > state.current_offsets[msg.chunk_id] {
-                            state.current_offsets[msg.chunk_id] = chunk_offset;
+                            state.current_offsets[msg.chunk_id] = if piece_len > 0 {
+                                chunk_offset.min(piece_len)
+                            } else {
+                                chunk_offset
+                            };
                         }
                     }
                 }
@@ -2112,6 +3054,13 @@ pub async fn start_download(
                         let capped_end = msg.piece_end.min(state.completed_pieces.len() - 1);
                         for piece_idx in msg.chunk_id..=capped_end {
                             state.completed_pieces[piece_idx] = true;
+                            if piece_idx < state.current_offsets.len() {
+                                state.current_offsets[piece_idx] = piece_len_for_index(
+                                    state.content_length,
+                                    state.chunk_size,
+                                    piece_idx,
+                                );
+                            }
                         }
                     }
                     pieces_since_flush += 1;
@@ -2146,7 +3095,17 @@ pub async fn start_download(
             }
         }
 
-        Ok(())
+        let final_hash = if let Some((st, _)) = &local_state {
+            if hash_byte_offset >= st.content_length && st.content_length > 0 {
+                Some(hex::encode(hasher.finalize()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(final_hash)
     });
 
     let total_downloaded = Arc::new(AtomicU64::new(starting_total_downloaded));
@@ -2446,7 +3405,11 @@ pub async fn start_download(
                         9051 // Fallback for non-onion, though unchoke_is_onion should handle this
                     };
 
-                    let client = match get_arti_client(unchoke_is_onion, unchoke_id, &unchoke_active_client_ptrs) {
+                    let client = match get_arti_client(
+                        unchoke_is_onion,
+                        unchoke_id,
+                        &unchoke_active_client_ptrs,
+                    ) {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
@@ -2550,10 +3513,12 @@ pub async fn start_download(
                 handshake_tasks.spawn(async move {
                     let port = active_ports_clone[c % daemon_count.max(1)] as usize;
                     let start = Instant::now();
-                    let client = match get_arti_client(is_onion_clone, c, &circuit_active_client_ptrs_clone) {
-                        Ok(c) => c,
-                        Err(_) => return (c, port, None, u128::MAX),
-                    };
+                    let client =
+                        match get_arti_client(is_onion_clone, c, &circuit_active_client_ptrs_clone)
+                        {
+                            Ok(c) => c,
+                            Err(_) => return (c, port, None, u128::MAX),
+                        };
                     // HEAD request to force the SOCKS5 handshake through Tor
                     let latency = match tokio::time::timeout(
                         Duration::from_secs(15),
@@ -2590,8 +3555,7 @@ pub async fn start_download(
             results.sort_by_key(|r| r.3);
 
             // Keep top circuits (cull bottom HANDSHAKE_CULL_RATIO)
-            let keep_count =
-                ((results.len() as f64 * (1.0 - HANDSHAKE_CULL_RATIO)) as usize).max(1);
+            let keep_count = handshake_keep_count(results.len(), scaled_circuits, is_onion);
             let cutoff_latency = results.get(keep_count).map(|r| r.3).unwrap_or(u128::MAX);
 
             for (i, (cid, port, client_opt, _latency)) in results.into_iter().enumerate() {
@@ -2900,7 +3864,7 @@ pub async fn start_download(
                             }
                         };
 
-                        if let Some(delay) = ddos_guard.record_response(response.status().as_u16()) {
+                        if let Some(delay) = ddos_guard.record_response_legacy(response.status().as_u16()) {
                             tokio::time::sleep(delay).await;
                         }
 
@@ -3104,7 +4068,10 @@ pub async fn start_download(
             });
         }
     } else {
-        logger.log(&app, "[!] Engaging 1-Circuit Fallback Stream Mode".to_string());
+        logger.log(
+            &app,
+            "[!] Engaging 1-Circuit Fallback Stream Mode".to_string(),
+        );
         let stream_client = get_arti_client(is_onion, 0, &active_client_ptrs)?;
         let task_tx = tx.clone();
         let task_app = app.clone();
@@ -3330,15 +4297,17 @@ pub async fn start_download(
         telemetry.set_active_circuits(0);
     }
 
-    match writer_handle.await {
-        Ok(Ok(())) => {}
+    let writer_hash = match writer_handle.await {
+        Ok(Ok(h)) => h,
         Ok(Err(err)) => {
             failure.get_or_insert(err.to_string());
+            None
         }
         Err(err) => {
             failure.get_or_insert(format!("writer task join failure: {err}"));
+            None
         }
-    }
+    };
 
     let _ = app.emit(
         "tor_status",
@@ -3503,31 +4472,44 @@ pub async fn start_download(
         }
     });
 
-    let hash = tokio::task::spawn_blocking(move || -> Result<String> {
-        let mut file = File::open(&output_target_clone)?;
-        let mut hasher = Sha256::new();
-        // Massively accelerate SHA256 disk I/O with 4MB pipelined heap buffers
-        let mut buffer = vec![0u8; 4 * 1024 * 1024];
-        let mut total_hashed: u64 = 0;
-        let mut last_report: u64 = 0;
-        loop {
-            let bytes = file.read(&mut buffer)?;
-            if bytes == 0 {
-                break;
+    let hash = if let Some(h) = writer_hash {
+        let _ = app.emit(
+            "download_status",
+            serde_json::json!({
+                "phase": "sha256_progress",
+                "message": "SHA256: 100% (In-Flight Accelerated)",
+                "pct": 100.0,
+                "eta_secs": 0.0,
+            }),
+        );
+        h
+    } else {
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let mut file = File::open(&output_target_clone)?;
+            let mut hasher = Sha256::new();
+            // Massively accelerate SHA256 disk I/O with 4MB pipelined heap buffers
+            let mut buffer = vec![0u8; 4 * 1024 * 1024];
+            let mut total_hashed: u64 = 0;
+            let mut last_report: u64 = 0;
+            loop {
+                let bytes = file.read(&mut buffer)?;
+                if bytes == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..bytes]);
+                total_hashed += bytes as u64;
+                // Report every ~5MB to avoid flooding the channel
+                if total_hashed - last_report >= 5_242_880 {
+                    let _ = sha_tx.blocking_send(total_hashed);
+                    last_report = total_hashed;
+                }
             }
-            hasher.update(&buffer[..bytes]);
-            total_hashed += bytes as u64;
-            // Report every ~5MB to avoid flooding the channel
-            if total_hashed - last_report >= 5_242_880 {
-                let _ = sha_tx.blocking_send(total_hashed);
-                last_report = total_hashed;
-            }
-        }
-        let _ = sha_tx.blocking_send(total_hashed); // Final report
-        drop(sha_tx); // Close channel to signal watcher
-        Ok(hex::encode(hasher.finalize()))
-    })
-    .await??;
+            let _ = sha_tx.blocking_send(total_hashed); // Final report
+            drop(sha_tx); // Close channel to signal watcher
+            Ok(hex::encode(hasher.finalize()))
+        })
+        .await??
+    };
 
     sha_watcher.abort(); // Stop watcher
 
@@ -3597,7 +4579,10 @@ pub async fn start_download(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_piece_spans, PieceSpan};
+    use super::{
+        build_piece_spans, estimate_downloaded_bytes, normalize_download_state,
+        piece_len_for_index, DownloadState, PieceSpan,
+    };
 
     #[test]
     fn piece_spans_coalesce_contiguous_missing_runs() {
@@ -3641,7 +4626,61 @@ mod tests {
         );
     }
 
-    use super::{schedule_srpt_with_starvation, BatchFileEntry, ScheduledBatchFile};
+    #[test]
+    fn piece_mode_resume_accounting_tracks_partial_progress_beyond_first_wave() {
+        let mut state = DownloadState {
+            completed_chunks: vec![false; 4],
+            current_offsets: vec![0; 4],
+            num_circuits: 4,
+            chunk_size: 0,
+            content_length: 100,
+            piece_mode: true,
+            completed_pieces: vec![false; 10],
+            total_pieces: 10,
+            etag: None,
+            last_modified: None,
+        };
+        normalize_download_state(&mut state, 4, 10, 10);
+        state.completed_pieces[0] = true;
+        state.completed_pieces[1] = true;
+        state.current_offsets[4] = 6;
+        state.current_offsets[9] = 5;
+
+        assert_eq!(estimate_downloaded_bytes(&state, 4), 31);
+    }
+
+    #[test]
+    fn normalize_download_state_expands_piece_offsets_to_total_piece_count() {
+        let mut state = DownloadState {
+            completed_chunks: vec![false; 4],
+            current_offsets: vec![0; 4],
+            num_circuits: 4,
+            chunk_size: 0,
+            content_length: 95,
+            piece_mode: true,
+            completed_pieces: vec![false; 8],
+            total_pieces: 8,
+            etag: None,
+            last_modified: None,
+        };
+
+        normalize_download_state(&mut state, 4, 10, 10);
+
+        assert_eq!(state.current_offsets.len(), 10);
+        assert_eq!(state.completed_pieces.len(), 10);
+        assert_eq!(state.chunk_size, 10);
+        assert_eq!(piece_len_for_index(95, 10, 9), 5);
+    }
+
+    use super::{
+        batch_entry_host, batch_large_threshold_bytes, batch_micro_threshold_bytes,
+        batch_no_byte_requeue_limit, batch_swarm_first_byte_timeout, diversify_first_wave_by_host,
+        handshake_keep_count, plan_batch_lanes, remap_queued_file_to_next_alternate,
+        schedule_srpt_with_starvation, BatchFileEntry, QueuedBatchFile, ScheduledBatchFile,
+        DEFAULT_BATCH_LARGE_THRESHOLD_CLEARNET, DEFAULT_BATCH_LARGE_THRESHOLD_ONION_HEAVY,
+        DEFAULT_BATCH_MICRO_THRESHOLD,
+    };
+    use crate::resource_governor::{DownloadBudget, GovernorPressure};
 
     #[test]
     fn test_srpt_scheduling_order() {
@@ -3652,6 +4691,7 @@ mod tests {
                     path: "a".to_string(),
                     size_hint: Some(100),
                     jwt_exp: None,
+                    alternate_urls: Vec::new(),
                 },
                 estimated_size: 100,
                 enqueue_order: 0,
@@ -3662,6 +4702,7 @@ mod tests {
                     path: "b".to_string(),
                     size_hint: Some(10),
                     jwt_exp: None,
+                    alternate_urls: Vec::new(),
                 },
                 estimated_size: 10,
                 enqueue_order: 1,
@@ -3672,6 +4713,7 @@ mod tests {
                     path: "c".to_string(),
                     size_hint: Some(50),
                     jwt_exp: None,
+                    alternate_urls: Vec::new(),
                 },
                 estimated_size: 50,
                 enqueue_order: 2,
@@ -3685,5 +4727,178 @@ mod tests {
         assert_eq!(scheduled[0].url, "b");
         assert_eq!(scheduled[1].url, "c");
         assert_eq!(scheduled[2].url, "a");
+    }
+
+    #[test]
+    fn onion_batch_promotes_mid_size_files_to_large_pipeline() {
+        std::env::remove_var("CRAWLI_BATCH_MICRO_THRESHOLD_MIB");
+        std::env::remove_var("CRAWLI_BATCH_LARGE_THRESHOLD_MIB");
+        assert_eq!(batch_micro_threshold_bytes(), DEFAULT_BATCH_MICRO_THRESHOLD);
+        assert_eq!(
+            batch_large_threshold_bytes(true, 2_533, 120),
+            DEFAULT_BATCH_LARGE_THRESHOLD_ONION_HEAVY
+        );
+        assert_eq!(
+            batch_large_threshold_bytes(false, 2_533, 120),
+            DEFAULT_BATCH_LARGE_THRESHOLD_CLEARNET
+        );
+    }
+
+    #[test]
+    fn onion_batch_overlap_reserves_large_lane_inside_stable_cap() {
+        let budget = DownloadBudget {
+            circuit_cap: 16,
+            small_file_parallelism: 8,
+            initial_active_cap: 10,
+            tournament_cap: 24,
+            micro_swarm_circuits: 8,
+            pressure: GovernorPressure::default(),
+        };
+        let large_files = vec![
+            BatchFileEntry {
+                url: "a".to_string(),
+                path: "a".to_string(),
+                size_hint: Some(400 * 1_048_576),
+                jwt_exp: None,
+                alternate_urls: Vec::new(),
+            },
+            BatchFileEntry {
+                url: "b".to_string(),
+                path: "b".to_string(),
+                size_hint: Some(300 * 1_048_576),
+                jwt_exp: None,
+                alternate_urls: Vec::new(),
+            },
+        ];
+
+        let plan = plan_batch_lanes(&budget, true, 2_394, &large_files);
+
+        assert!(plan.overlap_large_phase);
+        assert_eq!(plan.large_pipeline_circuits, 4);
+        assert_eq!(plan.micro_parallelism, 6);
+        assert_eq!(plan.small_parallelism, 6);
+        assert_eq!(
+            plan.micro_parallelism + plan.small_parallelism + plan.large_pipeline_circuits,
+            budget.circuit_cap
+        );
+    }
+
+    #[test]
+    fn small_or_clearnet_batches_keep_serial_large_phase() {
+        let budget = DownloadBudget {
+            circuit_cap: 16,
+            small_file_parallelism: 8,
+            initial_active_cap: 10,
+            tournament_cap: 24,
+            micro_swarm_circuits: 8,
+            pressure: GovernorPressure::default(),
+        };
+        let one_large = vec![BatchFileEntry {
+            url: "a".to_string(),
+            path: "a".to_string(),
+            size_hint: Some(32 * 1_048_576),
+            jwt_exp: None,
+            alternate_urls: Vec::new(),
+        }];
+
+        let onion_plan = plan_batch_lanes(&budget, true, 32, &one_large);
+        let clearnet_plan = plan_batch_lanes(&budget, false, 4_240, &one_large);
+
+        assert!(!onion_plan.overlap_large_phase);
+        assert!(!clearnet_plan.overlap_large_phase);
+        assert_eq!(onion_plan.large_pipeline_circuits, budget.circuit_cap);
+        assert_eq!(clearnet_plan.large_pipeline_circuits, budget.circuit_cap);
+    }
+
+    #[test]
+    fn first_wave_is_diversified_by_host() {
+        let files = vec![
+            BatchFileEntry {
+                url: "http://a.onion/file1".to_string(),
+                path: "1".to_string(),
+                size_hint: Some(1),
+                jwt_exp: None,
+                alternate_urls: Vec::new(),
+            },
+            BatchFileEntry {
+                url: "http://a.onion/file2".to_string(),
+                path: "2".to_string(),
+                size_hint: Some(2),
+                jwt_exp: None,
+                alternate_urls: Vec::new(),
+            },
+            BatchFileEntry {
+                url: "http://b.onion/file3".to_string(),
+                path: "3".to_string(),
+                size_hint: Some(3),
+                jwt_exp: None,
+                alternate_urls: Vec::new(),
+            },
+            BatchFileEntry {
+                url: "http://c.onion/file4".to_string(),
+                path: "4".to_string(),
+                size_hint: Some(4),
+                jwt_exp: None,
+                alternate_urls: Vec::new(),
+            },
+        ];
+
+        let diversified = diversify_first_wave_by_host(files, 3);
+        let first_hosts = diversified
+            .iter()
+            .take(3)
+            .map(|file| batch_entry_host(&file.url).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_hosts, vec!["a.onion", "b.onion", "c.onion"]);
+    }
+
+    #[test]
+    fn batch_swarm_defaults_enable_no_byte_escape_for_onion() {
+        std::env::remove_var("CRAWLI_BATCH_SWARM_FIRST_BYTE_TIMEOUT_SECS");
+        std::env::remove_var("CRAWLI_BATCH_NO_BYTE_REQUEUE_LIMIT");
+
+        assert_eq!(
+            batch_swarm_first_byte_timeout(true),
+            std::time::Duration::from_secs(18)
+        );
+        assert_eq!(batch_no_byte_requeue_limit(), 2);
+    }
+
+    #[test]
+    fn queued_file_remap_rotates_to_next_alternate_host() {
+        let mut queued = QueuedBatchFile {
+            entry: BatchFileEntry {
+                url: "http://hosta.onion/root/file.pdf".to_string(),
+                path: "file.pdf".to_string(),
+                size_hint: Some(10),
+                jwt_exp: None,
+                alternate_urls: vec![
+                    "http://hostb.onion/root/file.pdf".to_string(),
+                    "http://hostc.onion/root/file.pdf".to_string(),
+                ],
+            },
+            requeue_count: 0,
+            alternate_url_cursor: 0,
+        };
+
+        let remap = remap_queued_file_to_next_alternate(&mut queued).expect("should remap");
+
+        assert_eq!(remap.0, "hosta.onion");
+        assert_eq!(remap.1, "hostb.onion");
+        assert_eq!(queued.entry.url, "http://hostb.onion/root/file.pdf");
+        assert_eq!(queued.alternate_url_cursor, 1);
+    }
+
+    #[test]
+    fn clearnet_handshake_filter_keeps_target_worker_set() {
+        assert_eq!(handshake_keep_count(37, 32, false), 32);
+        assert_eq!(handshake_keep_count(24, 16, false), 16);
+    }
+
+    #[test]
+    fn onion_handshake_filter_still_culls_bottom_half() {
+        assert_eq!(handshake_keep_count(24, 16, true), 12);
+        assert_eq!(handshake_keep_count(1, 1, true), 1);
     }
 }

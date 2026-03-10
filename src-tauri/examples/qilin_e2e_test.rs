@@ -44,18 +44,13 @@ async fn main() -> Result<()> {
     let max_attempts = 4;
     for attempt in 1..=max_attempts {
         print!("  Attempt {}/{}... ", attempt, max_attempts);
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            client.get(url).send(),
-        ).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), client.get(url).send()).await
+        {
             Ok(Ok(resp)) => {
                 status = resp.status().as_u16();
                 let final_url = resp.url().as_str().to_string();
                 println!("✅ status={} final_url={}", status, final_url);
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
-                    resp.text(),
-                ).await {
+                match tokio::time::timeout(std::time::Duration::from_secs(15), resp.text()).await {
                     Ok(Ok(text)) => {
                         println!("  Body: {} bytes", text.len());
                         body = text;
@@ -68,13 +63,15 @@ async fn main() -> Result<()> {
             Ok(Err(e)) => {
                 println!("❌ {}", e);
                 if attempt < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_millis(attempt as u64 * 750)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(attempt as u64 * 750))
+                        .await;
                 }
             }
             Err(_) => {
                 println!("⏰ TIMEOUT (30s)");
                 if attempt < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_millis(attempt as u64 * 750)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(attempt as u64 * 750))
+                        .await;
                 }
             }
         }
@@ -104,12 +101,30 @@ async fn main() -> Result<()> {
 
     // Debug: show what was checked
     println!("  Debug checks:");
-    println!("    URL contains /site/view: {}", url.contains("/site/view"));
-    println!("    URL contains /site/data: {}", url.contains("/site/data"));
-    println!("    Body contains QData: {}", body.contains("<div class=\"page-header-title\">QData</div>"));
-    println!("    Body contains Data browser: {}", body.contains("Data browser"));
-    println!("    Body contains table#list: {}", body.contains("<table id=\"list\">"));
-    println!("    Body contains td.link: {}", body.contains("<td class=\"link\">"));
+    println!(
+        "    URL contains /site/view: {}",
+        url.contains("/site/view")
+    );
+    println!(
+        "    URL contains /site/data: {}",
+        url.contains("/site/data")
+    );
+    println!(
+        "    Body contains QData: {}",
+        body.contains("<div class=\"page-header-title\">QData</div>")
+    );
+    println!(
+        "    Body contains Data browser: {}",
+        body.contains("Data browser")
+    );
+    println!(
+        "    Body contains table#list: {}",
+        body.contains("<table id=\"list\">")
+    );
+    println!(
+        "    Body contains td.link: {}",
+        body.contains("<td class=\"link\">")
+    );
     println!("    Body first 200 chars: {}", &body[..body.len().min(200)]);
     println!();
 
@@ -128,21 +143,34 @@ async fn main() -> Result<()> {
     let storage_url = match tokio::time::timeout(
         std::time::Duration::from_secs(45),
         node_cache.discover_and_resolve(url, uuid, &client, None),
-    ).await {
+    )
+    .await
+    {
         Ok(Some(node)) => {
-            println!("  ✅ Resolved: {} ({}ms) in {:.1}s", node.host, node.avg_latency_ms, s4.elapsed().as_secs_f64());
+            println!(
+                "  ✅ Resolved: {} ({}ms) in {:.1}s",
+                node.host,
+                node.avg_latency_ms,
+                s4.elapsed().as_secs_f64()
+            );
             node.url
         }
         Ok(None) => {
             println!("  ⚠ No node resolved. Trying fallback mirrors...");
             // Try direct mirror
-            let fallback = format!("http://7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion/{}/", uuid);
+            let fallback = format!(
+                "http://7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion/{}/",
+                uuid
+            );
             println!("  Using fallback: {}", fallback);
             fallback
         }
         Err(_) => {
             println!("  ⏰ Discovery TIMED OUT after 45s. Using fallback.");
-            format!("http://7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion/{}/", uuid)
+            format!(
+                "http://7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion/{}/",
+                uuid
+            )
         }
     };
     println!();
@@ -154,13 +182,12 @@ async fn main() -> Result<()> {
     match tokio::time::timeout(
         std::time::Duration::from_secs(20),
         client.get(&storage_url).send(),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(resp)) => {
             println!("status={}", resp.status());
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                resp.text(),
-            ).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(15), resp.text()).await {
                 Ok(Ok(html)) => {
                     println!("  Body: {} bytes", html.len());
 
@@ -174,7 +201,9 @@ async fn main() -> Result<()> {
                     for cap in v3_row_re.captures_iter(&html) {
                         if let (Some(href), Some(size)) = (cap.get(1), cap.get(2)) {
                             let h = href.as_str();
-                            if h == "../" || h == "/" || h.starts_with('?') { continue; }
+                            if h == "../" || h == "/" || h.starts_with('?') {
+                                continue;
+                            }
                             if h.ends_with('/') {
                                 dirs.push(h.to_string());
                             } else {
@@ -215,8 +244,12 @@ async fn main() -> Result<()> {
 
     let total = total_start.elapsed();
     println!("\n╔═══════════════════════════════════════════╗");
-    println!("║  TOTAL TIME: {:.1}s ({}m {}s)              ║",
-        total.as_secs_f64(), total.as_secs() / 60, total.as_secs() % 60);
+    println!(
+        "║  TOTAL TIME: {:.1}s ({}m {}s)              ║",
+        total.as_secs_f64(),
+        total.as_secs() / 60,
+        total.as_secs() % 60
+    );
     println!("╚═══════════════════════════════════════════╝");
     Ok(())
 }

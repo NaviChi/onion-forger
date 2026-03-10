@@ -63,8 +63,16 @@ struct BenchmarkResult {
     crawl_duration_secs: f64,
     entries_per_second: f64,
     bytes_per_second: f64,
+    requests_per_entry: f64,
     tor_bootstrap_secs: f64,
     fingerprint_secs: f64,
+    subtree_reroutes: usize,
+    subtree_quarantine_hits: usize,
+    off_winner_child_requests: usize,
+    winner_host: String,
+    slowest_circuit: String,
+    late_throttles: usize,
+    outlier_isolations: usize,
     error_message: String,
     diagnosis: String,
 }
@@ -72,11 +80,11 @@ struct BenchmarkResult {
 impl BenchmarkResult {
     fn header() -> String {
         format!(
-            "{:<18} {:<35} {:<55} {:<12} {:<35} {:>8} {:>8} {:>8} {:>14} {:>10} {:>12} {:>12} {:>10} {:>10} {:<30} {:<60}",
+            "{:<18} {:<35} {:<55} {:<12} {:<35} {:>8} {:>8} {:>8} {:>14} {:>10} {:>12} {:>12} {:>10} {:>10} {:>10} {:>8} {:>8} {:>8} {:<22} {:<14} {:>8} {:>8} {:<30} {:<60}",
             "TEST_ID", "ADAPTER", "URL", "STATUS", "MATCHED_ADAPTER",
             "FILES", "FOLDERS", "ENTRIES", "SIZE_BYTES",
             "DURATION", "ENTRIES/s", "BYTES/s",
-            "TOR_BOOT", "FP_SECS", "ERROR", "DIAGNOSIS"
+            "REQ/ENTRY", "TOR_BOOT", "FP_SECS", "SUB_RER", "Q_HITS", "OFFWIN", "WINNER", "SLOWEST", "LATE", "OUTLIER", "ERROR", "DIAGNOSIS"
         )
     }
 
@@ -96,14 +104,21 @@ impl BenchmarkResult {
         } else {
             self.diagnosis.clone()
         };
+        let winner_display = if self.winner_host.len() > 20 {
+            format!("{}...", &self.winner_host[..17])
+        } else {
+            self.winner_host.clone()
+        };
 
         format!(
-            "{:<18} {:<35} {:<55} {:<12} {:<35} {:>8} {:>8} {:>8} {:>14} {:>10.2} {:>12.2} {:>12.2} {:>10.2} {:>10.2} {:<30} {:<60}",
+            "{:<18} {:<35} {:<55} {:<12} {:<35} {:>8} {:>8} {:>8} {:>14} {:>10.2} {:>12.2} {:>12.2} {:>10.2} {:>10.2} {:>10.2} {:>8} {:>8} {:>8} {:<22} {:<14} {:>8} {:>8} {:<30} {:<60}",
             self.test_id, self.adapter_name, url_display,
             self.status, self.matched_adapter,
             self.total_files, self.total_folders, self.total_entries, self.total_size_bytes,
             self.crawl_duration_secs, self.entries_per_second, self.bytes_per_second,
-            self.tor_bootstrap_secs, self.fingerprint_secs,
+            self.requests_per_entry, self.tor_bootstrap_secs, self.fingerprint_secs,
+            self.subtree_reroutes, self.subtree_quarantine_hits, self.off_winner_child_requests,
+            winner_display, self.slowest_circuit, self.late_throttles, self.outlier_isolations,
             error_display, diag_display,
         )
     }
@@ -207,16 +222,24 @@ fn main() {
 
         println!("[STEP] Bootstrapping {}-daemon Tor swarm...", TOR_DAEMONS);
         let tor_start = Instant::now();
-        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), TOR_DAEMONS, 0)
-            .await
-            .expect("bootstrap tor cluster");
+        let (guard, active_ports) = tor::bootstrap_tor_cluster_for_traffic(
+            app_handle.clone(),
+            TOR_DAEMONS,
+            0,
+            tor::SwarmTrafficClass::OnionService,
+        )
+        .await
+        .expect("bootstrap tor cluster");
+        let arti_clients = guard.get_arti_clients();
         let tor_bootstrap_secs = tor_start.elapsed().as_secs_f64();
         println!(
-            "[STEP] Tor ready in {:.2}s on ports {:?}\n",
-            tor_bootstrap_secs, active_ports
+            "[STEP] Tor ready in {:.2}s via {} runtime | {} in-process clients | {} managed ports {:?}\n",
+            tor_bootstrap_secs,
+            guard.runtime_label(),
+            arti_clients.len(),
+            active_ports.len(),
+            active_ports
         );
-
-        let arti_clients = guard.get_arti_clients();
         let mut all_results: Vec<BenchmarkResult> = Vec::new();
 
         // Run benchmark for each URL
@@ -287,15 +310,18 @@ fn main() {
             .join("tests")
             .join("benchmark_results.csv");
         let mut csv = String::new();
-        csv.push_str("test_id,adapter,url,status,matched_adapter,files,folders,entries,size_bytes,duration_secs,entries_per_sec,bytes_per_sec,tor_boot_secs,fp_secs,error,diagnosis\n");
+        csv.push_str("test_id,adapter,url,status,matched_adapter,files,folders,entries,size_bytes,duration_secs,entries_per_sec,bytes_per_sec,requests_per_entry,tor_boot_secs,fp_secs,subtree_reroutes,subtree_quarantine_hits,off_winner_child_requests,winner_host,slowest_circuit,late_throttles,outlier_isolations,error,diagnosis\n");
         for r in &all_results {
             csv.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{}\n",
                 r.test_id, r.adapter_name,
                 r.url.replace(',', "%2C"), r.status, r.matched_adapter,
                 r.total_files, r.total_folders, r.total_entries, r.total_size_bytes,
                 r.crawl_duration_secs, r.entries_per_second, r.bytes_per_second,
-                r.tor_bootstrap_secs, r.fingerprint_secs,
+                r.requests_per_entry, r.tor_bootstrap_secs, r.fingerprint_secs,
+                r.subtree_reroutes, r.subtree_quarantine_hits, r.off_winner_child_requests,
+                r.winner_host.replace(',', ";"), r.slowest_circuit.replace(',', ";"),
+                r.late_throttles, r.outlier_isolations,
                 r.error_message.replace(',', ";"), r.diagnosis.replace(',', ";"),
             ));
         }
@@ -312,6 +338,8 @@ async fn run_single_benchmark(
     tor_bootstrap_secs: f64,
     benchmark_duration: u64,
 ) -> BenchmarkResult {
+    let telemetry = app_handle.state::<AppState>().telemetry.clone();
+    let _telemetry_session = crawli_lib::runtime_metrics::CrawlSessionGuard::new(telemetry.clone());
     let mut result = BenchmarkResult {
         test_id: test_url.id.clone(),
         adapter_name: test_url.adapter.clone(),
@@ -325,8 +353,16 @@ async fn run_single_benchmark(
         crawl_duration_secs: 0.0,
         entries_per_second: 0.0,
         bytes_per_second: 0.0,
+        requests_per_entry: 0.0,
         tor_bootstrap_secs,
         fingerprint_secs: 0.0,
+        subtree_reroutes: 0,
+        subtree_quarantine_hits: 0,
+        off_winner_child_requests: 0,
+        winner_host: "-".to_string(),
+        slowest_circuit: "-".to_string(),
+        late_throttles: 0,
+        outlier_isolations: 0,
         error_message: String::new(),
         diagnosis: String::new(),
     };
@@ -344,7 +380,7 @@ async fn run_single_benchmark(
         mega_password: None,
     };
 
-    let daemon_count = active_ports.len().max(1);
+    let daemon_count = arti_clients.len().max(active_ports.len()).max(1);
     let frontier = CrawlerFrontier::new(
         Some(app_handle.clone()),
         test_url.url.clone(),
@@ -356,95 +392,112 @@ async fn run_single_benchmark(
         None, // missing target ledger bound
     );
 
-    // Phase 1: Fingerprint the target
-    println!("  [FP] Fetching fingerprint for {}...", test_url.url);
-    let fp_start = Instant::now();
-    let fp_timeout = Duration::from_secs(60);
-
-    let fingerprint_result = tokio::time::timeout(fp_timeout, async {
-        for attempt in 1..=3 {
-            let (retry_cid, retry_client) = frontier.get_client();
-
-            if attempt > 1 {
-                println!("  [FP] Retry #{} with fresh circuit...", attempt);
-            }
-
-            match tokio::time::timeout(
-                Duration::from_secs(30),
-                retry_client.get(&test_url.url).send(),
-            )
-            .await
-            {
-                Ok(Ok(resp)) => {
-                    let status = resp.status().as_u16();
-                    let headers: http::HeaderMap = resp.headers().clone();
-                    match tokio::time::timeout(Duration::from_secs(30), resp.text()).await {
-                        Ok(Ok(body)) => {
-                            frontier.record_success(
-                                retry_cid,
-                                body.len() as u64,
-                                fp_start.elapsed().as_millis() as u64,
-                            );
-                            return Ok(SiteFingerprint {
-                                url: test_url.url.clone(),
-                                status,
-                                headers: convert_headers(&headers),
-                                body,
-                            });
-                        }
-                        Ok(Err(e)) => println!("  [FP] Body read error: {}", e),
-                        Err(_) => println!("  [FP] Body read timeout"),
-                    }
-                }
-                Ok(Err(e)) => println!("  [FP] Request error: {}", e),
-                Err(_) => println!("  [FP] Request timeout (30s)"),
-            }
-            frontier.record_failure(retry_cid);
-        }
-        Err(anyhow::anyhow!("All 3 fingerprint attempts failed"))
-    })
-    .await;
-
-    let fingerprint = match fingerprint_result {
-        Ok(Ok(fp)) => {
-            result.fingerprint_secs = fp_start.elapsed().as_secs_f64();
-            println!(
-                "  [FP] Fingerprint obtained in {:.2}s (status={}, body_len={})",
-                result.fingerprint_secs,
-                fp.status,
-                fp.body.len()
-            );
-            fp
-        }
-        Ok(Err(e)) => {
-            result.status = "ERROR".to_string();
-            result.error_message = format!("Fingerprint failed: {}", e);
-            result.fingerprint_secs = fp_start.elapsed().as_secs_f64();
-            result.diagnosis = diagnose_result(&result);
-            return result;
-        }
-        Err(_) => {
-            result.status = "ERROR".to_string();
-            result.error_message = format!("Fingerprint timed out after {}s", fp_timeout.as_secs());
-            result.fingerprint_secs = fp_start.elapsed().as_secs_f64();
-            result.diagnosis = diagnose_result(&result);
-            return result;
-        }
-    };
-
-    // Phase 2: Determine adapter
     let registry = AdapterRegistry::new();
-    let adapter = match registry.determine_adapter(&fingerprint).await {
-        Some(a) => {
-            result.matched_adapter = a.name().to_string();
-            println!("  [ADAPT] Matched adapter: {}", a.name());
-            a
-        }
-        None => {
-            result.status = "ERROR".to_string();
-            result.error_message = "No adapter matched fingerprint".to_string();
-            result.diagnosis = diagnose_result(&result);
-            return result;
+    let adapter = if let Some(adapter) = registry.determine_adapter_from_url_hint(&test_url.url) {
+        result.fingerprint_secs = 0.0;
+        telemetry.set_fingerprint_latency_ms(0);
+        result.matched_adapter = adapter.name().to_string();
+        println!(
+            "  [FP] Strong URL hint matched {}. Skipping network fingerprint.",
+            adapter.name()
+        );
+        adapter
+    } else {
+        // Phase 1: Fingerprint the target
+        println!("  [FP] Fetching fingerprint for {}...", test_url.url);
+        let fp_start = Instant::now();
+        let fp_timeout = Duration::from_secs(60);
+
+        let fingerprint_result = tokio::time::timeout(fp_timeout, async {
+            for attempt in 1..=3 {
+                let (retry_cid, retry_client) = frontier.get_client();
+
+                if attempt > 1 {
+                    println!("  [FP] Retry #{} with fresh circuit...", attempt);
+                }
+
+                match tokio::time::timeout(
+                    Duration::from_secs(30),
+                    retry_client.get(&test_url.url).send(),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => {
+                        let status = resp.status().as_u16();
+                        let headers: http::HeaderMap = resp.headers().clone();
+                        match tokio::time::timeout(Duration::from_secs(30), resp.text()).await {
+                            Ok(Ok(body)) => {
+                                frontier.record_success(
+                                    retry_cid,
+                                    body.len() as u64,
+                                    fp_start.elapsed().as_millis() as u64,
+                                );
+                                return Ok(SiteFingerprint {
+                                    url: test_url.url.clone(),
+                                    status,
+                                    headers: convert_headers(&headers),
+                                    body,
+                                });
+                            }
+                            Ok(Err(e)) => println!("  [FP] Body read error: {}", e),
+                            Err(_) => println!("  [FP] Body read timeout"),
+                        }
+                    }
+                    Ok(Err(e)) => println!("  [FP] Request error: {}", e),
+                    Err(_) => println!("  [FP] Request timeout (30s)"),
+                }
+                frontier.record_failure(retry_cid);
+            }
+            Err(anyhow::anyhow!("All 3 fingerprint attempts failed"))
+        })
+        .await;
+
+        let fingerprint = match fingerprint_result {
+            Ok(Ok(fp)) => {
+                result.fingerprint_secs = fp_start.elapsed().as_secs_f64();
+                telemetry
+                    .set_fingerprint_latency_ms((result.fingerprint_secs * 1000.0).round() as u64);
+                println!(
+                    "  [FP] Fingerprint obtained in {:.2}s (status={}, body_len={})",
+                    result.fingerprint_secs,
+                    fp.status,
+                    fp.body.len()
+                );
+                fp
+            }
+            Ok(Err(e)) => {
+                result.status = "ERROR".to_string();
+                result.error_message = format!("Fingerprint failed: {}", e);
+                result.fingerprint_secs = fp_start.elapsed().as_secs_f64();
+                telemetry
+                    .set_fingerprint_latency_ms((result.fingerprint_secs * 1000.0).round() as u64);
+                result.diagnosis = diagnose_result(&result);
+                return result;
+            }
+            Err(_) => {
+                result.status = "ERROR".to_string();
+                result.error_message =
+                    format!("Fingerprint timed out after {}s", fp_timeout.as_secs());
+                result.fingerprint_secs = fp_start.elapsed().as_secs_f64();
+                telemetry
+                    .set_fingerprint_latency_ms((result.fingerprint_secs * 1000.0).round() as u64);
+                result.diagnosis = diagnose_result(&result);
+                return result;
+            }
+        };
+
+        match registry.determine_adapter(&fingerprint).await {
+            Some(adapter) => {
+                result.matched_adapter = adapter.name().to_string();
+                println!("  [ADAPT] Matched adapter: {}", adapter.name());
+                adapter
+            }
+            None => {
+                result.status = "ERROR".to_string();
+                result.error_message = "No adapter matched fingerprint".to_string();
+                result.diagnosis = diagnose_result(&result);
+                return result;
+            }
         }
     };
 
@@ -529,6 +582,36 @@ async fn run_single_benchmark(
     }
 
     frontier_arc.cancel();
+    telemetry.set_request_metrics(
+        frontier_arc.processed_count(),
+        frontier_arc.successful_count(),
+        frontier_arc.failed_count(),
+    );
+    let snapshot = telemetry.snapshot_counters();
+    println!(
+        "  [EFF] final requests={} success={} failure={} req/entry={:.2} fingerprint={}ms cache_hits={} subtree_reroutes={} quarantine_hits={} off_winner_child_requests={} winner_host={} slowest_circuit={} late_throttles={} outlier_isolations={}",
+        snapshot.total_requests,
+        snapshot.successful_requests,
+        snapshot.failed_requests,
+        snapshot.total_requests as f64 / result.total_entries.max(1) as f64,
+        snapshot.fingerprint_latency_ms,
+        snapshot.cached_route_hits,
+        snapshot.subtree_reroutes,
+        snapshot.subtree_quarantine_hits,
+        snapshot.off_winner_child_requests,
+        snapshot.winner_host.as_deref().unwrap_or("-"),
+        snapshot.slowest_circuit.as_deref().unwrap_or("-"),
+        snapshot.late_throttles,
+        snapshot.outlier_isolations,
+    );
+    result.requests_per_entry = snapshot.total_requests as f64 / result.total_entries.max(1) as f64;
+    result.subtree_reroutes = snapshot.subtree_reroutes;
+    result.subtree_quarantine_hits = snapshot.subtree_quarantine_hits;
+    result.off_winner_child_requests = snapshot.off_winner_child_requests;
+    result.winner_host = snapshot.winner_host.unwrap_or_else(|| "-".to_string());
+    result.slowest_circuit = snapshot.slowest_circuit.unwrap_or_else(|| "-".to_string());
+    result.late_throttles = snapshot.late_throttles;
+    result.outlier_isolations = snapshot.outlier_isolations;
     result.diagnosis = diagnose_result(&result);
     result
 }

@@ -30,9 +30,14 @@ fn main() {
 
         tor::cleanup_stale_tor_daemons();
         println!("[+] Bootstrapping Tor cluster (1 daemon)...");
-        let (guard, active_ports) = tor::bootstrap_tor_cluster(app_handle.clone(), 1, 0)
-            .await
-            .expect("Bootstrap failed");
+        let (guard, active_ports) = tor::bootstrap_tor_cluster_for_traffic(
+            app_handle.clone(),
+            1,
+            0,
+            tor::SwarmTrafficClass::OnionService,
+        )
+        .await
+        .expect("Bootstrap failed");
 
         // Wait briefly for Tor nodes to stabilize
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -132,6 +137,7 @@ fn main() {
                     path: format!("{}/{}", output_dir, file.path.split('/').last().unwrap_or("test_dw")),
                     size_hint: file.size_bytes,
                     jwt_exp: file.jwt_exp,
+                    alternate_urls: Vec::new(),
                 };
 
                 let control = aria_downloader::activate_download_control().unwrap();

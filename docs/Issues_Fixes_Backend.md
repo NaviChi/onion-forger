@@ -1,4 +1,205 @@
-> **Last Updated:** 2026-03-07T15:52 CST
+> **Last Updated:** 2026-03-10T06:00 CDT
+
+## Phase 86C: Arti Hot-Start + Hinted Warmup Bypass (2026-03-10)
+
+### Issues Found
+1. **Qilin Still Bootstrapped A Second Cold Arti Pool After Discovery** — even after storage resolution, the runtime still paid a second `MultiClientPool` hot-start instead of reusing the already-live swarm.
+2. **Hinted Onion Crawls Still Paid A Blocking Warmup Before A Skipped Fingerprint** — strong Qilin URL hints already selected the adapter, but the crawl still waited on onion warmup first.
+3. **Stage D Could Let Two Fresh Redirects Crowd Out The Stable Winner** — the first probe wave could spend its entire budget on volatile fresh hosts and only reach the cached winner after a full timeout class.
+4. **Frontier Client Count Could Stay Pinned To The Bootstrap Snapshot** — background Arti expansion could finish after bootstrap-return time, while the frontier still believed it only had the original ready quorum.
+
+### Fixes Implemented
+1. **Seeded MultiClientPool Reuse** — `multi_client_pool.rs` now seeds follow-on pools from already-hot swarm clients and derives extra slots with isolated handles instead of cold-bootstrapping a second pool.
+2. **Hinted Warmup Bypass** — `lib.rs` now skips blocking onion warmup whenever a strong URL hint already selects the adapter and the fingerprint GET will be skipped.
+3. **Stage D Stable-Slot Reservation** — `qilin_nodes.rs` now reserves first-wave capacity for the best stable candidate before appending the rest of the fresh redirect set.
+4. **Frontier Live-Client Refresh** — `frontier.rs` / `lib.rs` now refresh the frontier from the live swarm before hinted onion execution.
+
+### Validation
+- `cargo build --manifest-path 'crawli/src-tauri/Cargo.toml' --bin crawli` → success
+- `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' qilin --lib` → `22/22` pass
+- Live exact-target reruns:
+  - adapter handoff dropped from `138.83s` to `71.08s`
+  - the old `~55s` `storage resolved -> first circuit hot` delay was eliminated
+  - residual blockers became root durability and phantom-pool depletion, not fingerprinting or second-pool bootstrap
+
+## Phase 84: Qilin Frontier Telemetry Alignment + Compact CLI Summary + Live GUI Parity (2026-03-10)
+
+### Issues Found
+1. **Qilin Fast Path Bypassed Shared Frontier Counters** — the adapter’s normal request lane did real hidden-service fetches without incrementing `CrawlerFrontier::processed_requests`, so `processedNodes` stayed at `0` during live work.
+2. **Qilin Active Workers Were Invisible To Shared Status** — the fast path did not acquire the frontier semaphore or emit any alternate active-worker signal, so `activeWorkers` stayed at `0` unless a request fell into the slower governor lane.
+3. **Long Live CLI Crawls Had No Condensed Operator Summary** — the main binary could stream raw logs, but there was no compact progress view for `phase / queue / workers / current node / failovers` on the real product surface.
+4. **Terminal / GUI Worker Metrics Could Hold A Stale Final Value** — the last resource snapshot could keep the prior `activeWorkers/workerTarget` pair after completion because the session closed before a zeroed metrics frame was pushed.
+
+### Root Cause Analysis
+- Qilin maintained its own `pending` queue and request lifecycle outside the generic frontier bookkeeping.
+- The shared crawl status emitter only knew about `processed_requests` plus semaphore-derived workers.
+- Runtime worker telemetry was being written by the governor’s slow-path lane, not by the actual live request activity.
+- CLI observability stopped at raw event streaming; there was no operator-facing summary layer on top of the bridge payloads.
+
+### Fixes Implemented
+1. **Frontier Adapter Progress Overlay** — Added adapter-side `pending / active_workers / worker_target` overlay fields plus `progress_snapshot()` in `src-tauri/src/frontier.rs`. Shared crawl status now consumes that unified snapshot instead of recomputing everything from the frontier semaphore alone.
+2. **Qilin Request-Lifecycle Guards** — Added Qilin-local RAII guards that sync pending depth, active request count, and runtime worker metrics from the actual fast-path request lifecycle. This keeps the shared status plane aligned without forcing Qilin back through the slower semaphore path.
+3. **Fast-Path Success / Failure Accounting** — Qilin now records fast-path request outcomes through `CrawlerFrontier::record_success` / `record_failure`, and success is only counted after body decode succeeds so a single response no longer emits a success followed by a decode-failure penalty.
+4. **Compact CLI Summary Mode** — Added `--progress-summary` and `--progress-summary-interval-ms` to `src-tauri/src/cli.rs`. The summary is derived from the live `telemetry_bridge_update` payloads of the main binary itself; no helper benchmark or script path was introduced.
+5. **Terminal Zeroed Worker Snapshot** — Final crawl shutdown now publishes a zeroed worker-metrics resource snapshot so CLI and GUI surfaces do not retain the last live worker count after the crawl completes.
+6. **Live GUI Parity Rerun** — Re-ran the same Qilin target through the actual Tauri window with native UI input, confirming the GUI path reached the same bootstrap, fingerprint, Qilin match, and Stage A storage-redirect discovery milestones as the CLI path.
+
+### Validation
+- `cargo check --manifest-path 'crawli/src-tauri/Cargo.toml'` → success
+- `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' cli::tests --quiet` → 6/6 pass
+- `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' frontier::tests --quiet` → 2/2 pass
+- Live CLI rerun:
+  - `./crawli/src-tauri/target/debug/crawli --progress-summary --progress-summary-interval-ms 3000 crawl --url 'http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=f0668431-ee3f-3570-99cb-ea7d9c0691c6' --output-dir '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_cli_qilin_phase84'`
+  - Observed bootstrap at `16.8s`, fingerprint at `25.9s`, Stage A rotated redirect to `2dgrxjhee2rgibck...onion/cd6e50e2-bfe0-462e-b2c8-bb51993acd87/`, and compact summary movement from `workers=0/0` to `workers=1/8` with final `processed=1`.
+- Live GUI rerun:
+  - `npm run dev -- --host 127.0.0.1 --port 1420` + `./src-tauri/target/debug/crawli`
+  - Native UI input of the same target triggered the real GUI crawl path and reached fingerprint plus Stage A rotated redirect discovery to `x54h7i3afmu6clyg...onion/0edc707e-1d39-459a-a424-ee0b0c7d05f2/`.
+- Live target note:
+  - The March 10, 2026 parity reruns both hit volatile rotated storage hosts that were unreachable at probe time, so the CLI fallback run completed with `0` discovered entries. That reflects live target rotation / reachability instability, not a regression in Qilin adapter matching.
+
+### Prevention Rules
+- **P84-1:** Any adapter that performs real work outside the frontier semaphore must project its pending and active request state back into the shared frontier snapshot.
+- **P84-2:** Fast-path request accounting must still hit the shared frontier counters. Hidden work is worse than approximate work.
+- **P84-3:** Count request success only after body decode succeeds. Do not mark a request successful and then penalize the same response because the decode stage failed.
+- **P84-4:** Long-lived operator crawls on the primary binary must have a condensed summary mode; raw bridge-frame inspection is an escalation path, not the default operator view.
+- **P84-5:** Final worker telemetry must publish a zeroed terminal snapshot so GUI/CLI surfaces do not display stale live worker counts after completion.
+
+## Phase 83: Main-Binary CLI Mode & Live Qilin CLI Validation (2026-03-10)
+
+### Issues Found
+1. **Main Binary Had No First-Class CLI Mode** — `src-tauri/src/main.rs` always launched the Tauri window through `crawli_lib::run()`. Headless validation of the shipped program required examples/helper binaries instead of the real application entrypoint.
+2. **Detached GUI Commands Were Not Safe CLI Operations** — `initiate_download` returned immediately by spawning a background task, and `pre_resolve_onion` silently no-op’d if no prewarmed crawl swarm already existed. Those semantics are fine in a GUI, but they break one-shot CLI execution.
+3. **CLI Event Streaming Was Too Noisy For Live Qilin Runs** — blindly mirroring `telemetry_bridge_update` flooded stderr and buried the actual Tor/bootstrap/adapter decisions operators need.
+
+### Root Cause Analysis
+- The main Tauri binary had a GUI-only startup path even though the backend command surface was already reusable.
+- Some command handlers encoded GUI-friendly detached behavior rather than completion-friendly CLI behavior.
+- Dashboard telemetry frames were being treated as if they were human terminal logs.
+
+### Fixes Implemented
+1. **First-Class Main-Binary CLI Dispatcher** — Added `src-tauri/src/cli.rs` and updated `src-tauri/src/lib.rs` so `run()` now branches between GUI and CLI while preserving one shared `AppState` / backend surface.
+2. **Shared Backend Helpers For CLI Parity** — Added a blocking single-file download helper for CLI reuse, promoted onion pre-resolve into a reusable internal helper, and taught pre-resolve to bootstrap a crawl swarm on-demand.
+3. **Single Tauri Context Source** — Centralized `tauri::generate_context!()` behind one shared helper to avoid duplicate embedded-symbol linker collisions during `cargo test`.
+4. **Readable CLI Event Policy** — Default CLI stderr now streams actionable events only, while `telemetry_bridge_update` is opt-in via `--include-telemetry-events`. String payloads are dequoted before printing.
+5. **Live Main-Binary Qilin Validation** — Verified the shipped binary directly against `http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=f0668431-ee3f-3570-99cb-ea7d9c0691c6`, reaching real storage-node rotation/discovery plus recursive child parsing under the live storage tree.
+
+### Validation
+- `cargo check --manifest-path 'crawli/src-tauri/Cargo.toml'` → success
+- `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' cli::tests` → 4/4 pass
+- `cargo run --quiet --manifest-path 'crawli/src-tauri/Cargo.toml' -- adapter-catalog --compact-json` → success
+- `cargo run --quiet --manifest-path 'crawli/src-tauri/Cargo.toml' -- detect-input-mode --input 'http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=f0668431-ee3f-3570-99cb-ea7d9c0691c6' --compact-json` → success
+- Live main-binary crawl reached a rotated storage redirect (`bw2eqn5sp5yhe64g...onion/4de7c659-b065-4207-b9ce-16013bac9054/`) and recursive child parsing within `crawli/tmp/live_cli_qilin_f0668431`
+
+### Prevention Rules
+- **P83-1:** If the main Tauri binary needs GUI and CLI modes, implement both behind one shared entrypoint and one shared `AppState`. Do not fork behavior into examples first.
+- **P83-2:** Detached Tauri commands are GUI semantics, not CLI semantics. Any command that spawns-and-returns must expose a blocking helper for one-shot CLI use.
+- **P83-3:** `tauri::generate_context!()` must be centralized behind one function in a library crate. Multiple expansions will collide at test link time.
+- **P83-4:** Human CLI output must default to operator-useful logs, not raw dashboard telemetry floods. High-frequency bridge frames must be opt-in.
+
+## Phase 78: Zero-Copy SIMD Parsing & Batched Sled Streaming (2026-03-09)
+
+### Issues Found
+1. **CPU Parsing Bottlenecks** — Profiling revealed that `regex::Regex` execution during QData V3 HTML parsing and CMS Blog extraction was burning extreme amounts of CPU, creating a parsing stall-wall for massive directory listings.
+2. **Sled Sync Overhead** — `vfs::insert_entries` flushed to the sled database every 500 items at a 500ms cadence. During massive URL torrents from Qilin root pages, this caused synchronous `flush_async` thread contention that stalled the Tokio executor.
+
+### Fixes Implemented
+1. **Zero-Copy SIMD HTML Extraction** — Purged standard Regex patterns entirely in `qilin.rs`. Replaced them with raw string-slice parsing loops and `.find()` windowing, natively leveraging `memchr` (SIMD) for zero-allocation parsing at gigabyte/sec speeds.
+2. **5000-Item VFS Batches** — Upgraded the `ui_flush_task` threshold in `qilin.rs` from 500 items / 500ms to 5,000 items / 2,000ms. This dramatically reduces the frequency of `insert_entries` sled flushes and eliminates React UI render lag on the frontend during peak bursts.
+
+### Prevention Rules
+- **P78-1:** Avoid regular expressions for gigabyte-scale DOM extraction; use strictly bounded string-slice indexing and `memchr` (`find`) for parsing massive HTML/JSON strings.
+- **P78-2:** Disk flushes inside high-concurrency tokio loops MUST be heavily batched. A 500-item batch is too restrictive for an engine capable of discovering 20,000 files in a single burst.
+
+## Phase 77E: Pending Counter Fix, Auto-Discovery Registry & Parallel Acceleration (2026-03-09)
+
+### Issues Found
+1. **Pending Counter Underflow to usize::MAX** — With `CRAWLI_QILIN_WORKERS=16`, the `TaskGuard::drop()` used raw `fetch_sub(1)` on the pending `AtomicUsize`. When more workers competed to decrement than items existed, the counter wrapped to `18446744073709551614` (usize::MAX - 1), preventing the crawl completion idle check from ever seeing `pending == 0`.
+2. **No Global Node Discovery** — Storage nodes discovered from 302 redirects were only cached per-victim-UUID, not globally. Next time a different victim was crawled, the discovered node was lost.
+
+### Root Cause Analysis
+- The `TaskGuard` RAII struct decremented `pending` on drop, but with 16 workers racing, spurious decrements exceeded actual enqueued items.
+- The sled DB schema stored nodes under `node:<uuid>:<host>`, but had no cross-UUID global registry.
+
+### Fixes Implemented
+1. **Saturating Pending Decrement** — Both `TaskGuard::drop()` sites (lines 2085, 2999) now use `fetch_update(|v| Some(v.saturating_sub(1)))` instead of raw `fetch_sub(1)`. This prevents wraparound to `usize::MAX`.
+2. **Global Host Registry** — Added `GlobalHostRecord` struct and three new methods to `QilinNodeCache`:
+   - `register_discovered_host()`: Saves hosts to `global_host:<host>` keys with first-seen/last-seen tracking
+   - `get_all_global_hosts()`: Returns all globally known hosts
+   - `emit_node_inventory()`: Emits `qilin_nodes_updated` Tauri event with total count + host list
+3. **Auto-Seeding from Prior Sessions** — `seed_known_mirrors()` now merges hardcoded hosts with dynamically-discovered hosts from the global registry.
+4. **Stage A Auto-Registration** — Every 302 redirect discovery automatically registers the host globally and emits a UI update.
+
+### Validation
+- `cargo test --lib` → 63/63 pass
+- Soak test (16 workers, 4 arti clients): **2,484 entries in 123.2s at 20.17 entries/sec** ✅
+- Clean termination (no pending counter stall)
+- New host `isbbnfgsv2jycdbx...onion` auto-registered during crawl
+
+### Prevention Rules
+- **P77E-1:** NEVER use raw `fetch_sub(1)` on pending counters — always use `fetch_update` with `saturating_sub` to prevent wraparound.
+- **P77E-2:** Storage node discoveries from 302 redirects MUST be persisted globally, not just per-UUID, to benefit future crawls.
+- **P77E-3:** Emit `qilin_nodes_updated` event to the UI whenever the node inventory changes so the user can see growing infrastructure.
+
+## Phase 77D: UUID Remapping Discovery & Storage Node Rotation (2026-03-09)
+
+### Issues Found
+1. **CMS UUID ≠ Storage UUID** — Stage A and Stage D probed storage nodes with `/<cms_uuid>/` which ALWAYS returns 404. The CMS silently remaps victim UUIDs: CMS UUID `f0668431-ee3f-...` → Storage UUID `7844d54e-11da-...`. The storage path only exists under the remapped UUID.
+2. **pandora42btu is NOT a Qilin storage node** — It's the Pandora RaaS platform (a completely separate ransomware group). The Qilin CMS footer contains an affiliate link to pandora42btu, which Stage B's regex picked up as a "storage reference." All 10 tested Qilin victim UUIDs returned 404 on pandora.
+3. **Storage Node Rotation** — Each request to `/site/data?uuid=` redirects to a DIFFERENT storage `.onion` node. Qilin uses load-balanced storage distribution. The redirect target from the first probe (`onlta6cik...`) differed from the soak test redirect target (`nenvi5anqg2...`).
+
+### Root Cause Analysis
+- Probing pandora42btu root `/` revealed `<title>Pandora</title>` with sections for "Registration", "Payment", "LOGIN", "SITE RULES" — a fully independent ransomware platform.
+- CMS main page contains exactly ONE `.onion` reference — `pandora42btu` — in the footer as an affiliate link.
+- Capturing 20 victims' `/site/data?uuid=` 302 redirects found 3 unique storage nodes, none matching any known mirror. Only 3/20 victims had active redirects (others returned 404, suggesting delisted victims).
+- The `send_capturing_redirect()` approach captures the Location header WITHOUT following it, getting the correct storage URL even when the target node is offline.
+
+### Fixes Implemented
+1. **`send_capturing_redirect()` method** in `arti_client.rs` — Performs the HTTP request but stops at the first response, capturing the Location header instead of following the redirect. Returns `(ArtiResponse, Option<redirect_url>)`.
+2. **Stage A rewrite** in `qilin_nodes.rs` — Uses `send_capturing_redirect()` to get the true storage URL (with remapped UUID and correct `.onion` host), caches it, then optionally attempts to connect to the storage node.
+3. **pandora42btu removal** from `seed_known_mirrors()` + added to Stage B blocklist to prevent re-discovery.
+4. **3 new active storage nodes** added to known mirrors: `onlta6cik...`, `42hfjtvbstk...`, `5nqgp7hms...`.
+
+### Validation
+- `cargo test --lib` → 63/63 pass
+- Soak test: **2,484 entries (2,263 files + 221 folders, 43.87GB) in 138.9s at 17.88 entries/sec** ✅
+- Stage A correctly captured redirect: 302 → `nenvi5anqg2up7jw...onion/7844d54e-.../` (200 OK, 2523 bytes)
+- Full recursive folder traversal completed (222 folders, 100% verification)
+
+### Prevention Rules
+- **P77D-1:** NEVER assume CMS UUIDs match storage paths. Always capture the 302 redirect URL to get the remapped UUID.
+- **P77D-2:** `.onion` addresses found in CMS HTML (footer, sidebar, affiliate links) are NOT necessarily storage nodes — verify by checking root `/` page identity.
+- **P77D-3:** Qilin rotates storage nodes between requests. The redirect target from `/site/data?uuid=` may differ on each call.
+- **P77D-4:** When probing for redirect targets, disable redirect following to capture the Location header before the (potentially offline) target connection fails.
+
+## Phase 77C: Qilin CMS Bypass & Staggered Wave Probing (2026-03-09)
+
+### Issues Found
+1. **CMS View Page Has No File Data** — Phase 77 assumed `/site/view?uuid=` would contain file listings. Actual HTML dump showed it's a victim profile page (company name, logo, dates). No file/folder entries exist on the CMS.
+2. **18-Way Concurrent HS Probe Storm** — Stage D fired all 18 storage node probes simultaneously via one arti client, overwhelming arti's v3 HS circuit builder and causing even alive nodes to fail from circuit pool starvation.
+3. **120s Global Discovery Timeout Too Short** — With sequential wave probing, 7 waves × up to 40s each = 280s worst case. The 120s timeout killed discovery before reaching alive nodes in later waves.
+4. **404 Responses Demoted Alive Nodes** — `pandora42btu` was the only reachable storage node but was demoted after returning 404 (the UUID path wasn't hosted there), preventing reuse in future probes.
+
+### Root Cause Analysis
+- Direct arti probe test confirmed **2 of 6 tested nodes are alive** (CMS + pandora42btu), others return "Onion Service not found" (genuinely offline).
+- The CMS `/site/data?uuid=` endpoint is a 302 redirect to a storage node — it does NOT return JSON or file data.
+- pandora42btu connects in 2-11s when probed individually, but fails when competing with 17 other simultaneous HS lookups.
+
+### Fixes Implemented
+1. **Staggered Wave Probing** in `qilin_nodes.rs` — Stage D now probes in waves of 3 with early-exit on first success. Each wave gets `STAGE_D_BATCH_TIMEOUT_SECS=40s`. The moment any node responds, remaining waves are skipped.
+2. **404/403 Non-Demotion** in `qilin_nodes.rs` — Nodes returning 404/403 are not demoted (they're alive but don't host this UUID at the probed path). Logged as "alive but path not found."
+3. **Global Timeout Increase** in `qilin.rs` — Discovery global timeout raised from 120s to 300s to accommodate 7 waves of 3 nodes each.
+4. **HS Direct Probe Test** in `examples/hs_storage_probe.rs` — Standalone test that probes storage `.onion` nodes directly via arti (no SOCKS) to isolate connectivity issues.
+
+### Validation
+- `cargo test --lib` → 63/63 pass
+- Direct probe test confirmed pandora42btu connects in 2.0s
+- Soak test completed all 7 waves within global timeout
+
+### Prevention Rules
+- **P77C-1:** Never fire more than 3 concurrent `.onion` HS lookups through arti — wave-probe in small batches with early-exit.
+- **P77C-2:** A 404/403 from a `.onion` node means "alive, wrong path" — do NOT demote; the node may host other UUIDs or use different path schemes.
+- **P77C-3:** CMS view/profile pages are NOT file listings — always verify HTML structure before assuming parseable file data.
+- **P77C-4:** Global discovery timeouts must account for worst-case wave count × per-wave timeout.
 
 ## Phase 52D: Download Engine (2026-03-07)
 
@@ -399,7 +600,7 @@ Full audit: [SOCKS_Performance_Audit_Whitepaper.md](file:///Users/navi/Documents
 - **P43J-1:** Timestamped crawl indexes are history only; repeat-run comparison must use a deterministic per-target ledger and authoritative best snapshot.
 - **P43J-2:** A crawl that underperforms prior best must never shrink the authoritative best listing.
 - **P43J-3:** Download resume planning must prefer failed items before the general missing/mismatch queue.
-- **P43J-4:** Stable user-facing listing names belong in the selected output root; machine-readable target state belongs under `temp_onionforge_forger/targets/<target_key>/`.
+- **P43J-4:** Stable user-facing listing names belong in the selected output root; machine-readable target state belongs under `<selected_output>/targets/<target_key>/` while non-payload support artifacts belong under the hidden sibling support root.
 
 ## Phase 43I: Qilin Resource Telemetry, DB-Backed Completion, and Standby Failover (2026-03-06)
 
@@ -639,7 +840,7 @@ Issue-to-fix mapping:
   - Fix: pass `size_hint` from crawl entries to batch router and skip active probes for hinted files.
 - Issue: Support artifacts were mixed into extraction directories.
   - Root Cause: manifests, sidecar metadata, state, logs, and local VFS db wrote to output root or file-adjacent locations.
-  - Fix: route non-crawler support artifacts into `<selected_output>/temp_onionforge_forger`.
+  - Fix: route non-crawler support artifacts into `<selected_output_parent>/.onionforge_support/<support_key>/`.
 - Issue: Batch download telemetry for UI was incomplete.
   - Root Cause: only partial progress signals existed, mostly small-file phase and raw stream stats.
   - Fix: emit standardized batch lifecycle events (`download_batch_started`, enriched `batch_progress`) for aggregate file-level tracking.
@@ -733,7 +934,7 @@ Issue-to-fix mapping:
 **6. Scheduler loops must not block queue intake behind single long-running workers.**
 **7. Onion listing size mapping should prefer parsed listing data over per-entry HEAD probes.**
 **8. Batch routing must consume crawler size hints before issuing network probes.**
-**9. Non-crawler support artifacts must stay isolated under `temp_onionforge_forger` in the selected output root.**
+**9. Non-crawler support artifacts must stay isolated under the hidden sibling support root (`.onionforge_support/<support_key>`), not inside the visible payload tree.**
 **10. Download progress UX must be driven by explicit backend telemetry events.**
 **11. Batch telemetry contracts must include both file-count and byte-count dimensions for UI parity with stream telemetry.**
 **12. Adapter capability metadata must reflect actual crawl implementation status and be test-asserted.**
@@ -886,3 +1087,18 @@ A dedicated `MultiClientPool` was engineered to instantiate and isolate multiple
 - **Issue**: Unknown or polymorphic SPA frameworks bypassed standard ast scraping algorithms and were defaulted to empty directory mappings unless structurally supported. Relying solely on exact-match adapters like DragonForce restricts fallback parsing on modified sites. 
 - **Fix**: The Universal Explorer now features runtime Wire Mode Detection (`parse_page_from_body`). If the DOM contains SPA cues (`__NEXT_DATA__`, `<iframe`, `token=`), the Explorer automatically leverages the Predictive State Hydrator algorithms to statically extrapolate NextJS routes/API endpoints directly out of JSON payloads without JS execution.
 - **Prevention Rule**: All new fallback/Universal explorers MUST interrogate `__NEXT_DATA__` boundaries and SPA embedded objects if autoindex HTML mapping returns zero entries to ensure data is not hidden behind deterministic dynamic routers.
+
+## Phase 77F: Qilin Top-3 Performance Execution (2026-03-09)
+**Issue:** Qilin crawl stuck under 20.17 IO/sec ceiling with tail-stalls.
+**Fix:** Implemented Inverted Retry Queue (drains degraded lanes before processing new work), Circuit-Pinned Worker Pools (assigns Tor worker instances to specific nodes), and Selective Tournament Spraying (fans out the root directory across top-4 warm mirror nodes).
+**Prevention Rule:** PR-77F-001: Avoid global circuit failover if only one node dies; pin workers to active nodes dynamically.
+
+## Phase 78: Backport Zero-Copy memchr SIMD to Play and Lockbit
+**Issue:** Autoindex (Play) and Lockbit parsers were heavily using line-by-line String allocators and `scraper::Html::parse_document(html)` resulting in severe memory allocation stalls and massive GC spikes under heavy directory trees.
+**Fix:** Completely removed the `scraper` crate and `.lines()` iterators from `/src/adapters/lockbit.rs` and `/src/adapters/autoindex.rs`. Built manual zero-copy string-slice windowing using `.find()` (delegates to SIMD `memchr`), resulting in nanosecond-level DOM extraction and Gigabyte/sec parser speeds without Tokio context-switch stalls.
+**Prevention Rule:** PR-PH78-001: Never ever use `scraper::Html::parse_document()` for predictable/iterative directory auto-indexes or table rows. Use memory-safe, zero-copy `slice[..].find()` techniques to extract elements without DOM tree heap allocation.
+
+## Phase 79: Proactive Multi-Node Failover Manager
+**Issue:** `client error (Connect)` socket failures completely derailed high-concurrency 64-worker soak tests when individual onion seeds rotated their addresses or succumbed to DDoS. Adapters (except Qilin) lacked generic fallback resolution.
+**Fix:** Implemented a unified `SeedManager` directly inside `CrawlerFrontier`. All URL routing, sub-resource probing (`bytes=0-0`), and fallback allocations are seamlessly intercepted via `f.seed_manager.remap_url(&next_url, &f.target_url)`. Heavy 50x/Timeout drops trigger aggregate fallback threshold counters, dynamically rotating the cluster's focus away from dead targets.
+**Prevention Rule:** PR-PH79-001: All target implementations must run generic GET routes and probes through `SeedManager` rather than blindly accessing dequeued raw `.onion` domains. Adapters should handle internal `.onion` failover dynamically at the `CrawlerFrontier` level, not locally.

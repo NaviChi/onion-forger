@@ -124,36 +124,51 @@ impl CrawlerAdapter for PlayAdapter {
                             raw_url: current_base.clone(),
                         });
 
+                        let effective_url = f.seed_manager.remap_url(&next_url, &f.target_url).await;
+
                         // Fetch the HTML listing page
                         let fetch_result = tokio::time::timeout(
                             std::time::Duration::from_secs(45),
-                            client.get(&next_url).send(),
+                            client.get(&effective_url).send(),
                         )
                         .await;
                         let html = match fetch_result {
                             Ok(Ok(resp)) => {
+                                let status = resp.status();
                                 if let Some(delay) =
-                                    ddos_guard.record_response(resp.status().as_u16())
+                                    ddos_guard.record_response_legacy(status.as_u16())
                                 {
                                     tokio::time::sleep(delay).await;
                                 }
-                                if resp.status().is_success() {
+                                if status.is_success() {
+                                    f.seed_manager.report_success().await;
                                     match resp.text().await {
                                         Ok(body) => {
                                             bytes_downloaded += body.len() as u64;
                                             body
                                         }
                                         Err(_) => {
+                                            if f.seed_manager.report_failure(10).await {
+                                                println!("[Global Failover] Rotated active seed threshold exceeded for {}", f.target_url);
+                                            }
                                             fetch_success = false;
                                             String::new()
                                         }
                                     }
                                 } else {
+                                    if status == 502 || status == 503 || status == 504 {
+                                        if f.seed_manager.report_failure(10).await {
+                                            println!("[Global Failover] Rotated active seed threshold exceeded for {}", f.target_url);
+                                        }
+                                    }
                                     fetch_success = false;
                                     String::new()
                                 }
                             }
                             _ => {
+                                if f.seed_manager.report_failure(10).await {
+                                    println!("[Global Failover] Rotated active seed threshold exceeded for {}", f.target_url);
+                                }
                                 fetch_success = false;
                                 build_fallback_html()
                             }
@@ -198,7 +213,8 @@ impl CrawlerAdapter for PlayAdapter {
                                     Some(s)
                                 } else {
                                     // Merge HEAD Size Probes into First GET (Kill Redundant Requests)
-                                    match client.get(&raw_url).header("Range", "bytes=0-0").send().await {
+                                    let effective_raw_url = f.seed_manager.remap_url(&raw_url, &f.target_url).await;
+                                    match client.get(&effective_raw_url).header("Range", "bytes=0-0").send().await {
                                         Ok(size_resp) => size_resp
                                             .headers()
                                             .get("content-range")

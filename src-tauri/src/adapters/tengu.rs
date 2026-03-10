@@ -23,7 +23,7 @@ fn parse_tengu_listing(html: &str, _base_url: &str) -> Vec<FileEntry> {
                     for row in document.select(&row_selector) {
                         let link = row.select(&link_selector).next();
                         let size_node = row.select(&size_selector).next();
-                        
+
                         if let Some(link) = link {
                             let href = link.value().attr("href").unwrap_or("");
                             if href.is_empty()
@@ -52,7 +52,12 @@ fn parse_tengu_listing(html: &str, _base_url: &str) -> Vec<FileEntry> {
                             let mut size_bytes = None;
                             if !is_dir {
                                 if let Some(sn) = size_node {
-                                    let size_str = sn.text().collect::<Vec<_>>().join("").trim().to_uppercase();
+                                    let size_str = sn
+                                        .text()
+                                        .collect::<Vec<_>>()
+                                        .join("")
+                                        .trim()
+                                        .to_uppercase();
                                     size_bytes = extract_size_from_str(&size_str);
                                 }
                             }
@@ -100,7 +105,7 @@ fn extract_size_from_str(size_str: &str) -> Option<u64> {
 impl CrawlerAdapter for TenguAdapter {
     async fn can_handle(&self, fingerprint: &SiteFingerprint) -> bool {
         let url_lower = fingerprint.url.to_ascii_lowercase();
-        url_lower.contains("longvqprqrb4zbxooswz4upefhtikhnyqv4gw4fkzpkc2wjpvxsucwid") 
+        url_lower.contains("longvqprqrb4zbxooswz4upefhtikhnyqv4gw4fkzpkc2wjpvxsucwid")
             || url_lower.contains("tengu")
     }
 
@@ -206,7 +211,8 @@ impl CrawlerAdapter for TenguAdapter {
                         )
                         .await
                         {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            if let Some(delay) =
+                                ddos_guard.record_response_legacy(resp.status().as_u16())
                             {
                                 tokio::time::sleep(delay).await;
                             }

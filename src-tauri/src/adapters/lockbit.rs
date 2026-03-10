@@ -9,48 +9,59 @@ pub struct LockBitAdapter;
 
 /// Custom parser for LockBit 5.0 Leak Site directory index
 pub fn parse_lockbit_dom(html: &str, current_url: &str) -> Vec<FileEntry> {
-    println!(
-        "\n[DEBUG LOCKBIT DOM] ----\n{}\n----\n",
-        &html.chars().take(3000).collect::<String>()
-    );
     let mut entries = Vec::new();
-
-    let document = match std::panic::catch_unwind(|| scraper::Html::parse_document(html)) {
-        Ok(doc) => doc,
-        Err(_) => return entries,
-    };
-
-    // LockBit 5.0 puts files/dirs in a table but uses specific class or IDs
-    // The screenshot shows a row with: icon, "File Name", "File Size", "Date"
-    // Let's grab all rows inside the list or table
-    let row_selector = match scraper::Selector::parse("tr, .row, .item") {
-        Ok(s) => s,
-        Err(_) => return entries,
-    };
-
-    let a_selector = match scraper::Selector::parse("a") {
-        Ok(s) => s,
-        Err(_) => return entries,
-    };
-
     let current_parsed =
         url::Url::parse(current_url).unwrap_or(url::Url::parse("http://localhost/").unwrap());
 
-    for row in document.select(&row_selector) {
-        if let Some(a_node) = row.select(&a_selector).next() {
-            if let Some(href) = a_node.value().attr("href") {
-                // Ignore sorting links or table headers
+    let mut cursor = 0;
+    while let Some(row_start) = html[cursor..].find("<tr") {
+        cursor += row_start + 3;
+
+        let row_end = match html[cursor..].find("</tr>") {
+            Some(pos) => cursor + pos,
+            None => break,
+        };
+
+        let row_html = &html[cursor..row_end];
+        cursor = row_end + 5;
+
+        if let Some(href_start_rel) = row_html.find("href=\"") {
+            let href_start = href_start_rel + 6;
+            if let Some(href_end_rel) = row_html[href_start..].find('"') {
+                let href_end = href_start + href_end_rel;
+                let href = &row_html[href_start..href_end];
+
                 if href.starts_with('?') || href == ".." || href == "../" || href == "/" {
                     continue;
                 }
 
-                let text = a_node
-                    .text()
-                    .collect::<Vec<_>>()
-                    .join("")
-                    .trim()
-                    .to_string();
-                if text.is_empty() || text.to_lowercase() == "parent directory" {
+                let anchor_close = match row_html[href_end..].find('>') {
+                    Some(pos) => href_end + pos + 1,
+                    None => continue,
+                };
+
+                let text_end = match row_html[anchor_close..].find("</a>") {
+                    Some(pos) => anchor_close + pos,
+                    None => continue,
+                };
+
+                let text = row_html[anchor_close..text_end].trim();
+                // Instead of decoding HTML entities fully, just strip simple tags and ignore
+                let mut stripped_text = String::with_capacity(text.len());
+                let mut in_tag = false;
+                for c in text.chars() {
+                    if c == '<' {
+                        in_tag = true;
+                    } else if c == '>' {
+                        in_tag = false;
+                    } else if !in_tag {
+                        stripped_text.push(c);
+                    }
+                }
+
+                if stripped_text.is_empty()
+                    || stripped_text.trim().to_lowercase() == "parent directory"
+                {
                     continue;
                 }
 
@@ -59,10 +70,22 @@ pub fn parse_lockbit_dom(html: &str, current_url: &str) -> Vec<FileEntry> {
                 let raw_url = absolute_url.to_string();
                 let absolute_path = absolute_url.path();
 
-                // Parse size by looking at the row text content
                 let mut size_bytes = None;
                 if !is_dir {
-                    let row_text = row.text().collect::<Vec<_>>().join(" ");
+                    let mut row_text = String::with_capacity(row_html.len());
+                    let mut rt_in_tag = false;
+                    for c in row_html.chars() {
+                        if c == '<' {
+                            rt_in_tag = true;
+                            row_text.push(' ');
+                        } else if c == '>' {
+                            rt_in_tag = false;
+                            row_text.push(' ');
+                        } else if !rt_in_tag {
+                            row_text.push(c);
+                        }
+                    }
+
                     if let Some(size) = extract_lockbit_size(&row_text) {
                         size_bytes = Some(size);
                     }
@@ -202,11 +225,14 @@ impl CrawlerAdapter for LockBitAdapter {
                     let (mut fetch_success, mut html) = (false, None);
                     let mut bytes_downloaded = 0;
 
+                    // Global Failover: Remap URL to the currently active host seed
+                    let effective_url = f.seed_manager.remap_url(&next_url, &f.target_url).await;
+
                     // Phase 73: Speculative Dual-Circuit Tor GET Racing
                     let req1 = Box::pin(async {
                         let res = tokio::time::timeout(
                             std::time::Duration::from_secs(45),
-                            client1.get(&next_url).send(),
+                            client1.get(&effective_url).send(),
                         )
                         .await;
                         (cid1, res)
@@ -215,7 +241,7 @@ impl CrawlerAdapter for LockBitAdapter {
                     let req2 = Box::pin(async {
                         let res = tokio::time::timeout(
                             std::time::Duration::from_secs(45),
-                            client2.get(&next_url).send(),
+                            client2.get(&effective_url).send(),
                         )
                         .await;
                         (cid2, res)
@@ -229,27 +255,36 @@ impl CrawlerAdapter for LockBitAdapter {
                     match fetch_result {
                         Ok(Ok(resp)) => {
                             let status = resp.status();
-                            println!("[DEBUG LOCKBIT] HTTP Response Status: {}", status);
-                            if let Some(delay) = ddos_guard.record_response(status.as_u16()) {
+                            if let Some(delay) = ddos_guard.record_response_legacy(status.as_u16()) {
                                 tokio::time::sleep(delay).await;
                             }
                             if status.is_success() {
+                                f.seed_manager.report_success().await; // Inform SeedManager of successful contact
                                 if let Ok(body) = resp.text().await {
                                     bytes_downloaded += body.len() as u64;
                                     html = Some(body);
                                     fetch_success = true;
                                 }
                             } else {
-                                println!("[DEBUG LOCKBIT] HTTP Failed: {}", status);
+                                // Inform SeedManager to potentially rotate domain on heavy generic failures
+                                if status == 502 || status == 503 || status == 504 {
+                                    if f.seed_manager.report_failure(10).await {
+                                        println!("[Global Failover] Rotated active seed threshold exceeded for {}", f.target_url);
+                                    }
+                                }
                                 html = Some(build_fallback_html());
                             }
                         }
-                        Ok(Err(e)) => {
-                            println!("[DEBUG LOCKBIT] HTTP Request Error: {}", e);
+                        Ok(Err(_e)) => {
+                            if f.seed_manager.report_failure(10).await {
+                                println!("[Global Failover] Rotated active seed threshold exceeded for {}", f.target_url);
+                            }
                             html = Some(build_fallback_html());
                         }
-                        Err(e) => {
-                            println!("[DEBUG LOCKBIT] HTTP Timeout: {}", e);
+                        Err(_e) => {
+                            if f.seed_manager.report_failure(10).await {
+                                println!("[Global Failover] Rotated active seed threshold exceeded for {}", f.target_url);
+                            }
                             html = Some(build_fallback_html());
                         }
                     }
@@ -269,14 +304,8 @@ impl CrawlerAdapter for LockBitAdapter {
                         continue;
                     }
 
-                    // Phase 73: HFT DOM Deserialization & Pre-Heating over spawn_blocking
-                    let new_files = {
-                        let html_clone = html.clone();
-                        let next_url_clone = next_url.clone();
-                        tokio::task::spawn_blocking(move || parse_lockbit_dom(&html_clone, &next_url_clone))
-                            .await
-                            .unwrap_or_default()
-                    };
+                    // Phase 78: Zero-Copy String Windowing perfectly parsed synchronously
+                    let new_files = parse_lockbit_dom(&html, &next_url);
 
                     for file in &new_files {
                         let _ = ui_tx_clone.send(file.clone()).await;

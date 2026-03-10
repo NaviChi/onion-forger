@@ -57,7 +57,8 @@ impl ArtiClient {
     pub fn new_clearnet() -> Self {
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
-            .pool_max_idle_per_host(0)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(32)
             .tcp_nodelay(true)
             .build()
             .unwrap_or_default();
@@ -274,6 +275,63 @@ impl ArtiRequestBuilder {
                     .await
                     .map_err(|e| anyhow!("Clearnet request failed: {}", e))?;
                 Ok(ArtiResponse::Clearnet { inner: res })
+            }
+        }
+    }
+
+    /// Phase 77D: Send the request but DON'T follow redirects.
+    /// Returns (response, Option<resolved_location_url>).
+    /// This is critical for Qilin Stage A: the CMS returns a 302 to a storage node,
+    /// but we need to capture the Location header even when the storage node is offline.
+    pub async fn send_capturing_redirect(self) -> Result<(ArtiResponse, Option<String>)> {
+        match self {
+            Self::Tor {
+                client,
+                headers,
+                method,
+                url,
+                json_body,
+            } => {
+                let body_bytes = json_body.map(Bytes::from).unwrap_or_else(Bytes::new);
+                let mut req = Request::builder().method(method).uri(&url);
+                for (key, value) in &headers {
+                    req = req.header(key.as_str(), value.as_str());
+                }
+
+                let req_obj = req
+                    .body(http_body_util::Full::new(body_bytes))
+                    .map_err(|e| anyhow!("Failed to build request: {}", e))?;
+
+                let res: Response<hyper::body::Incoming> = client
+                    .request(req_obj)
+                    .await
+                    .map_err(|e| anyhow!("Request failed: {}", e))?;
+
+                // Capture redirect Location if present
+                let redirect_url = if matches!(
+                    res.status(),
+                    StatusCode::MOVED_PERMANENTLY
+                        | StatusCode::FOUND
+                        | StatusCode::SEE_OTHER
+                        | StatusCode::TEMPORARY_REDIRECT
+                        | StatusCode::PERMANENT_REDIRECT
+                ) {
+                    res.headers()
+                        .get(http::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|loc| resolve_redirect_url(&url, loc).ok())
+                } else {
+                    None
+                };
+
+                Ok((ArtiResponse::Tor { inner: res, url }, redirect_url))
+            }
+            Self::Clearnet { req } => {
+                let res = req
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("Clearnet request failed: {}", e))?;
+                Ok((ArtiResponse::Clearnet { inner: res }, None))
             }
         }
     }

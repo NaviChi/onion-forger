@@ -16,7 +16,10 @@ async fn main() -> Result<()> {
     let node_cache = QilinNodeCache::default();
     node_cache.seed_known_mirrors(uuid).await;
 
-    if let Some(best_node) = node_cache.discover_and_resolve(seed, uuid, &client, None).await {
+    if let Some(best_node) = node_cache
+        .discover_and_resolve(seed, uuid, &client, None)
+        .await
+    {
         println!("Resolved to Storage Node: {}", best_node.url);
 
         match client.get(&best_node.url).send().await {

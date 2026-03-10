@@ -169,7 +169,7 @@ pub fn derive_target_identity(url: &str) -> TargetIdentity {
 
 pub fn target_paths(output_root: &Path, target_url: &str) -> Result<TargetPaths> {
     let identity = derive_target_identity(target_url);
-    let support_root = output_root.join("temp_onionforge_forger");
+    let support_root = crate::support_artifact_dir_for_output_root(output_root);
     let target_dir = output_root.join("targets").join(&identity.target_key);
     let current_dir = target_dir.join("current");
     let best_dir = target_dir.join("best");
@@ -648,7 +648,8 @@ fn sanitize_key_component(raw: &str, max_len: usize) -> String {
         trimmed.to_string()
     };
     if component.len() > max_len {
-        component.truncate(max_len);
+        let safe_len = component.floor_char_boundary(max_len);
+        component.truncate(safe_len);
     }
     component
 }

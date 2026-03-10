@@ -17,6 +17,23 @@ pub struct TorStatusEvent {
     pub message: String,
     pub daemon_count: usize,
     pub ports: Vec<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_clients: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_port_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_probe_target: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwarmTrafficClass {
+    Mixed,
+    OnionService,
+    Clearnet,
 }
 
 /// A Guard that manages Tor lifecycle. Dropping it shuts down all circuits.
@@ -48,6 +65,20 @@ impl TorProcessGuard {
             "none"
         }
     }
+
+    pub fn client_count(&self) -> usize {
+        self.native_swarm
+            .as_ref()
+            .map(|swarm| swarm.clients.read().unwrap().len())
+            .unwrap_or(0)
+    }
+
+    pub fn managed_port_count(&self) -> usize {
+        self.native_swarm
+            .as_ref()
+            .map(|swarm| swarm.socks_ports.read().unwrap().len())
+            .unwrap_or(0)
+    }
 }
 
 impl Drop for TorProcessGuard {
@@ -63,11 +94,31 @@ pub async fn bootstrap_tor_cluster(
     daemon_count: usize,
     node_offset: usize,
 ) -> Result<(TorProcessGuard, Vec<u16>)> {
+    bootstrap_tor_cluster_for_traffic(app, daemon_count, node_offset, SwarmTrafficClass::Mixed)
+        .await
+}
+
+/// Bootstraps `daemon_count` native arti Tor circuits for a specific traffic class.
+pub async fn bootstrap_tor_cluster_for_traffic(
+    app: AppHandle,
+    daemon_count: usize,
+    node_offset: usize,
+    traffic_class: SwarmTrafficClass,
+) -> Result<(TorProcessGuard, Vec<u16>)> {
     // Explicitly install the rustls crypto provider globally before building the Arti client
-    rustls::crypto::ring::default_provider().install_default().ok();
-    let (swarm, ports) =
-        tor_native::bootstrap_arti_cluster(app.clone(), daemon_count, node_offset).await?;
-    let guard = TorProcessGuard { native_swarm: Some(swarm) };
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let (swarm, ports) = tor_native::bootstrap_arti_cluster_for_traffic(
+        app.clone(),
+        daemon_count,
+        node_offset,
+        traffic_class,
+    )
+    .await?;
+    let guard = TorProcessGuard {
+        native_swarm: Some(swarm),
+    };
     Ok((guard, ports))
 }
 
@@ -86,10 +137,6 @@ impl TorProcessGuard {
 pub async fn request_newnym(socks_port: u16) -> Result<()> {
     tor_native::request_newnym_arti(socks_port).await
 }
-
-
-
-
 
 /// Cleanup stale Tor daemons — no-op with native arti (no child processes to clean).
 pub fn cleanup_stale_tor_daemons() {

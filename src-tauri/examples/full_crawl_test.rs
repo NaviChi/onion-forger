@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
         resume: false,
         resume_index: None,
         mega_password: None,
-                stealth_ramp: true,
+        stealth_ramp: true,
     };
 
     let frontier = CrawlerFrontier::new(

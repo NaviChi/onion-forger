@@ -147,6 +147,33 @@ export interface IResourceMetricsFrame {
 
     /** ResourceMetricsFrame timeoutCount */
     timeoutCount?: (number|null);
+
+    /** ResourceMetricsFrame throttleRatePerSec */
+    throttleRatePerSec?: (number|null);
+
+    /** ResourceMetricsFrame phantomPoolDepth */
+    phantomPoolDepth?: (number|null);
+
+    /** ResourceMetricsFrame subtreeReroutes */
+    subtreeReroutes?: (number|null);
+
+    /** ResourceMetricsFrame subtreeQuarantineHits */
+    subtreeQuarantineHits?: (number|null);
+
+    /** ResourceMetricsFrame offWinnerChildRequests */
+    offWinnerChildRequests?: (number|null);
+
+    /** ResourceMetricsFrame winnerHost */
+    winnerHost?: (string|null);
+
+    /** ResourceMetricsFrame slowestCircuit */
+    slowestCircuit?: (string|null);
+
+    /** ResourceMetricsFrame lateThrottles */
+    lateThrottles?: (number|null);
+
+    /** ResourceMetricsFrame outlierIsolations */
+    outlierIsolations?: (number|null);
 }
 
 /** Represents a ResourceMetricsFrame. */
@@ -193,6 +220,33 @@ export class ResourceMetricsFrame implements IResourceMetricsFrame {
 
     /** ResourceMetricsFrame timeoutCount. */
     public timeoutCount: number;
+
+    /** ResourceMetricsFrame throttleRatePerSec. */
+    public throttleRatePerSec: number;
+
+    /** ResourceMetricsFrame phantomPoolDepth. */
+    public phantomPoolDepth: number;
+
+    /** ResourceMetricsFrame subtreeReroutes. */
+    public subtreeReroutes: number;
+
+    /** ResourceMetricsFrame subtreeQuarantineHits. */
+    public subtreeQuarantineHits: number;
+
+    /** ResourceMetricsFrame offWinnerChildRequests. */
+    public offWinnerChildRequests: number;
+
+    /** ResourceMetricsFrame winnerHost. */
+    public winnerHost?: (string|null);
+
+    /** ResourceMetricsFrame slowestCircuit. */
+    public slowestCircuit?: (string|null);
+
+    /** ResourceMetricsFrame lateThrottles. */
+    public lateThrottles: number;
+
+    /** ResourceMetricsFrame outlierIsolations. */
+    public outlierIsolations: number;
 
     /**
      * Creates a new ResourceMetricsFrame instance using the specified properties.

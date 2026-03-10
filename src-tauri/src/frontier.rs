@@ -83,6 +83,11 @@ pub struct CrawlerFrontier {
     // Cancellation flag — checked by workers to abort early
     pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     pub processed_requests: AtomicUsize,
+    pub successful_requests: AtomicUsize,
+    pub failed_requests: AtomicUsize,
+    pub adapter_pending_requests: AtomicUsize,
+    pub adapter_active_workers: AtomicUsize,
+    pub adapter_worker_target: AtomicUsize,
 
     // Write-Ahead-Log Phase 4.8
     pub wal_tx: UnboundedSender<String>,
@@ -95,6 +100,18 @@ pub struct CrawlerFrontier {
 
     // Phase 58: Universal Explorer Prefix Learning Ledger Integration
     pub target_paths: Option<crate::target_state::TargetPaths>,
+
+    // Phase 79: Multi-Node Global Failover Rotation
+    pub seed_manager: Arc<crate::seed_manager::SeedManager>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrontierProgressSnapshot {
+    pub visited: usize,
+    pub processed: usize,
+    pub queued: usize,
+    pub active_workers: usize,
+    pub worker_target: usize,
 }
 
 fn sanitize_filename(url: &str) -> String {
@@ -116,9 +133,43 @@ fn env_usize(name: &str) -> Option<usize> {
         .and_then(|value| value.trim().parse::<usize>().ok())
 }
 
+fn build_onion_clients(
+    arti_clients: &[crate::tor_native::SharedTorClient],
+    num_daemons: usize,
+) -> (Vec<crate::arti_client::ArtiClient>, Vec<usize>) {
+    let mut clients = Vec::with_capacity(arti_clients.len());
+    let mut client_daemon_map = Vec::with_capacity(arti_clients.len());
+
+    for (idx, shared_client) in arti_clients.iter().enumerate() {
+        let tor_client_arc = shared_client.read().unwrap().clone();
+        let isolation_token = arti_client::IsolationToken::new();
+        let client =
+            crate::arti_client::ArtiClient::new((*tor_client_arc).clone(), Some(isolation_token));
+        clients.push(client);
+        client_daemon_map.push(idx % num_daemons.max(1));
+    }
+
+    (clients, client_daemon_map)
+}
+
 impl CrawlerFrontier {
     pub fn active_client_count(&self) -> usize {
         self.http_clients.len().max(1)
+    }
+
+    pub fn sync_arti_clients(
+        &mut self,
+        arti_clients: &[crate::tor_native::SharedTorClient],
+    ) -> usize {
+        if !self.is_onion || arti_clients.is_empty() {
+            return self.http_clients.len();
+        }
+
+        let (clients, client_daemon_map) = build_onion_clients(arti_clients, self.num_daemons);
+        self.http_clients = clients;
+        self.client_daemon_map = client_daemon_map;
+        self.client_counter.store(0, Ordering::Relaxed);
+        self.http_clients.len()
     }
 
     pub fn new(
@@ -147,16 +198,7 @@ impl CrawlerFrontier {
         let mut client_daemon_map = Vec::new();
 
         if is_onion {
-            for (idx, shared_client) in arti_clients.iter().enumerate() {
-                let tor_client_arc = shared_client.read().unwrap().clone();
-                let isolation_token = arti_client::IsolationToken::new();
-                let client = crate::arti_client::ArtiClient::new(
-                    (*tor_client_arc).clone(),
-                    Some(isolation_token),
-                );
-                clients.push(client);
-                client_daemon_map.push(idx % num_daemons.max(1));
-            }
+            (clients, client_daemon_map) = build_onion_clients(&arti_clients, num_daemons);
         } else {
             for daemon_idx in 0..num_daemons.max(1) {
                 clients.push(crate::arti_client::ArtiClient::new_clearnet());
@@ -304,7 +346,7 @@ impl CrawlerFrontier {
         let scorer_capacity = total_circuits.max(client_daemon_map.len()).max(1);
 
         Self {
-            target_url,
+            target_url: target_url.clone(),
             num_daemons,
             is_onion,
             swarm_guard: None, // swarm_guard is typically set after `new` in an async context
@@ -320,10 +362,19 @@ impl CrawlerFrontier {
             active_options: options,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             processed_requests: AtomicUsize::new(0),
+            successful_requests: AtomicUsize::new(0),
+            failed_requests: AtomicUsize::new(0),
+            adapter_pending_requests: AtomicUsize::new(0),
+            adapter_active_workers: AtomicUsize::new(0),
+            adapter_worker_target: AtomicUsize::new(0),
             wal_tx,
             delta_new_files: AtomicUsize::new(0),
             circuit_blacklist: DashMap::new(),
             target_paths,
+            seed_manager: Arc::new(crate::seed_manager::SeedManager::new(
+                target_url.clone(),
+                Vec::new(),
+            )),
         }
     }
 
@@ -420,6 +471,7 @@ impl CrawlerFrontier {
     /// Report a successful HTTP fetch to adjust the AIMD window and Scorer weights
     pub fn record_success(&self, cid: usize, bytes: u64, elapsed_ms: u64) {
         self.processed_requests.fetch_add(1, Ordering::Relaxed);
+        self.successful_requests.fetch_add(1, Ordering::Relaxed);
         self.bbr.on_success(bytes.max(1), elapsed_ms.max(1));
         self.scorer.record_piece(cid, bytes, elapsed_ms);
     }
@@ -427,6 +479,7 @@ impl CrawlerFrontier {
     /// Report a failed HTTP fetch (timeout/error) to slice the AIMD window
     pub fn record_failure(&self, _cid: usize) {
         self.processed_requests.fetch_add(1, Ordering::Relaxed);
+        self.failed_requests.fetch_add(1, Ordering::Relaxed);
         self.bbr.on_timeout();
     }
 
@@ -438,16 +491,76 @@ impl CrawlerFrontier {
         self.processed_requests.load(Ordering::Relaxed)
     }
 
+    pub fn successful_count(&self) -> usize {
+        self.successful_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.failed_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn set_adapter_pending_requests(&self, pending: usize) {
+        self.adapter_pending_requests
+            .store(pending, Ordering::Relaxed);
+    }
+
+    pub fn set_adapter_worker_target(&self, worker_target: usize) {
+        self.adapter_worker_target
+            .store(worker_target, Ordering::Relaxed);
+    }
+
+    pub fn begin_adapter_request(&self) -> usize {
+        self.adapter_active_workers.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn finish_adapter_request(&self) -> usize {
+        self.adapter_active_workers
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .unwrap_or(0)
+            .saturating_sub(1)
+    }
+
+    pub fn clear_adapter_progress(&self) {
+        self.adapter_pending_requests.store(0, Ordering::Relaxed);
+        self.adapter_active_workers.store(0, Ordering::Relaxed);
+        self.adapter_worker_target.store(0, Ordering::Relaxed);
+    }
+
     pub fn active_workers(&self) -> usize {
-        self.max_worker_permits
-            .saturating_sub(self.politeness_semaphore.available_permits())
+        let permit_workers = self
+            .max_worker_permits
+            .saturating_sub(self.politeness_semaphore.available_permits());
+        permit_workers.max(self.adapter_active_workers.load(Ordering::Relaxed))
     }
 
     pub fn worker_target(&self) -> usize {
-        if self.is_onion && self.active_options.listing {
+        let base_target = if self.is_onion && self.active_options.listing {
             self.active_client_count().clamp(1, self.max_worker_permits)
         } else {
             self.bbr.current_active().clamp(1, self.max_worker_permits)
+        };
+        let adapter_target = self.adapter_worker_target.load(Ordering::Relaxed);
+        base_target.max(adapter_target).max(self.active_workers())
+    }
+
+    pub fn progress_snapshot(&self) -> FrontierProgressSnapshot {
+        let processed = self.processed_count();
+        let queued = self
+            .visited_count()
+            .saturating_sub(processed)
+            .max(self.adapter_pending_requests.load(Ordering::Relaxed));
+        let active_workers = self.active_workers();
+        let worker_target = self.worker_target().max(active_workers);
+        let visited = self.visited_count().max(processed.saturating_add(queued));
+
+        FrontierProgressSnapshot {
+            visited,
+            processed,
+            queued,
+            active_workers,
+            worker_target,
         }
     }
 
@@ -511,5 +624,61 @@ impl CrawlerFrontier {
     /// Accessor for the persistent Target Ledger pathing logic
     pub fn target_paths(&self) -> Option<&crate::target_state::TargetPaths> {
         self.target_paths.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CrawlOptions, CrawlerFrontier};
+
+    fn test_frontier() -> CrawlerFrontier {
+        CrawlerFrontier::new(
+            None,
+            "http://example.onion/root/".to_string(),
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            CrawlOptions::default(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn adapter_progress_snapshot_overlays_pending_and_workers() {
+        let frontier = test_frontier();
+        assert!(frontier.mark_visited("http://example.onion/root/"));
+        assert!(frontier.mark_visited("http://example.onion/root/A/"));
+        frontier.record_success(0, 4096, 10);
+        frontier.set_adapter_pending_requests(3);
+        frontier.set_adapter_worker_target(12);
+        let started = frontier.begin_adapter_request();
+
+        let snapshot = frontier.progress_snapshot();
+
+        assert_eq!(started, 1);
+        assert_eq!(snapshot.processed, 1);
+        assert_eq!(snapshot.queued, 3);
+        assert_eq!(snapshot.active_workers, 1);
+        assert_eq!(snapshot.worker_target, 12);
+        assert_eq!(snapshot.visited, 4);
+
+        let remaining = frontier.finish_adapter_request();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn clearing_adapter_progress_resets_overlay() {
+        let frontier = test_frontier();
+        frontier.set_adapter_pending_requests(5);
+        frontier.set_adapter_worker_target(9);
+        frontier.begin_adapter_request();
+        frontier.clear_adapter_progress();
+
+        let snapshot = frontier.progress_snapshot();
+
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.active_workers, 0);
+        assert!(snapshot.worker_target >= 1);
     }
 }

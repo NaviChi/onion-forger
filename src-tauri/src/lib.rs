@@ -5,6 +5,7 @@ pub mod azure_connectivity;
 pub mod bbr;
 pub mod bft_quorum;
 pub mod binary_telemetry;
+mod cli;
 pub mod db;
 pub mod frontier;
 pub mod ghost_browser;
@@ -15,6 +16,7 @@ pub mod mega_handler; // Phase 52: Mega.nz public folder support
 pub mod multi_client_pool;
 #[allow(dead_code)]
 pub mod multipath; // Experimental lab engine; production downloads use aria_downloader.
+pub mod network_disk;
 pub mod path_utils;
 pub mod resource_governor;
 pub mod runtime_metrics;
@@ -23,16 +25,47 @@ pub mod speculative_prefetch;
 pub mod subtree_heatmap;
 pub mod target_state;
 pub mod telemetry_bridge;
+pub mod timer;
 pub mod tor;
 pub mod tor_native;
 pub mod tor_runtime; // Phase 45: Parallel chunk downloading
 pub mod torrent_handler; // Phase 52: BitTorrent .torrent + magnet support // Phase 53: Optional Azure + Intranet enterprise
-pub mod timer;
 
 use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
 use tokio::sync::Mutex;
+
+pub(crate) fn url_targets_onion(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if let Ok(parsed) = url::Url::parse(trimmed) {
+        return parsed
+            .host_str()
+            .map(|host| host.to_ascii_lowercase().ends_with(".onion"))
+            .unwrap_or(false);
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    let authority = lowered
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(lowered.as_str())
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+
+    authority.ends_with(".onion")
+}
 
 /// Global shared frontier for cancellation support
 pub struct AppState {
@@ -42,8 +75,10 @@ pub struct AppState {
     pub vfs: db::SledVfs,
     pub telemetry: runtime_metrics::RuntimeTelemetry,
     pub telemetry_bridge: telemetry_bridge::TelemetryBridge,
-    pub crawl_swarm_guard: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>>>,
-    pub download_swarm_guard: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>>>,
+    pub crawl_swarm_guard:
+        tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>>>,
+    pub download_swarm_guard:
+        tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>>>,
     /// Phase 53: Azure connectivity state (only compiled with `--features azure`)
     #[cfg(feature = "azure")]
     pub azure: tokio::sync::Mutex<azure_connectivity::AzureConnectivityState>,
@@ -148,26 +183,24 @@ fn crawl_status_snapshot(
     progress_percent: f64,
     eta_seconds: Option<u64>,
 ) -> CrawlStatusUpdate {
-    let visited = frontier.visited_count();
-    let processed = frontier.processed_count();
-    let queued = visited.saturating_sub(processed);
+    let snapshot = frontier.progress_snapshot();
 
     CrawlStatusUpdate {
         phase: phase.to_string(),
         progress_percent: progress_percent.clamp(0.0, 100.0),
-        visited_nodes: visited,
-        processed_nodes: processed,
-        queued_nodes: queued,
-        active_workers: frontier.active_workers(),
-        worker_target: frontier.worker_target(),
+        visited_nodes: snapshot.visited,
+        processed_nodes: snapshot.processed,
+        queued_nodes: snapshot.queued,
+        active_workers: snapshot.active_workers,
+        worker_target: snapshot.worker_target,
         eta_seconds,
         estimation: "adaptive-frontier".to_string(),
         delta_new_files: frontier
             .delta_new_files
             .load(std::sync::atomic::Ordering::Relaxed),
         vanguard: if frontier.stealth_ramp_active() {
-            let active = frontier.active_workers();
-            let target = frontier.worker_target();
+            let active = snapshot.active_workers;
+            let target = snapshot.worker_target;
             Some(VanguardTelemetry {
                 current: active,
                 target,
@@ -199,10 +232,11 @@ fn spawn_crawl_status_emitter(
         loop {
             interval.tick().await;
 
-            let visited = frontier.visited_count();
-            let processed = frontier.processed_count();
-            let queued = visited.saturating_sub(processed);
-            let active_workers = frontier.active_workers();
+            let snapshot = frontier.progress_snapshot();
+            let visited = snapshot.visited;
+            let processed = snapshot.processed;
+            let queued = snapshot.queued;
+            let active_workers = snapshot.active_workers;
 
             let now = std::time::Instant::now();
             let dt = now.duration_since(last_tick).as_secs_f64().max(0.001);
@@ -228,6 +262,14 @@ fn spawn_crawl_status_emitter(
             } else {
                 None
             };
+
+            if let Some(state) = app.try_state::<AppState>() {
+                state.telemetry.set_request_metrics(
+                    frontier.processed_count(),
+                    frontier.successful_count(),
+                    frontier.failed_count(),
+                );
+            }
 
             let phase = if frontier.is_cancelled() {
                 "cancelled"
@@ -281,10 +323,147 @@ fn support_key_for_path(path: &str) -> String {
         base = "root".to_string();
     }
     if base.len() > 96 {
-        base.truncate(96);
+        let safe_len = base.floor_char_boundary(96);
+        base.truncate(safe_len);
     }
 
     format!("{base}_{hash:016x}")
+}
+
+pub(crate) fn support_artifact_dir_for_output_root(
+    output_root: &std::path::Path,
+) -> std::path::PathBuf {
+    let anchor = output_root.parent().unwrap_or(output_root);
+    anchor
+        .join(".onionforge_support")
+        .join(support_key_for_path(&output_root.to_string_lossy()))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadSupportIndexEntry {
+    logical_path: String,
+    raw_url: String,
+    size_bytes: Option<u64>,
+    entry_type: &'static str,
+}
+
+async fn write_download_support_index(
+    entries: &[adapters::FileEntry],
+    support_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let index_entries = entries
+        .iter()
+        .map(|entry| DownloadSupportIndexEntry {
+            logical_path: entry.path.clone(),
+            raw_url: entry.raw_url.clone(),
+            size_bytes: entry.size_bytes,
+            entry_type: match entry.entry_type {
+                adapters::EntryType::File => "file",
+                adapters::EntryType::Folder => "folder",
+            },
+        })
+        .collect::<Vec<_>>();
+    let support_index_path = support_dir.join("download_support_index.json");
+    tokio::fs::write(
+        &support_index_path,
+        serde_json::to_vec_pretty(&index_entries)?,
+    )
+    .await?;
+    Ok(())
+}
+
+fn build_download_manifest(entries: &[adapters::FileEntry]) -> String {
+    let mut manifest = String::new();
+    manifest.push_str("# OnionForge Download Manifest\n");
+    manifest.push_str(&format!("# Generated: {}\n", chrono_stub()));
+    manifest.push_str(&format!("# Total Entries: {}\n\n", entries.len()));
+    for entry in entries {
+        let type_tag = match entry.entry_type {
+            adapters::EntryType::Folder => "DIR ",
+            adapters::EntryType::File => "FILE",
+        };
+        let size_tag = entry
+            .size_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "0 B".to_string());
+        let decoded_path = path_utils::url_decode(&entry.path);
+        manifest.push_str(&format!(
+            "{} {:>12}  {}  {}\n",
+            type_tag, size_tag, decoded_path, entry.raw_url
+        ));
+    }
+    manifest
+}
+
+async fn write_download_support_artifacts(
+    entries: &[adapters::FileEntry],
+    support_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let manifest_path = support_dir.join("_onionforge_manifest.txt");
+    tokio::fs::write(&manifest_path, build_download_manifest(entries).as_bytes()).await?;
+    write_download_support_index(entries, support_dir).await
+}
+
+fn ranked_qilin_download_hosts(entries: &[adapters::FileEntry]) -> Vec<String> {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for entry in entries {
+        if !matches!(entry.entry_type, adapters::EntryType::File) {
+            continue;
+        }
+        let Some(host) = reqwest::Url::parse(&entry.raw_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        else {
+            continue;
+        };
+        if !host.ends_with(".onion") {
+            continue;
+        }
+        *counts.entry(host).or_default() += 1;
+    }
+
+    let mut ranked = counts.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|(host_a, count_a), (host_b, count_b)| {
+        count_b.cmp(count_a).then_with(|| host_a.cmp(host_b))
+    });
+    ranked.into_iter().map(|(host, _)| host).collect()
+}
+
+fn build_qilin_alternate_urls(raw_url: &str, ranked_hosts: &[String]) -> Vec<String> {
+    let Some(current_host) = reqwest::Url::parse(raw_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+    else {
+        return Vec::new();
+    };
+
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut alternates = Vec::new();
+    for host in ranked_hosts {
+        let normalized = host.to_ascii_lowercase();
+        if normalized == current_host || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        if let Some(rewritten) = rewrite_qilin_seed_host(raw_url, &normalized) {
+            alternates.push(rewritten);
+        }
+    }
+    alternates
+}
+
+fn build_batch_file_entry(
+    entry: &adapters::FileEntry,
+    safe_target: String,
+    ranked_hosts: &[String],
+) -> aria_downloader::BatchFileEntry {
+    aria_downloader::BatchFileEntry {
+        url: entry.raw_url.clone(),
+        path: safe_target,
+        size_hint: entry.size_bytes,
+        jwt_exp: entry.jwt_exp,
+        alternate_urls: build_qilin_alternate_urls(&entry.raw_url, ranked_hosts),
+    }
 }
 
 fn looks_like_direct_artifact(url: &str, is_binary: bool) -> Option<String> {
@@ -320,6 +499,104 @@ struct CrawlAttemptResult {
     was_cancelled: bool,
 }
 
+fn warmup_quorum_target(client_count: usize) -> usize {
+    if client_count <= 1 {
+        return client_count;
+    }
+
+    client_count.clamp(2, 4).min((client_count / 2).max(2))
+}
+
+async fn warm_onion_clients_until_quorum(
+    frontier: &frontier::CrawlerFrontier,
+    url: &str,
+    timer: &crate::timer::CrawlTimer,
+) {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let clients_to_warm = frontier.http_clients.len();
+    if clients_to_warm <= 1 {
+        return;
+    }
+
+    let ready_quorum = warmup_quorum_target(clients_to_warm);
+    timer.emit_log(&format!(
+        "[Tor Swarm] Executing quorum warmup across {} clients (ready quorum {})...",
+        clients_to_warm, ready_quorum
+    ));
+
+    let mut warmups = FuturesUnordered::new();
+    for client in &frontier.http_clients {
+        let warm_client = client.clone();
+        let warm_url = url.to_string();
+        warmups.push(tokio::spawn(async move {
+            matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(45),
+                    warm_client.head(&warm_url).send(),
+                )
+                .await,
+                Ok(Ok(_))
+            )
+        }));
+    }
+
+    let mut ready = 0usize;
+    while let Some(result) = warmups.next().await {
+        if matches!(result, Ok(true)) {
+            ready += 1;
+            if ready >= ready_quorum {
+                break;
+            }
+        }
+
+        if ready + warmups.len() < ready_quorum {
+            break;
+        }
+    }
+
+    let outstanding = warmups.len();
+    drop(warmups);
+
+    if ready >= ready_quorum {
+        timer.emit_log(&format!(
+            "[Tor Swarm] Warmup quorum reached: {}/{} clients ready. Fingerprinting begins while {} warmups continue in background.",
+            ready, clients_to_warm, outstanding
+        ));
+    } else {
+        timer.emit_log(&format!(
+            "[Tor Swarm] Warmup quorum not reached: {}/{} ready. Proceeding with best available clients.",
+            ready, clients_to_warm
+        ));
+    }
+}
+
+async fn refresh_frontier_clients_from_swarm(
+    frontier: &mut frontier::CrawlerFrontier,
+    timer: &crate::timer::CrawlTimer,
+    phase_label: &str,
+) {
+    let Some(guard_arc) = frontier.swarm_guard.clone() else {
+        return;
+    };
+
+    let shared_clients = {
+        let guard = guard_arc.lock().await;
+        guard.get_arti_clients()
+    };
+    let before = frontier.http_clients.len();
+    let after = frontier.sync_arti_clients(&shared_clients);
+
+    if after > before {
+        let message = format!(
+            "[Tor Swarm] Refreshed frontier clients before {}: {} -> {} live Arti clients",
+            phase_label, before, after
+        );
+        timer.emit_log(&message);
+        println!("[Crawli Bootstrap] {}", message);
+    }
+}
+
 async fn execute_crawl_attempt(
     url: &str,
     options: &frontier::CrawlOptions,
@@ -332,8 +609,8 @@ async fn execute_crawl_attempt(
     let timer = crate::timer::CrawlTimer::new(app.clone());
     timer.emit_log(&format!("[System] Bootstrapping Target: {}", url));
 
-    let is_onion = url.contains(".onion");
-    let support_dir = output_root.join("temp_onionforge_forger");
+    let is_onion = url_targets_onion(url);
+    let support_dir = support_artifact_dir_for_output_root(output_root);
     tokio::fs::create_dir_all(&support_dir)
         .await
         .map_err(|e| format!("Failed to create support directory: {e}"))?;
@@ -350,7 +627,10 @@ async fn execute_crawl_attempt(
             if !arti_clients.is_empty() {
                 swarm_guard_for_frontier = Some(guard_arc.clone());
                 pre_warmed = true;
-                timer.emit_log(&format!("[Tor Swarm] Using pre-warmed Phantom Swarm ({} clients)", arti_clients.len()));
+                timer.emit_log(&format!(
+                    "[Tor Swarm] Using pre-warmed Phantom Swarm ({} clients)",
+                    arti_clients.len()
+                ));
                 println!(
                     "[Crawli Bootstrap] Using pre-warmed Phantom Swarm ({} clients)",
                     arti_clients.len()
@@ -368,11 +648,19 @@ async fn execute_crawl_attempt(
                 .daemons
                 .unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 })
                 .max(1);
-            match tor::bootstrap_tor_cluster(app.clone(), target_daemons, 0).await {
+            match tor::bootstrap_tor_cluster_for_traffic(
+                app.clone(),
+                target_daemons,
+                0,
+                tor::SwarmTrafficClass::OnionService,
+            )
+            .await
+            {
                 Ok((guard, ports)) => {
                     timer.emit_log(&format!(
                         "[Tor Swarm] Bootstrap complete: {} runtime, {} daemons active",
-                        guard.runtime_label(), ports.len()
+                        guard.runtime_label(),
+                        ports.len()
                     ));
                     println!(
                         "[Crawli Bootstrap] tor bootstrap complete: runtime={} ports={:?}",
@@ -418,239 +706,286 @@ async fn execute_crawl_attempt(
 
     let vfs_path = support_dir.join(".crawli_vtdb");
     let vfs_path_str = vfs_path.to_string_lossy().to_string();
-    timer.emit_log(&format!("[VFS] Initializing Sled storage at {}", vfs_path_str));
+    timer.emit_log(&format!(
+        "[VFS] Initializing Sled storage at {}",
+        vfs_path_str
+    ));
     let _ = vfs.initialize(&vfs_path_str).await;
     let _ = vfs.clear().await;
     timer.emit_log("[VFS] Storage initialized & wiped for new run");
     println!("[Crawli Bootstrap] vfs initialized at {}", vfs_path_str);
 
+    let registry = adapters::AdapterRegistry::new().with_explorer_context(ledger.clone());
+    let hinted_adapter = registry.determine_adapter_from_url_hint(url);
+
     if is_onion {
-        let clients_to_warm = frontier.http_clients.len();
-        if clients_to_warm > 1 {
-            timer.emit_log(&format!("[Tor Swarm] Executing Parallelized Tor Circuit Pre-Warming across {} daemons...", clients_to_warm));
-            let mut pre_warms = Vec::with_capacity(clients_to_warm);
-            for client in &frontier.http_clients {
-                let warm_client = client.clone();
-                let warm_url = url.to_string();
-                pre_warms.push(tokio::spawn(async move {
-                    // Send a lightweight HEAD request just to build the Tor circuit to the rendezvous point
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(45),
-                        warm_client.head(&warm_url).send(),
-                    ).await;
-                }));
-            }
-            let _ = futures::future::join_all(pre_warms).await;
-            timer.emit_log("[Tor Swarm] Circuit Pre-Warming Complete. Full parallel throughput unlocked.");
+        refresh_frontier_clients_from_swarm(&mut frontier, &timer, "warmup").await;
+        if let Some(adapter) = hinted_adapter.as_ref() {
+            timer.emit_log(&format!(
+                "[Tor Swarm] Strong adapter hint ({}) present. Skipping blocking warmup and proceeding directly to adapter execution.",
+                adapter.name()
+            ));
+        } else {
+            warm_onion_clients_until_quorum(&frontier, url, &timer).await;
+            refresh_frontier_clients_from_swarm(&mut frontier, &timer, "fingerprinting").await;
         }
     }
+    let mut fingerprint: Option<adapters::SiteFingerprint> = None;
+    let mut fingerprint_latency_ms = 0u64;
 
-    println!("[Crawli Fingerprint] requesting initial URL: {}", url);
-    timer.emit_log("[Fingerprint] Initiating site capabilities probe...");
-
-    let fingerprint_attempts = if is_onion { 4 } else { 2 };
-    let mut fingerprint_attempt = 1usize;
-    let resp = loop {
-        let attempt = fingerprint_attempt;
-        let (cid, client) = frontier.get_client();
-        // PR-CRAWLER-012: Every HTTP call through Tor must have explicit timeout
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            client.get(url).send(),
-        )
-        .await
-        {
-            Ok(Ok(r)) => {
-                timer.emit_log(&format!(
-                    "[Fingerprint] Probe successful! Status: {}, Final URL: {}",
-                    r.status(), r.url()
-                ));
-                println!(
-                    "[Crawli Fingerprint] initial URL responded: status={} final={}",
-                    r.status(),
-                    r.url()
-                );
-                break r;
-            }
-            Ok(Err(e)) => {
-                let error_text = e.to_string();
-                println!(
-                    "[Crawli Fingerprint] initial URL request failed on attempt {} via cid {}: {}",
-                    attempt, cid, error_text
-                );
-
-                if attempt >= fingerprint_attempts {
-                    timer.emit_log(&format!("[Fingerprint] CRITICAL FAIL: Site offline or blocking Tor. ({})", error_text));
-                    
-                    // PR-CRAWLER-017: If the fallback chain fails completely, the Phantom Swarm
-                    // may have a burned guard node or IP ban. Shred it from AppState so
-                    // the user's next 'Retry' click forces a 100% cold boot.
-                    timer.emit_log("[Tor Swarm] ⚠ Evicting degraded Phantom Swarm to force cold boot next run.");
-                    if let Some(guard_arc) = app_state.crawl_swarm_guard.lock().await.take() {
-                        let mut g = guard_arc.lock().await;
-                        g.shutdown_all();
-                    }
-
-                    return Err(format!(
-                        "OFFLINE_SYNC_ERROR: The site might be down. Please manually check it to verify if it is actually functional and active. ({})",
-                        error_text
-                    ));
-                }
-
-                timer.emit_log(&format!(
-                    "[Fingerprint] Probe failed on attempt {}/{}. Rotating circuit...",
-                    attempt, fingerprint_attempts
-                ));
-                if is_onion {
-                    frontier.trigger_circuit_isolation(cid).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis((attempt as u64) * 750)).await;
-                fingerprint_attempt = fingerprint_attempt.saturating_add(1);
-            }
-            Err(_) => {
-                // Timeout — treat as failure
-                println!(
-                    "[Crawli Fingerprint] attempt {} timed out after 30s via cid {}",
-                    attempt, cid
-                );
-
-                if attempt >= fingerprint_attempts {
-                    timer.emit_log("[Fingerprint] CRITICAL FAIL: All fingerprint attempts timed out (30s each).");
-                    
-                    // PR-CRAWLER-017: Shred degraded Phantom Swarm to prevent infinite loop of dead circuits
-                    timer.emit_log("[Tor Swarm] ⏰ Evicting dead Phantom Swarm to force cold boot next run.");
-                    if let Some(guard_arc) = app_state.crawl_swarm_guard.lock().await.take() {
-                        let mut g = guard_arc.lock().await;
-                        g.shutdown_all();
-                    }
-
-                    return Err(
-                        "OFFLINE_SYNC_ERROR: All fingerprint probes timed out. The site may be down or Tor circuits are degraded.".to_string()
-                    );
-                }
-
-                timer.emit_log(&format!(
-                    "[Fingerprint] Probe timed out on attempt {}/{}. Rotating circuit...",
-                    attempt, fingerprint_attempts
-                ));
-                if is_onion {
-                    frontier.trigger_circuit_isolation(cid).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis((attempt as u64) * 750)).await;
-                fingerprint_attempt = fingerprint_attempt.saturating_add(1);
-            }
-        }
-    };
-
-    let status = resp.status().as_u16();
-    let headers = resp.headers().clone();
-    let content_type = headers
-        .get("content-type")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let is_binary = !content_type.starts_with("text/")
-        && !content_type.contains("json")
-        && !content_type.contains("xml")
-        && (content_type.contains("application/")
-            || url.ends_with(".7z")
-            || url.ends_with(".zip")
-            || url.ends_with(".rar")
-            || url.ends_with(".tar.gz")
-            || url.ends_with(".tar")
-            || url.ends_with(".gz"));
-
-    let body = if is_binary {
-        "[BINARY_OR_ARCHIVE_DATA]".to_string()
-    } else {
-        // PR-CRAWLER-012: Timeout on body read to prevent hang on stalled connections
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            resp.text(),
-        ).await {
-            Ok(Ok(text)) => text,
-            Ok(Err(_)) => "[DECODE_ERROR]".to_string(),
-            Err(_) => {
-                println!("[Crawli Fingerprint] body read timed out after 15s");
-                "[BODY_TIMEOUT]".to_string()
-            }
-        }
-    };
-
-    let fingerprint = adapters::SiteFingerprint {
-        url: url.to_string(),
-        status,
-        headers,
-        body,
-    };
-
-    if let Some(name) = looks_like_direct_artifact(url, is_binary) {
-        timer.emit_log(&format!("[Adapter] Target appears to be a direct file/artifact: {}", name));
-        let registry = adapters::AdapterRegistry::new().with_explorer_context(ledger.clone());
-        if let Some(adapter) = registry.determine_adapter(&fingerprint).await {
-            timer.emit_log(&format!("[Adapter] Match found: {}", adapter.name()));
-            app.emit(
-                "crawl_log",
-                format!("[Adapter] Match found: {}", adapter.name()),
-            )
-            .unwrap_or_default();
-        } else {
-            timer.emit_log("[Adapter] Match found: Direct Artifact (No specialized adapter match)");
-            app.emit(
-                "crawl_log",
-                "[Adapter] Match found: Direct Artifact (No specialized adapter match)".to_string(),
-            )
-            .unwrap_or_default();
-        }
-
-        let size = fingerprint
-            .headers
-            .get("content-length")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        let entry = adapters::FileEntry {
-            jwt_exp: None,
-            path: name.clone(),
-            size_bytes: size,
-            entry_type: adapters::EntryType::File,
-            raw_url: url.to_string(),
-        };
+    if let Some(adapter) = hinted_adapter {
+        timer.emit_log(&format!(
+            "[Fingerprint] Strong URL hint matched {}. Skipping network fingerprint probe.",
+            adapter.name()
+        ));
         app.emit(
             "crawl_log",
             format!(
-                "[System] Raw File Target Intercepted: {}. Enqueueing directly to Aria Forge.",
-                name
+                "[Fingerprint] Strong URL hint matched {}. Skipping network fingerprint probe.",
+                adapter.name()
             ),
         )
         .unwrap_or_default();
-        let fallback_entries = vec![entry.clone()];
-        vfs.insert_entries(&fallback_entries)
-            .await
-            .map_err(|e| e.to_string())?;
-        let _ = app.emit("crawl_progress", fallback_entries.clone());
+        app_state.telemetry.set_fingerprint_latency_ms(0);
+    } else {
+        println!("[Crawli Fingerprint] requesting initial URL: {}", url);
+        timer.emit_log("[Fingerprint] Initiating site capabilities probe...");
+        let fingerprint_started_at = std::time::Instant::now();
 
-        let arc_frontier = std::sync::Arc::new(frontier);
-        let state = app.state::<AppState>();
-        let mut lock = state.active_frontier.lock().await;
-        *lock = Some(arc_frontier.clone());
-        drop(lock);
-        let _ = app.emit(
-            "crawl_status_update",
-            crawl_status_snapshot(arc_frontier.as_ref(), "complete", 100.0, Some(0)),
-        );
+        let fingerprint_attempts = if is_onion { 4 } else { 2 };
+        let mut fingerprint_attempt = 1usize;
+        let resp = loop {
+            let attempt = fingerprint_attempt;
+            let (cid, client) = frontier.get_client();
+            // PR-CRAWLER-012: Every HTTP call through Tor must have explicit timeout
+            match tokio::time::timeout(std::time::Duration::from_secs(30), client.get(url).send())
+                .await
+            {
+                Ok(Ok(r)) => {
+                    timer.emit_log(&format!(
+                        "[Fingerprint] Probe successful! Status: {}, Final URL: {}",
+                        r.status(),
+                        r.url()
+                    ));
+                    println!(
+                        "[Crawli Fingerprint] initial URL responded: status={} final={}",
+                        r.status(),
+                        r.url()
+                    );
+                    break r;
+                }
+                Ok(Err(e)) => {
+                    let error_text = e.to_string();
+                    println!(
+                        "[Crawli Fingerprint] initial URL request failed on attempt {} via cid {}: {}",
+                        attempt, cid, error_text
+                    );
 
-        return Ok(CrawlAttemptResult {
-            summary: summarize_entry_slice(&fallback_entries),
-            was_cancelled: false,
-        });
+                    if attempt >= fingerprint_attempts {
+                        timer.emit_log(&format!(
+                            "[Fingerprint] CRITICAL FAIL: Site offline or blocking Tor. ({})",
+                            error_text
+                        ));
+
+                        // PR-CRAWLER-017: If the fallback chain fails completely, the Phantom Swarm
+                        // may have a burned guard node or IP ban. Shred it from AppState so
+                        // the user's next 'Retry' click forces a 100% cold boot.
+                        timer.emit_log("[Tor Swarm] ⚠ Evicting degraded Phantom Swarm to force cold boot next run.");
+                        if let Some(guard_arc) = app_state.crawl_swarm_guard.lock().await.take() {
+                            let mut g = guard_arc.lock().await;
+                            g.shutdown_all();
+                        }
+
+                        return Err(format!(
+                            "OFFLINE_SYNC_ERROR: The site might be down. Please manually check it to verify if it is actually functional and active. ({})",
+                            error_text
+                        ));
+                    }
+
+                    timer.emit_log(&format!(
+                        "[Fingerprint] Probe failed on attempt {}/{}. Rotating circuit...",
+                        attempt, fingerprint_attempts
+                    ));
+                    if is_onion {
+                        frontier.trigger_circuit_isolation(cid).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis((attempt as u64) * 750))
+                        .await;
+                    fingerprint_attempt = fingerprint_attempt.saturating_add(1);
+                }
+                Err(_) => {
+                    // Timeout — treat as failure
+                    println!(
+                        "[Crawli Fingerprint] attempt {} timed out after 30s via cid {}",
+                        attempt, cid
+                    );
+
+                    if attempt >= fingerprint_attempts {
+                        timer.emit_log("[Fingerprint] CRITICAL FAIL: All fingerprint attempts timed out (30s each).");
+
+                        // PR-CRAWLER-017: Shred degraded Phantom Swarm to prevent infinite loop of dead circuits
+                        timer.emit_log(
+                            "[Tor Swarm] ⏰ Evicting dead Phantom Swarm to force cold boot next run.",
+                        );
+                        if let Some(guard_arc) = app_state.crawl_swarm_guard.lock().await.take() {
+                            let mut g = guard_arc.lock().await;
+                            g.shutdown_all();
+                        }
+
+                        return Err(
+                            "OFFLINE_SYNC_ERROR: All fingerprint probes timed out. The site may be down or Tor circuits are degraded.".to_string()
+                        );
+                    }
+
+                    timer.emit_log(&format!(
+                        "[Fingerprint] Probe timed out on attempt {}/{}. Rotating circuit...",
+                        attempt, fingerprint_attempts
+                    ));
+                    if is_onion {
+                        frontier.trigger_circuit_isolation(cid).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis((attempt as u64) * 750))
+                        .await;
+                    fingerprint_attempt = fingerprint_attempt.saturating_add(1);
+                }
+            }
+        };
+
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        let content_type = headers
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        let is_binary = !content_type.starts_with("text/")
+            && !content_type.contains("json")
+            && !content_type.contains("xml")
+            && (content_type.contains("application/")
+                || url.ends_with(".7z")
+                || url.ends_with(".zip")
+                || url.ends_with(".rar")
+                || url.ends_with(".tar.gz")
+                || url.ends_with(".tar")
+                || url.ends_with(".gz"));
+
+        let body = if is_binary {
+            "[BINARY_OR_ARCHIVE_DATA]".to_string()
+        } else {
+            // PR-CRAWLER-012: Timeout on body read to prevent hang on stalled connections
+            match tokio::time::timeout(std::time::Duration::from_secs(15), resp.text()).await {
+                Ok(Ok(text)) => text,
+                Ok(Err(_)) => "[DECODE_ERROR]".to_string(),
+                Err(_) => {
+                    println!("[Crawli Fingerprint] body read timed out after 15s");
+                    "[BODY_TIMEOUT]".to_string()
+                }
+            }
+        };
+
+        fingerprint_latency_ms = fingerprint_started_at.elapsed().as_millis() as u64;
+        app_state
+            .telemetry
+            .set_fingerprint_latency_ms(fingerprint_latency_ms);
+
+        let captured_fingerprint = adapters::SiteFingerprint {
+            url: url.to_string(),
+            status,
+            headers,
+            body,
+        };
+
+        if let Some(name) = looks_like_direct_artifact(url, is_binary) {
+            timer.emit_log(&format!(
+                "[Adapter] Target appears to be a direct file/artifact: {}",
+                name
+            ));
+            if let Some(adapter) = registry.determine_adapter(&captured_fingerprint).await {
+                timer.emit_log(&format!("[Adapter] Match found: {}", adapter.name()));
+                app.emit(
+                    "crawl_log",
+                    format!("[Adapter] Match found: {}", adapter.name()),
+                )
+                .unwrap_or_default();
+            } else {
+                timer.emit_log(
+                    "[Adapter] Match found: Direct Artifact (No specialized adapter match)",
+                );
+                app.emit(
+                    "crawl_log",
+                    "[Adapter] Match found: Direct Artifact (No specialized adapter match)"
+                        .to_string(),
+                )
+                .unwrap_or_default();
+            }
+
+            let size = captured_fingerprint
+                .headers
+                .get("content-length")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let entry = adapters::FileEntry {
+                jwt_exp: None,
+                path: name.clone(),
+                size_bytes: size,
+                entry_type: adapters::EntryType::File,
+                raw_url: url.to_string(),
+            };
+            app.emit(
+                "crawl_log",
+                format!(
+                    "[System] Raw File Target Intercepted: {}. Enqueueing directly to Aria Forge.",
+                    name
+                ),
+            )
+            .unwrap_or_default();
+            let fallback_entries = vec![entry.clone()];
+            vfs.insert_entries(&fallback_entries)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = app.emit("crawl_progress", fallback_entries.clone());
+
+            let arc_frontier = std::sync::Arc::new(frontier);
+            let state = app.state::<AppState>();
+            let mut lock = state.active_frontier.lock().await;
+            *lock = Some(arc_frontier.clone());
+            drop(lock);
+            let _ = app.emit(
+                "crawl_status_update",
+                crawl_status_snapshot(arc_frontier.as_ref(), "complete", 100.0, Some(0)),
+            );
+
+            return Ok(CrawlAttemptResult {
+                summary: summarize_entry_slice(&fallback_entries),
+                was_cancelled: false,
+            });
+        }
+
+        fingerprint = Some(captured_fingerprint);
     }
 
-    let registry = adapters::AdapterRegistry::new().with_explorer_context(ledger.clone());
-    let Some(adapter) = registry.determine_adapter(&fingerprint).await else {
-        timer.emit_log("[Adapter] CRITICAL FAIL: No known adapter matched this site architecture.");
-        return Err("No known adapter matched this sites architecture.".to_string());
+    let adapter = if let Some(adapter) = hinted_adapter {
+        adapter
+    } else {
+        let Some(adapter) = registry
+            .determine_adapter(fingerprint.as_ref().expect("fingerprint must exist"))
+            .await
+        else {
+            timer.emit_log(
+                "[Adapter] CRITICAL FAIL: No known adapter matched this site architecture.",
+            );
+            return Err("No known adapter matched this sites architecture.".to_string());
+        };
+        timer.emit_log(&format!(
+            "[Fingerprint] Network probe completed in {} ms.",
+            fingerprint_latency_ms
+        ));
+        adapter
     };
 
-    timer.emit_log(&format!("[Adapter] Match found: {}. Executing deep crawl...", adapter.name()));
+    timer.emit_log(&format!(
+        "[Adapter] Match found: {}. Executing deep crawl...",
+        adapter.name()
+    ));
     app.emit(
         "crawl_log",
         format!("[Adapter] Match found: {}", adapter.name()),
@@ -678,35 +1013,36 @@ async fn execute_crawl_attempt(
 
     let was_cancelled = arc_frontier.is_cancelled();
     let final_payload = if was_cancelled {
-        let visited = arc_frontier.visited_count();
-        let processed = arc_frontier.processed_count();
-        let queued = visited.saturating_sub(processed);
+        let snapshot = arc_frontier.progress_snapshot();
         let progress = estimate_progress_percent(
-            visited.max(1),
-            processed,
-            queued,
-            arc_frontier.active_workers(),
+            snapshot.visited.max(1),
+            snapshot.processed,
+            snapshot.queued,
+            snapshot.active_workers,
         );
         crawl_status_snapshot(arc_frontier.as_ref(), "cancelled", progress, None)
     } else if crawl_result.is_ok() {
         crawl_status_snapshot(arc_frontier.as_ref(), "complete", 100.0, Some(0))
     } else {
-        let visited = arc_frontier.visited_count();
-        let processed = arc_frontier.processed_count();
-        let queued = visited.saturating_sub(processed);
+        let snapshot = arc_frontier.progress_snapshot();
         let progress = estimate_progress_percent(
-            visited.max(1),
-            processed,
-            queued,
-            arc_frontier.active_workers(),
+            snapshot.visited.max(1),
+            snapshot.processed,
+            snapshot.queued,
+            snapshot.active_workers,
         );
         crawl_status_snapshot(arc_frontier.as_ref(), "error", progress, None)
     };
     telemetry_bridge::publish_crawl_status(&app, final_payload);
+    {
+        let state = app.state::<AppState>();
+        state.telemetry.set_worker_metrics(0, 0);
+        telemetry_bridge::publish_resource_metrics(&app, state.telemetry.snapshot_counters());
+    }
+    arc_frontier.clear_adapter_progress();
 
     match crawl_result {
         Ok(files) => {
-            timer.emit_log(&format!("[Adapter] Crawl complete! Found {} raw entries.", files.len()));
             let state = app.state::<AppState>();
             *state.current_target_dir.lock().await = None;
             *state.current_target_key.lock().await = None;
@@ -720,13 +1056,32 @@ async fn execute_crawl_attempt(
             if summary.discovered_count == 0 && !files.is_empty() {
                 summary = summarize_entry_slice(&files);
             }
+            if summary.discovered_count == files.len() {
+                timer.emit_log(&format!(
+                    "[Adapter] Crawl complete! Found {} raw entries (files={} folders={}).",
+                    files.len(),
+                    summary.file_count,
+                    summary.folder_count
+                ));
+            } else {
+                timer.emit_log(&format!(
+                    "[Adapter] Crawl complete! raw entries={} effective entries={} (files={} folders={}).",
+                    files.len(),
+                    summary.discovered_count,
+                    summary.file_count,
+                    summary.folder_count
+                ));
+            }
             Ok(CrawlAttemptResult {
                 summary,
                 was_cancelled,
             })
         }
         Err(e) => {
-            timer.emit_log(&format!("[Adapter] CRITICAL FAIL during crawl execution: {}", e));
+            timer.emit_log(&format!(
+                "[Adapter] CRITICAL FAIL during crawl execution: {}",
+                e
+            ));
             let state = app.state::<AppState>();
             let mut lock = state.active_frontier.lock().await;
             *lock = None;
@@ -744,168 +1099,8 @@ async fn scaffold_download_from_vfs(
     connections: usize,
     force_tor: bool,
 ) -> anyhow::Result<u32> {
-    use anyhow::anyhow;
-    use aria_downloader::BatchFileEntry;
-
-    let base = output_root.to_path_buf();
-    tokio::fs::create_dir_all(&base).await?;
-    let support_dir = base.join("temp_onionforge_forger");
-    tokio::fs::create_dir_all(&support_dir).await?;
-
-    let mut written_final: u32 = 0;
-    let mut batch_files: Vec<BatchFileEntry> = Vec::new();
-    let mut manifest = String::new();
-    let mut total_entries = 0usize;
-    let mut total_bytes_hint = 0u64;
-    let mut unknown_size_files = 0usize;
-
-    manifest.push_str("# OnionForge Download Manifest\n");
-    manifest.push_str(&format!("# Generated: {}\n", chrono_stub()));
-
-    vfs.with_entry_batches(512, |entries| {
-        for entry in entries {
-            total_entries = total_entries.saturating_add(1);
-            let full_path = match path_utils::resolve_path_within_root(
-                &base,
-                &entry.path,
-                matches!(entry.entry_type, adapters::EntryType::Folder),
-            ) {
-                Ok(Some(path)) => path,
-                Ok(None) => continue,
-                Err(err) => {
-                    let _ = app.emit(
-                        "crawl_log",
-                        format!("[SECURITY] Rejected unsafe path '{}': {}", entry.path, err),
-                    );
-                    continue;
-                }
-            };
-
-            match entry.entry_type {
-                adapters::EntryType::Folder => {
-                    std::fs::create_dir_all(&full_path)?;
-                    let gitkeep = full_path.join(".gitkeep");
-                    if !gitkeep.exists() {
-                        let _ = std::fs::write(&gitkeep, b"");
-                    }
-                    written_final = written_final.saturating_add(1);
-                }
-                adapters::EntryType::File => {
-                    if let Some(parent) = full_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-
-                    let safe_target = full_path.to_string_lossy().to_string();
-                    let url_lower = entry.raw_url.to_lowercase();
-                    if url_lower.starts_with("http://") || url_lower.starts_with("https://") {
-                        batch_files.push(BatchFileEntry {
-                            url: entry.raw_url.clone(),
-                            path: safe_target,
-                            size_hint: entry.size_bytes,
-                            jwt_exp: entry.jwt_exp,
-                        });
-                        total_bytes_hint =
-                            total_bytes_hint.saturating_add(entry.size_bytes.unwrap_or(0));
-                        if entry.size_bytes.unwrap_or(0) == 0 {
-                            unknown_size_files = unknown_size_files.saturating_add(1);
-                        }
-                    } else {
-                        if !full_path.exists() {
-                            let _ = std::fs::write(&full_path, b"");
-                        }
-                        let _ = app.emit(
-                            "crawl_log",
-                            format!(
-                                "[MIRROR] Placeholder scaffolded for {} (no valid source URL).",
-                                entry.path
-                            ),
-                        );
-                        written_final = written_final.saturating_add(1);
-                    }
-
-                    let meta_path = support_dir.join(format!(
-                        "{}.onionforge.meta",
-                        support_key_for_path(&entry.path)
-                    ));
-                    let size_str = entry
-                        .size_bytes
-                        .map(|s: u64| s.to_string())
-                        .unwrap_or_else(|| "0".to_string());
-                    let meta_content = format!(
-                        "url={}\nsize={}\ntype=file\noriginal_path={}\n",
-                        entry.raw_url, size_str, entry.path
-                    );
-                    let _ = std::fs::write(&meta_path, meta_content.as_bytes());
-                }
-            }
-
-            let type_tag = match entry.entry_type {
-                adapters::EntryType::Folder => "DIR ",
-                adapters::EntryType::File => "FILE",
-            };
-            let size_tag = entry
-                .size_bytes
-                .map(format_bytes)
-                .unwrap_or_else(|| "0 B".to_string());
-            let decoded_path = path_utils::url_decode(&entry.path);
-            manifest.push_str(&format!(
-                "{} {:>12}  {}  {}\n",
-                type_tag, size_tag, decoded_path, entry.raw_url
-            ));
-        }
-        Ok(())
-    })
-    .await?;
-
-    manifest.insert_str(
-        manifest
-            .find('\n')
-            .map(|idx| idx + 1)
-            .unwrap_or(manifest.len()),
-        &format!("# Total Entries: {}\n\n", total_entries),
-    );
-
-    if !batch_files.is_empty() {
-        let batch_count = batch_files.len();
-        let _ = app.emit(
-            "download_batch_started",
-            DownloadBatchStartedEvent {
-                total_files: batch_count,
-                total_bytes_hint,
-                unknown_size_files,
-                output_dir: base.to_string_lossy().to_string(),
-            },
-        );
-        let _ = app.emit(
-            "crawl_log",
-            format!(
-                "[ARIA] Batch mirror engaged: {} files | Circuits: {}",
-                batch_count,
-                connections.max(1)
-            ),
-        );
-
-        let control = aria_downloader::activate_download_control()
-            .ok_or_else(|| anyhow!("A download is already active."))?;
-        let batch_result = aria_downloader::start_batch_download(
-            app.clone(),
-            batch_files,
-            connections.max(1),
-            force_tor,
-            Some(base.to_string_lossy().to_string()),
-            control,
-        )
-        .await;
-        aria_downloader::clear_download_control();
-        batch_result?;
-
-        written_final = written_final.saturating_add(batch_count as u32);
-    }
-
-    let manifest_path = support_dir.join("_onionforge_manifest.txt");
-    tokio::fs::write(&manifest_path, manifest.as_bytes()).await?;
-
-    Ok(written_final)
+    let entries = vfs.iter_entries().await?;
+    scaffold_download(&entries, output_root, app, connections, force_tor).await
 }
 
 async fn scaffold_download_from_entries_with_plan(
@@ -923,18 +1118,14 @@ async fn scaffold_download_from_entries_with_plan(
 
     let base = output_root.to_path_buf();
     tokio::fs::create_dir_all(&base).await?;
-    let support_dir = base.join("temp_onionforge_forger");
+    let support_dir = support_artifact_dir_for_output_root(&base);
     tokio::fs::create_dir_all(&support_dir).await?;
+    let ranked_hosts = ranked_qilin_download_hosts(entries);
 
     let mut written_final: u32 = 0;
     let mut batch_lookup: BTreeMap<String, BatchFileEntry> = BTreeMap::new();
-    let mut manifest = String::new();
     let mut total_bytes_hint = 0u64;
     let mut unknown_size_files = 0usize;
-
-    manifest.push_str("# OnionForge Download Manifest\n");
-    manifest.push_str(&format!("# Generated: {}\n", chrono_stub()));
-    manifest.push_str(&format!("# Total Entries: {}\n\n", entries.len()));
 
     for entry in entries {
         let full_path = match path_utils::resolve_path_within_root(
@@ -972,12 +1163,7 @@ async fn scaffold_download_from_entries_with_plan(
                 if url_lower.starts_with("http://") || url_lower.starts_with("https://") {
                     batch_lookup.insert(
                         entry.path.clone(),
-                        BatchFileEntry {
-                            url: entry.raw_url.clone(),
-                            path: safe_target,
-                            size_hint: entry.size_bytes,
-                            jwt_exp: entry.jwt_exp,
-                        },
+                        build_batch_file_entry(entry, safe_target, &ranked_hosts),
                     );
                     total_bytes_hint =
                         total_bytes_hint.saturating_add(entry.size_bytes.unwrap_or(0));
@@ -997,42 +1183,15 @@ async fn scaffold_download_from_entries_with_plan(
                     );
                     written_final = written_final.saturating_add(1);
                 }
-
-                let meta_path = support_dir.join(format!(
-                    "{}.onionforge.meta",
-                    support_key_for_path(&entry.path)
-                ));
-                let size_str = entry
-                    .size_bytes
-                    .map(|s: u64| s.to_string())
-                    .unwrap_or_else(|| "0".to_string());
-                let meta_content = format!(
-                    "url={}\nsize={}\ntype=file\noriginal_path={}\n",
-                    entry.raw_url, size_str, entry.path
-                );
-                let _ = tokio::fs::write(&meta_path, meta_content.as_bytes()).await;
             }
         }
-
-        let type_tag = match entry.entry_type {
-            adapters::EntryType::Folder => "DIR ",
-            adapters::EntryType::File => "FILE",
-        };
-        let size_tag = entry
-            .size_bytes
-            .map(format_bytes)
-            .unwrap_or_else(|| "0 B".to_string());
-        let decoded_path = path_utils::url_decode(&entry.path);
-        manifest.push_str(&format!(
-            "{} {:>12}  {}  {}\n",
-            type_tag, size_tag, decoded_path, entry.raw_url
-        ));
     }
 
     let batch_files: Vec<BatchFileEntry> = ordered_entries
         .iter()
         .filter_map(|entry| batch_lookup.remove(&entry.path))
         .collect();
+    write_download_support_artifacts(entries, &support_dir).await?;
 
     if !batch_files.is_empty() {
         let _ = app.emit(
@@ -1103,9 +1262,6 @@ async fn scaffold_download_from_entries_with_plan(
         target_state::save_failure_manifest(&target_paths.failure_manifest_path, &next_failures)?;
     }
 
-    let manifest_path = support_dir.join("_onionforge_manifest.txt");
-    tokio::fs::write(&manifest_path, manifest.as_bytes()).await?;
-
     Ok(written_final)
 }
 
@@ -1168,13 +1324,23 @@ async fn start_crawl(
 
     if options.resume && options.resume_index.is_none() {
         if best_prior_count > 0 && target_paths.stable_best_dirs_listing_path.exists() {
-            options.resume_index = Some(target_paths.stable_best_dirs_listing_path.to_string_lossy().to_string());
+            options.resume_index = Some(
+                target_paths
+                    .stable_best_dirs_listing_path
+                    .to_string_lossy()
+                    .to_string(),
+            );
         } else if target_paths.stable_current_dirs_listing_path.exists() {
-            options.resume_index = Some(target_paths.stable_current_dirs_listing_path.to_string_lossy().to_string());
+            options.resume_index = Some(
+                target_paths
+                    .stable_current_dirs_listing_path
+                    .to_string_lossy()
+                    .to_string(),
+            );
         }
-        
+
         if options.resume_index.is_some() {
-             app.emit(
+            app.emit(
                 "crawl_log",
                 format!("[SYSTEM] 🔭 Phase 68 Ledger Resume: Auto-injecting persistent snapshot across system restarts.")
             ).unwrap_or_default();
@@ -1429,7 +1595,7 @@ async fn start_crawl(
                 ),
             )
             .unwrap_or_default();
-            let is_onion = url.contains(".onion");
+            let is_onion = url_targets_onion(&url);
             match scaffold_download_from_entries_with_plan(
                 &authoritative_entries,
                 &resume_build.ordered_entries,
@@ -1527,11 +1693,205 @@ async fn download_files(
     app: tauri::AppHandle,
 ) -> Result<u32, String> {
     let output_root = canonical_output_root(&output_dir)?;
-    let force_tor = entries.iter().any(|entry| entry.raw_url.contains(".onion"));
+    let force_tor = entries
+        .iter()
+        .any(|entry| url_targets_onion(&entry.raw_url));
     let circuits = connections.unwrap_or(120).max(1);
     scaffold_download(&entries, &output_root, &app, circuits, force_tor)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedQilinSubtreeRouteSummary {
+    #[allow(dead_code)]
+    updated_at_epoch: u64,
+    winner_host: Option<String>,
+    entries: Vec<PersistedQilinSubtreeRouteEntry>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedQilinSubtreeRouteEntry {
+    subtree_key: String,
+    preferred_host: String,
+    #[allow(dead_code)]
+    success_count: u32,
+    #[allow(dead_code)]
+    last_success_epoch: u64,
+}
+
+fn find_qilin_route_summary_path(context_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cursor = if context_path.is_dir() {
+        Some(context_path)
+    } else {
+        context_path.parent()
+    };
+
+    for _ in 0..6 {
+        let current = cursor?;
+        let candidate = current.join("qilin_subtree_route_summary.json");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        cursor = current.parent();
+    }
+
+    None
+}
+
+fn split_qilin_download_seed_and_relative_path(url: &str) -> Option<(String, String)> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let segments: Vec<_> = parsed.path_segments()?.collect();
+    let uuid_idx = segments.iter().position(|segment| {
+        segment.len() == 36 && segment.chars().filter(|c| *c == '-').count() == 4
+    })?;
+
+    let mut seed_path = String::new();
+    for segment in segments.iter().take(uuid_idx + 1) {
+        seed_path.push('/');
+        seed_path.push_str(segment);
+    }
+    seed_path.push('/');
+
+    let seed_url = format!("{}://{}{}", parsed.scheme(), parsed.host_str()?, seed_path);
+    let relative_path = segments
+        .iter()
+        .skip(uuid_idx + 1)
+        .filter(|segment| !segment.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/");
+    Some((seed_url, relative_path))
+}
+
+fn rewrite_qilin_seed_host(raw_url: &str, preferred_host: &str) -> Option<String> {
+    let (seed_url, _) = split_qilin_download_seed_and_relative_path(raw_url)?;
+    let parsed_seed = reqwest::Url::parse(&seed_url).ok()?;
+    let current_host = parsed_seed.host_str()?.trim();
+    if current_host.eq_ignore_ascii_case(preferred_host) {
+        return None;
+    }
+    let next_seed = seed_url.replacen(current_host, preferred_host, 1);
+    Some(raw_url.replacen(&seed_url, &next_seed, 1))
+}
+
+fn subtree_key_for_qilin_download(raw_url: &str) -> Option<String> {
+    let (_, relative_path) = split_qilin_download_seed_and_relative_path(raw_url)?;
+    let trimmed = relative_path.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let subtree = trimmed
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or(trimmed);
+    if subtree.is_empty() {
+        None
+    } else {
+        Some(subtree.to_string())
+    }
+}
+
+#[cfg(test)]
+fn preferred_qilin_host_for_subtree(
+    subtree: &str,
+    routes_by_subtree: &std::collections::HashMap<String, String>,
+    winner_host: Option<&str>,
+) -> Option<String> {
+    let mut cursor = Some(subtree);
+    while let Some(candidate) = cursor {
+        if let Some(host) = routes_by_subtree.get(candidate) {
+            return Some(host.clone());
+        }
+        cursor = candidate.rsplit_once('/').map(|(parent, _)| parent);
+    }
+    winner_host.map(|host| host.to_string())
+}
+
+fn preferred_qilin_download_host_for_subtree(
+    subtree: &str,
+    routes_by_subtree: &std::collections::HashMap<String, PersistedQilinSubtreeRouteEntry>,
+    winner_host: Option<&str>,
+    updated_at_epoch: u64,
+) -> Option<String> {
+    let mut cursor = Some(subtree);
+    while let Some(candidate) = cursor {
+        if let Some(route) = routes_by_subtree.get(candidate) {
+            if let Some(winner_host) = winner_host {
+                let route_age = updated_at_epoch.saturating_sub(route.last_success_epoch);
+                let should_prefer_winner = !winner_host.eq_ignore_ascii_case(&route.preferred_host)
+                    && (route.success_count < 2 || route_age > 120);
+                if should_prefer_winner {
+                    return Some(winner_host.to_string());
+                }
+            }
+            return Some(route.preferred_host.clone());
+        }
+        cursor = candidate.rsplit_once('/').map(|(parent, _)| parent);
+    }
+    winner_host.map(|host| host.to_string())
+}
+
+fn maybe_repin_qilin_entries_from_context(
+    entries: &mut [adapters::FileEntry],
+    context_path: Option<&std::path::Path>,
+    app: &tauri::AppHandle,
+) -> anyhow::Result<usize> {
+    let Some(context_path) = context_path else {
+        return Ok(0);
+    };
+    let Some(route_summary_path) = find_qilin_route_summary_path(context_path) else {
+        return Ok(0);
+    };
+
+    let content = std::fs::read_to_string(&route_summary_path)?;
+    let summary: PersistedQilinSubtreeRouteSummary = serde_json::from_str(&content)?;
+    let winner_host = summary.winner_host.clone();
+    let updated_at_epoch = summary.updated_at_epoch;
+    let routes_by_subtree: std::collections::HashMap<String, PersistedQilinSubtreeRouteEntry> =
+        summary
+            .entries
+            .into_iter()
+            .map(|entry| (entry.subtree_key.clone(), entry))
+            .collect();
+
+    let mut rewrites = 0usize;
+    for entry in entries.iter_mut() {
+        if !url_targets_onion(&entry.raw_url) {
+            continue;
+        }
+        let Some(subtree_key) = subtree_key_for_qilin_download(&entry.raw_url) else {
+            continue;
+        };
+        let Some(preferred_host) = preferred_qilin_download_host_for_subtree(
+            &subtree_key,
+            &routes_by_subtree,
+            winner_host.as_deref(),
+            updated_at_epoch,
+        ) else {
+            continue;
+        };
+        let Some(remapped) = rewrite_qilin_seed_host(&entry.raw_url, &preferred_host) else {
+            continue;
+        };
+        entry.raw_url = remapped;
+        rewrites = rewrites.saturating_add(1);
+    }
+
+    if rewrites > 0 {
+        let winner_host = winner_host.unwrap_or_else(|| "-".to_string());
+        let _ = app.emit(
+            "crawl_log",
+            format!(
+                "[Qilin Download] Repinned {} saved URLs using subtree route memory (winner host {}).",
+                rewrites, winner_host
+            ),
+        );
+    }
+
+    Ok(rewrites)
 }
 
 async fn scaffold_download(
@@ -1546,8 +1906,9 @@ async fn scaffold_download(
 
     let base = output_root.to_path_buf();
     tokio::fs::create_dir_all(&base).await?;
-    let support_dir = base.join("temp_onionforge_forger");
+    let support_dir = support_artifact_dir_for_output_root(&base);
     tokio::fs::create_dir_all(&support_dir).await?;
+    let ranked_hosts = ranked_qilin_download_hosts(entries);
 
     let mut written_final: u32 = 0;
     let mut batch_files: Vec<BatchFileEntry> = Vec::new();
@@ -1586,12 +1947,7 @@ async fn scaffold_download(
                 let safe_target = full_path.to_string_lossy().to_string();
                 let url_lower = entry.raw_url.to_lowercase();
                 if url_lower.starts_with("http://") || url_lower.starts_with("https://") {
-                    batch_files.push(BatchFileEntry {
-                        url: entry.raw_url.clone(),
-                        path: safe_target,
-                        size_hint: entry.size_bytes,
-                        jwt_exp: entry.jwt_exp,
-                    });
+                    batch_files.push(build_batch_file_entry(entry, safe_target, &ranked_hosts));
                 } else {
                     if !full_path.exists() {
                         tokio::fs::write(&full_path, b"").await?;
@@ -1605,23 +1961,10 @@ async fn scaffold_download(
                     );
                     written_final = written_final.saturating_add(1);
                 }
-
-                let meta_path = support_dir.join(format!(
-                    "{}.onionforge.meta",
-                    support_key_for_path(&entry.path)
-                ));
-                let size_str = entry
-                    .size_bytes
-                    .map(|s: u64| s.to_string())
-                    .unwrap_or_else(|| "0".to_string());
-                let meta_content = format!(
-                    "url={}\nsize={}\ntype=file\noriginal_path={}\n",
-                    entry.raw_url, size_str, entry.path
-                );
-                let _ = tokio::fs::write(&meta_path, meta_content.as_bytes()).await;
             }
         }
     }
+    write_download_support_artifacts(entries, &support_dir).await?;
 
     if !batch_files.is_empty() {
         let batch_count = batch_files.len();
@@ -1671,29 +2014,6 @@ async fn scaffold_download(
         written_final = written_final.saturating_add(batch_count as u32);
     }
 
-    // Write a manifest index at the root
-    let manifest_path = support_dir.join("_onionforge_manifest.txt");
-    let mut manifest = String::new();
-    manifest.push_str("# OnionForge Download Manifest\n");
-    manifest.push_str(&format!("# Generated: {}\n", chrono_stub()));
-    manifest.push_str(&format!("# Total Entries: {}\n\n", entries.len()));
-    for entry in entries {
-        let type_tag = match entry.entry_type {
-            adapters::EntryType::Folder => "DIR ",
-            adapters::EntryType::File => "FILE",
-        };
-        let size_tag = entry
-            .size_bytes
-            .map(format_bytes)
-            .unwrap_or_else(|| "0 B".to_string());
-        let decoded_path = path_utils::url_decode(&entry.path);
-        manifest.push_str(&format!(
-            "{} {:>12}  {}  {}\n",
-            type_tag, size_tag, decoded_path, entry.raw_url
-        ));
-    }
-    tokio::fs::write(&manifest_path, manifest.as_bytes()).await?;
-
     Ok(written_final)
 }
 
@@ -1733,11 +2053,13 @@ async fn cancel_crawl(app: tauri::AppHandle) -> Result<String, String> {
 
     if let Some(frontier) = active_frontier {
         frontier.cancel();
-        let visited = frontier.visited_count();
-        let processed = frontier.processed_count();
-        let queued = visited.saturating_sub(processed);
-        let progress =
-            estimate_progress_percent(visited.max(1), processed, queued, frontier.active_workers());
+        let snapshot = frontier.progress_snapshot();
+        let progress = estimate_progress_percent(
+            snapshot.visited.max(1),
+            snapshot.processed,
+            snapshot.queued,
+            snapshot.active_workers,
+        );
         let _ = app.emit(
             "crawl_status_update",
             crawl_status_snapshot(frontier.as_ref(), "cancelled", progress, None),
@@ -1791,9 +2113,15 @@ async fn download_all(
     if let Some(target_url) = target_url.filter(|value| !value.trim().is_empty()) {
         let target_paths =
             target_state::target_paths(&output_root, &target_url).map_err(|e| e.to_string())?;
-        let authoritative_entries =
+        let mut authoritative_entries =
             target_state::load_entries_snapshot(&target_paths.best_snapshot_path)
                 .map_err(|e| e.to_string())?;
+        maybe_repin_qilin_entries_from_context(
+            &mut authoritative_entries,
+            Some(target_paths.target_dir.as_path()),
+            &app,
+        )
+        .map_err(|e| e.to_string())?;
         if !authoritative_entries.is_empty() {
             let failure_records =
                 target_state::load_failure_manifest(&target_paths.failure_manifest_path)
@@ -1845,7 +2173,7 @@ async fn download_all(
                 &output_root,
                 &app,
                 circuits,
-                target_url.contains(".onion"),
+                url_targets_onion(&target_url),
             )
             .await
             .map_err(|e| e.to_string());
@@ -1853,7 +2181,9 @@ async fn download_all(
     }
 
     let entries = state.vfs.iter_entries().await.map_err(|e| e.to_string())?;
-    let force_tor = entries.iter().any(|entry| entry.raw_url.contains(".onion"));
+    let force_tor = entries
+        .iter()
+        .any(|entry| url_targets_onion(&entry.raw_url));
     if entries.is_empty() {
         return Ok(0);
     }
@@ -1878,8 +2208,10 @@ pub struct DownloadFailedEvent {
     error: String,
 }
 
-#[tauri::command]
-async fn initiate_download(app: tauri::AppHandle, args: DownloadArgs) -> Result<(), String> {
+async fn run_single_download_blocking(
+    app: tauri::AppHandle,
+    args: DownloadArgs,
+) -> Result<(), String> {
     let control = aria_downloader::activate_download_control()
         .ok_or_else(|| "A download is already active.".to_string())?;
 
@@ -1902,7 +2234,7 @@ async fn initiate_download(app: tauri::AppHandle, args: DownloadArgs) -> Result<
         format!("[PATH] Output root: {}", output_root.display()),
     )
     .ok();
-    let support_dir = output_root.join("temp_onionforge_forger");
+    let support_dir = support_artifact_dir_for_output_root(&output_root);
     app.emit(
         "log",
         format!("[PATH] Support artifact dir: {}", support_dir.display()),
@@ -1914,33 +2246,38 @@ async fn initiate_download(app: tauri::AppHandle, args: DownloadArgs) -> Result<
     )
     .ok();
 
+    let jwt_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>> =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let dummy_entry = aria_downloader::BatchFileEntry {
+        url,
+        path: safe_target_str,
+        size_hint: None,
+        jwt_exp: None,
+        alternate_urls: Vec::new(),
+    };
+    let result = aria_downloader::start_download(
+        app,
+        dummy_entry,
+        connections,
+        force_tor,
+        Some(output_root.to_string_lossy().to_string()),
+        control,
+        jwt_cache,
+    )
+    .await;
+
+    aria_downloader::clear_download_control();
+    result.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn initiate_download(app: tauri::AppHandle, args: DownloadArgs) -> Result<(), String> {
     let app_clone = app.clone();
-    let fail_url = url.clone();
-    let fail_path = safe_target_str.clone();
+    let fail_url = args.url.clone();
+    let fail_path = args.path.clone();
 
     tokio::spawn(async move {
-        let jwt_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>> =
-            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let dummy_entry = aria_downloader::BatchFileEntry {
-            url,
-            path: safe_target_str,
-            size_hint: None,
-            jwt_exp: None,
-        };
-        let result = aria_downloader::start_download(
-            app_clone.clone(),
-            dummy_entry,
-            connections,
-            force_tor,
-            Some(output_root.to_string_lossy().to_string()),
-            control,
-            jwt_cache,
-        )
-        .await;
-
-        aria_downloader::clear_download_control();
-
-        if let Err(err) = result {
+        if let Err(err) = run_single_download_blocking(app_clone.clone(), args).await {
             let message = err.to_string();
             let _ = app_clone.emit("log", format!("[ERROR] {message}"));
             let _ = app_clone.emit(
@@ -1978,27 +2315,61 @@ fn stop_active_download(app: tauri::AppHandle) -> Result<bool, String> {
     Ok(stopped)
 }
 
-#[tauri::command]
-async fn pre_resolve_onion(url: String, app: tauri::AppHandle) -> Result<(), String> {
-    if !url.contains(".onion") {
+pub(crate) async fn ensure_crawl_swarm(
+    app: &tauri::AppHandle,
+    daemon_count: usize,
+) -> Result<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>, String> {
+    let state = app.state::<AppState>();
+    if let Some(existing) = state.crawl_swarm_guard.lock().await.clone() {
+        return Ok(existing);
+    }
+
+    let (guard, _) = tor::bootstrap_tor_cluster_for_traffic(
+        app.clone(),
+        daemon_count.max(1),
+        0,
+        tor::SwarmTrafficClass::OnionService,
+    )
+    .await
+    .map_err(|e| format!("Failed to bootstrap Tor swarm: {e}"))?;
+    let guard_arc = Arc::new(tokio::sync::Mutex::new(guard));
+    *state.crawl_swarm_guard.lock().await = Some(guard_arc.clone());
+    Ok(guard_arc)
+}
+
+async fn perform_pre_resolve_onion(url: &str, app: &tauri::AppHandle) -> Result<(), String> {
+    if !url_targets_onion(url) {
         return Ok(());
     }
-    let state = app.state::<AppState>();
-    if let Some(guard_arc) = state.crawl_swarm_guard.lock().await.clone() {
-        tauri::async_runtime::spawn(async move {
-            let guard = guard_arc.lock().await;
-            if let Some(client) = guard.get_arti_clients().first() {
-                let tor_client = client.read().unwrap().clone();
-                let token = ::arti_client::IsolationToken::new();
-                let arti = arti_client::ArtiClient::new((*tor_client).clone(), Some(token));
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    arti.head(&url).send(),
-                )
-                .await;
-            }
-        });
+
+    let guard_arc = ensure_crawl_swarm(app, 1).await?;
+    let guard = guard_arc.lock().await;
+    let shared_client = guard
+        .get_arti_clients()
+        .first()
+        .cloned()
+        .ok_or_else(|| "Tor swarm did not expose an arti client.".to_string())?;
+    drop(guard);
+
+    let tor_client = shared_client.read().unwrap().clone();
+    let token = ::arti_client::IsolationToken::new();
+    let arti = arti_client::ArtiClient::new((*tor_client).clone(), Some(token));
+    tokio::time::timeout(std::time::Duration::from_secs(10), arti.head(url).send())
+        .await
+        .map_err(|_| format!("Pre-resolve timed out for {url}"))?
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn pre_resolve_onion(url: String, app: tauri::AppHandle) -> Result<(), String> {
+    if !url_targets_onion(&url) {
+        return Ok(());
     }
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = perform_pre_resolve_onion(&url, &app_handle).await;
+    });
     Ok(())
 }
 
@@ -2008,9 +2379,7 @@ async fn get_subtree_heatmap(target_key: String) -> Result<serde_json::Value, St
         .unwrap_or_default()
         .join("targets")
         .join(&target_key);
-    let heatmap_path = target_dir
-        .join("temp_onionforge_forger")
-        .join("subtree_heatmap.json");
+    let heatmap_path = target_dir.join("qilin_bad_subtrees.json");
 
     if heatmap_path.exists() {
         if let Ok(content) = tokio::fs::read_to_string(&heatmap_path).await {
@@ -2054,19 +2423,26 @@ fn get_system_profile() -> serde_json::Value {
     })
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+fn install_runtime_prereqs() {
     // Phase 62: Install missing global CryptoProvider for rustls >= 0.23
     // Without this, ArtiClient::new panics silently on the tokio async thread,
     // dropping the Tauri IPC resolver and creating an infinite hang in the frontend proxy.
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
-            .expect("Failed to universally install ring CryptoProvider. Backend cannot run safely.");
+            .expect(
+                "Failed to universally install ring CryptoProvider. Backend cannot run safely.",
+            );
     }
 
     // Flush any zombie Tor daemons from previous sessions on startup
     tor::cleanup_stale_tor_daemons();
+}
 
+pub(crate) fn tauri_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
+fn run_gui() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
@@ -2081,7 +2457,14 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
-                if let Ok((guard, _)) = tor::bootstrap_tor_cluster(handle.clone(), 4, 0).await {
+                if let Ok((guard, _)) = tor::bootstrap_tor_cluster_for_traffic(
+                    handle.clone(),
+                    4,
+                    0,
+                    tor::SwarmTrafficClass::OnionService,
+                )
+                .await
+                {
                     *state.crawl_swarm_guard.lock().await =
                         Some(Arc::new(tokio::sync::Mutex::new(guard)));
                 }
@@ -2107,6 +2490,8 @@ pub fn run() {
             crate::binary_telemetry::drain_telemetry_ring,
             detect_input_mode,
             get_system_profile,
+            crate::network_disk::fetch_network_disk_block_cmd,
+            crate::network_disk::fetch_network_disk_extents_cmd,
             // Phase 53: Azure + Intranet enterprise commands (feature-gated)
             #[cfg(feature = "azure")]
             azure_connectivity::configure_azure_storage,
@@ -2127,8 +2512,145 @@ pub fn run() {
                 tor::cleanup_stale_tor_daemons();
             }
         })
-        .run(tauri::generate_context!())
+        .run(tauri_context())
         .expect("error while running tauri application");
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    install_runtime_prereqs();
+    if let Some(exit_code) = cli::try_run_from_env() {
+        std::process::exit(exit_code);
+    }
+    run_gui();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_qilin_alternate_urls, preferred_qilin_download_host_for_subtree,
+        preferred_qilin_host_for_subtree, rewrite_qilin_seed_host,
+        split_qilin_download_seed_and_relative_path, subtree_key_for_qilin_download,
+        support_artifact_dir_for_output_root, url_targets_onion, PersistedQilinSubtreeRouteEntry,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn split_qilin_download_seed_preserves_relative_tree() {
+        let url = "http://hosta.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Business%20Related/1%20and%201%20internet/file.pdf";
+        let (seed, relative) =
+            split_qilin_download_seed_and_relative_path(url).expect("qilin url should parse");
+        assert_eq!(
+            seed,
+            "http://hosta.onion/6749d00a-277a-4575-a398-2120f37889d6/"
+        );
+        assert_eq!(
+            relative,
+            "kent/Business%20Related/1%20and%201%20internet/file.pdf"
+        );
+        assert_eq!(
+            subtree_key_for_qilin_download(url).as_deref(),
+            Some("kent/Business%20Related/1%20and%201%20internet")
+        );
+    }
+
+    #[test]
+    fn rewrite_qilin_seed_host_keeps_storage_uuid_and_suffix() {
+        let url =
+            "http://hosta.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Bankrupcy/report.pdf";
+        let remapped =
+            rewrite_qilin_seed_host(url, "hostb.onion").expect("host rewrite should succeed");
+        assert_eq!(
+            remapped,
+            "http://hostb.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Bankrupcy/report.pdf"
+        );
+    }
+
+    #[test]
+    fn url_targets_onion_checks_host_not_path() {
+        assert!(url_targets_onion("http://example.onion/files/"));
+        assert!(url_targets_onion("example.onion/files/"));
+        assert!(!url_targets_onion(
+            "https://cdn.breachforums.as/pay_or_leak/shouldve_paid_the_ransom_pathstone.com_shinyhunters.7z"
+        ));
+        assert!(!url_targets_onion(
+            "https://example.com/path/onion/report.txt"
+        ));
+    }
+
+    #[test]
+    fn preferred_qilin_host_walks_up_to_parent_subtree() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "kent/Business%20Related".to_string(),
+            "winner.onion".to_string(),
+        );
+        let preferred = preferred_qilin_host_for_subtree(
+            "kent/Business%20Related/1%20and%201%20internet",
+            &routes,
+            Some("fallback.onion"),
+        );
+        assert_eq!(preferred.as_deref(), Some("winner.onion"));
+
+        let fallback =
+            preferred_qilin_host_for_subtree("kent/Unknown", &routes, Some("fallback.onion"));
+        assert_eq!(fallback.as_deref(), Some("fallback.onion"));
+    }
+
+    #[test]
+    fn download_host_bias_prefers_fresh_winner_over_aged_subtree_host() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "kent/Business%20Related".to_string(),
+            PersistedQilinSubtreeRouteEntry {
+                subtree_key: "kent/Business%20Related".to_string(),
+                preferred_host: "stale.onion".to_string(),
+                success_count: 2,
+                last_success_epoch: 100,
+            },
+        );
+
+        let preferred = preferred_qilin_download_host_for_subtree(
+            "kent/Business%20Related/1%20and%201%20internet",
+            &routes,
+            Some("winner.onion"),
+            260,
+        );
+
+        assert_eq!(preferred.as_deref(), Some("winner.onion"));
+    }
+
+    #[test]
+    fn support_artifact_dir_moves_outside_payload_root() {
+        let output_root = std::path::Path::new("/tmp/onionforge/output");
+        let support_dir = support_artifact_dir_for_output_root(output_root);
+        assert!(support_dir.starts_with("/tmp/onionforge/.onionforge_support"));
+        assert!(!support_dir.starts_with(output_root));
+    }
+
+    #[test]
+    fn qilin_alternate_urls_skip_current_host_and_preserve_path() {
+        let url =
+            "http://hosta.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Bankrupcy/report.pdf";
+        let alternates = build_qilin_alternate_urls(
+            url,
+            &[
+                "hosta.onion".to_string(),
+                "hostb.onion".to_string(),
+                "hostc.onion".to_string(),
+            ],
+        );
+        assert_eq!(alternates.len(), 2);
+        assert_eq!(
+            alternates[0],
+            "http://hostb.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Bankrupcy/report.pdf"
+        );
+        assert_eq!(
+            alternates[1],
+            "http://hostc.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Bankrupcy/report.pdf"
+        );
+    }
 }
 pub mod arti_client;
 pub mod arti_connector;
+pub mod seed_manager;

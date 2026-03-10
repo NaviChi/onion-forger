@@ -206,6 +206,7 @@ async fn feature3_head_probing_simulation() {
             resume: false,
             resume_index: None,
             mega_password: None,
+            stealth_ramp: false,
         },
         None,
     );
@@ -250,6 +251,7 @@ async fn feature3_head_probing_simulation() {
             resume: false,
             resume_index: None,
             mega_password: None,
+            stealth_ramp: false,
         },
         None,
     );
@@ -582,6 +584,7 @@ async fn feature9_sustained_load_120_workers() {
             resume: false,
             resume_index: None,
             mega_password: None,
+            stealth_ramp: false,
         },
         None,
     ));

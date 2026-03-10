@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 const MAX_DEPTH: usize = 4;
 const DIRS_PER_LEVEL: usize = 4;
 const FILES_PER_DIR: usize = 12;
-const CIRCUIT_MATRIX: &[usize] = &[12, 24, 36];
+const CIRCUIT_MATRIX: &[usize] = &[12, 24, 36, 64];
 
 #[derive(Clone, Copy)]
 struct BenchmarkProfile {
@@ -264,7 +264,7 @@ async fn run_case(
         resume: false,
         resume_index: None,
         mega_password: None,
-                stealth_ramp: true,
+        stealth_ramp: true,
     };
 
     let frontier = Arc::new(CrawlerFrontier::new(

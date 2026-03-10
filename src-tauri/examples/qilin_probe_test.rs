@@ -28,7 +28,10 @@ async fn main() -> Result<()> {
     let tor_start = Instant::now();
     let tor_client = spawn_tor_node(0, false).await?;
     let client = ArtiClient::new(tor_client, Some(arti_client::IsolationToken::new()));
-    println!("[1/4] ✅ Tor ready in {:.1}s\n", tor_start.elapsed().as_secs_f64());
+    println!(
+        "[1/4] ✅ Tor ready in {:.1}s\n",
+        tor_start.elapsed().as_secs_f64()
+    );
 
     // Stage 2: Fingerprint probe (the call that WAS missing timeout)
     println!("[2/4] Fingerprint probe (30s timeout per attempt, up to 4 attempts)...");
@@ -40,19 +43,26 @@ async fn main() -> Result<()> {
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             client.get(target).send(),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(resp)) => {
-                println!("✅ status={} ({:.1}s)", resp.status(), fp_start.elapsed().as_secs_f64());
-                
+                println!(
+                    "✅ status={} ({:.1}s)",
+                    resp.status(),
+                    fp_start.elapsed().as_secs_f64()
+                );
+
                 // Body read with timeout
                 print!("[3/4] Reading body (15s timeout)... ");
                 let body_start = Instant::now();
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
-                    resp.text(),
-                ).await {
+                match tokio::time::timeout(std::time::Duration::from_secs(15), resp.text()).await {
                     Ok(Ok(body)) => {
-                        println!("✅ {} bytes ({:.1}s)", body.len(), body_start.elapsed().as_secs_f64());
+                        println!(
+                            "✅ {} bytes ({:.1}s)",
+                            body.len(),
+                            body_start.elapsed().as_secs_f64()
+                        );
                         response_body = body;
                         fingerprint_ok = true;
                     }
@@ -82,10 +92,17 @@ async fn main() -> Result<()> {
             || response_body.contains("_csrf-blog")
             || response_body.contains("item_box_photos");
         println!("\n  Qilin adapter match: {}", is_qilin);
-        println!("  Body first 300 chars: {}", &response_body[..response_body.len().min(300)]);
+        println!(
+            "  Body first 300 chars: {}",
+            &response_body[..response_body.len().min(300)]
+        );
     } else {
-        println!("\n[2/4] ❌ ALL fingerprint probes failed. This is the EXACT behavior the GUI sees.");
-        println!("       Previously this would hang forever. Now it fails after 4×30s = 120s max.\n");
+        println!(
+            "\n[2/4] ❌ ALL fingerprint probes failed. This is the EXACT behavior the GUI sees."
+        );
+        println!(
+            "       Previously this would hang forever. Now it fails after 4×30s = 120s max.\n"
+        );
     }
 
     // Stage 4: Storage node discovery
@@ -98,13 +115,22 @@ async fn main() -> Result<()> {
     match tokio::time::timeout(
         std::time::Duration::from_secs(45),
         node_cache.discover_and_resolve(target, uuid, &client, None),
-    ).await {
+    )
+    .await
+    {
         Ok(Some(node)) => {
-            println!("[4/4] ✅ Resolved: {} ({}ms) in {:.1}s",
-                node.host, node.avg_latency_ms, disco_start.elapsed().as_secs_f64());
+            println!(
+                "[4/4] ✅ Resolved: {} ({}ms) in {:.1}s",
+                node.host,
+                node.avg_latency_ms,
+                disco_start.elapsed().as_secs_f64()
+            );
         }
         Ok(None) => {
-            println!("[4/4] ⚠ No node resolved in {:.1}s", disco_start.elapsed().as_secs_f64());
+            println!(
+                "[4/4] ⚠ No node resolved in {:.1}s",
+                disco_start.elapsed().as_secs_f64()
+            );
         }
         Err(_) => {
             println!("[4/4] ⏰ Discovery TIMED OUT after 45s");
@@ -112,7 +138,11 @@ async fn main() -> Result<()> {
     }
 
     let total = tor_start.elapsed();
-    println!("\n=== TOTAL: {:.1}s ({}m {}s) ===",
-        total.as_secs_f64(), total.as_secs() / 60, total.as_secs() % 60);
+    println!(
+        "\n=== TOTAL: {:.1}s ({}m {}s) ===",
+        total.as_secs_f64(),
+        total.as_secs() / 60,
+        total.as_secs() % 60
+    );
     Ok(())
 }

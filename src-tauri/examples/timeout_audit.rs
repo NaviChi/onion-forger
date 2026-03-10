@@ -18,8 +18,7 @@ fn main() {
     let fingerprint_retry_sleep_max = 3u64; // attempt * 750ms ≈ 3s worst case
     let fingerprint_worst_case =
         fingerprint_max_attempts * (fingerprint_timeout_per_attempt + fingerprint_retry_sleep_max);
-    println!(
-        "Stage 1: Fingerprint Probe");
+    println!("Stage 1: Fingerprint Probe");
     println!(
         "  Timeout per attempt: {}s × {} attempts + retry sleep",
         fingerprint_timeout_per_attempt, fingerprint_max_attempts
@@ -40,7 +39,10 @@ fn main() {
     println!("\nStage 2: Storage Node Discovery (Qilin)");
     println!("  Global timeout: {}s", discovery_global_timeout);
     println!("  Internal stage timeouts: A=20s, B=20s, D-head=30s, D-tail=30s");
-    println!("  (All internal timeouts are capped by the {}s global)", discovery_global_timeout);
+    println!(
+        "  (All internal timeouts are capped by the {}s global)",
+        discovery_global_timeout
+    );
 
     // Stage 3: Phase 42 Fallback (qilin.rs)
     let newnym_sleep = 2u64;
@@ -55,8 +57,12 @@ fn main() {
     println!("  Worst case: {}s", phase42_worst_case);
 
     // Total
-    let total_worst_case = fingerprint_worst_case + body_read_timeout + discovery_global_timeout + phase42_worst_case;
-    let optimistic_case = fingerprint_timeout_per_attempt + body_read_timeout + discovery_global_timeout + phase42_worst_case;
+    let total_worst_case =
+        fingerprint_worst_case + body_read_timeout + discovery_global_timeout + phase42_worst_case;
+    let optimistic_case = fingerprint_timeout_per_attempt
+        + body_read_timeout
+        + discovery_global_timeout
+        + phase42_worst_case;
 
     println!("\n=== TOTAL WORST CASE ===");
     println!(

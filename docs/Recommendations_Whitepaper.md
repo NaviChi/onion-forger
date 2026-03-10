@@ -1,4 +1,310 @@
-> **Last Updated:** 2026-03-09T03:36 CST
+> **Last Updated:** 2026-03-10T11:55 CDT
+
+## Phase 95: Clearnet Direct-File Audit + Direct Mode Fix (2026-03-10)
+
+**Status: Implemented and live-benchmarked on safe public direct-download targets**
+
+What the code review and live reruns confirmed:
+- The direct HTTP(S) path already existed, but it was underperforming because it still inherited onion-era policy in two places: excessive large-file fan-out and a handshake filter that culled half the clearnet survivors before the run even started.
+- The app also still treated non-MEGA/non-torrent URLs as `onion` by default. That made clearnet direct archives look like Tor targets in `detect-input-mode` and the UI.
+- The repaired clearnet path is now materially faster on the same host/file pair. On March 10, 2026 the safe public `10Gb.dat` benchmark reached about `3.8 GiB` in `60s` (`~63 MiB/s`, `~530 Mbps`) versus the older `~95.7 Mbps` build and a same-day single-stream `curl` control at `~208 Mbps`.
+
+Recommendations now active:
+- Keep clearnet and onion download policy separate. Clearnet should use connection pooling, sane direct-file caps, and no onion-style handshake survivor culling.
+- Keep the new `direct` mode in the operator plane and use hostname-based onion detection everywhere; do not rely on “everything else is onion” fallthrough.
+- Preserve the piece-mode resume accounting fix. Large interrupted direct downloads need per-piece offset tracking, not per-initial-circuit tracking.
+
+Next recommended steps:
+- Add a dedicated clearnet regression harness that records `bytes/60s`, `handshake survivors`, and `worker cap` so direct HTTP(S) performance cannot silently drift back below the current benchmark.
+- Consider adaptive clearnet `active_start` widening after early healthy completions instead of statically starting at `16`, but benchmark it against the current `~530 Mbps` posture before promoting it.
+- Keep the user-facing “download via torrent” feature separate from direct archive download; only use torrent mode when an actual magnet or `.torrent` source exists.
+
+## Phase 94: Hidden Support Root + Per-File Host Remap Review (2026-03-10)
+
+**Status: Code-reviewed and live-benchmarked on the exact Qilin / Arti download path**
+
+What the code review and live reruns confirmed:
+- Per-file alternate-host remap is now active in `src-tauri/src/aria_downloader.rs`. The March 10, 2026 exact-target `150s` rerun logged `24` real remaps instead of silently retrying the same raw URL forever.
+- Downloader support artifacts no longer belong in the operator-visible payload tree. The runtime now writes `_onionforge_manifest.txt` and `download_support_index.json` under a hidden sibling root (`.onionforge_support/<support_key>/`) and leaves the payload root free of `temp_onionforge_forger`.
+- The new single-index approach is now emitted during scaffold, not only after a clean batch exit. An interrupted `20s` rerun still produced both support files under the hidden root.
+- The remaining failure is still transfer-side: the March 10, 2026 exact-target `150s` rerun produced `0` payload bytes even after host remaps, because the first wave still overconcentrates on the `zqetti.../lbln...` pair and does not reach the third current-snapshot storage host (`4xl2hta3...`) quickly enough.
+
+Recommendations now active:
+- Keep support artifacts in the hidden sibling root and exclude them from operator payload/file accounting by default.
+- Keep the single manifest/index model; do not restore eager `.onionforge.meta` sidecars unless a concrete runtime need appears.
+- Rebalance first-wave download admission so the batch does not repin most saved URLs onto one winner host before that winner proves useful completions.
+- Allow stalled files to graduate to the third known storage host before they exhaust the current micro/small requeue budget.
+
+Next recommended steps:
+- Gate Qilin download repinning behind early useful completions or live host-quality evidence instead of repinning `1769` saved URLs onto one winner host unconditionally.
+- Teach the per-file remap path to reach the third current-snapshot host earlier (`4xl2hta3...`) instead of oscillating between the top two hosts.
+- Re-run the exact-target timed benchmark and require non-zero payload bytes before promoting a full best-snapshot soak.
+
+## Phase 93: `.meta` Sidecar Audit + First-Byte Escape Review (2026-03-10)
+
+**Status: Superseded by Phase 94 runtime changes**
+
+What the prior code review confirmed:
+- `temp_onionforge_forger/*.onionforge.meta` files were support sidecars written during scaffold in the earlier implementation; they were not completed payload files.
+- The real output failure on the March 10, 2026 exact-target rerun was `0` payload bytes outside the support directory, which proved that support-artifact visibility was not the root transfer problem.
+
+## Phase 92: Download Admission Audit + Qilin Route Repinning (2026-03-10)
+
+**Status: Implemented and live-benchmarked on exact Qilin / Arti download paths**
+
+Implemented in this pass:
+- `src-tauri/src/aria_downloader.rs` now computes a bounded onion batch lane plan, starts the large-file lane only after early useful completions, and shortens micro/small hidden-service send/body timeouts while rotating isolated clients on repeated batch failures.
+- `src-tauri/src/lib.rs` and `src-tauri/src/cli.rs` now repin saved Qilin raw URLs through the persisted `qilin_subtree_route_summary.json` route memory before batch download starts. The live CLI path repinned `1769` saved URLs to the persisted winner-host set on March 10, 2026.
+- Repeated exact-target `150s` timed windows still produced `0` useful completions after the repin and timeout changes, which narrows the remaining bottleneck to first-wave hidden-service first-byte/body stalls in the micro+small swarm itself.
+
+Recommendations now active:
+- Do not widen hidden-service batch fan-out again until the first-wave swarm can escape no-byte stalls quickly. More concurrency is not the missing ingredient on this target.
+- Preserve the repin layer. It is still valuable because it removes stale raw-URL trust, even though it did not by itself restore early useful completions on the March 10, 2026 target reruns.
+- Treat large-lane overlap as conditional throughput optimization, not a default entitlement. If the first wave does not produce early completions, keep the large lane parked.
+
+Next recommended steps:
+- Add early no-byte abort + requeue logic for micro/small files so dead first-wave requests do not monopolize the batch for most of the benchmark window.
+- Diversify the first wave across multiple preferred hosts instead of letting the smallest-file scheduler overconcentrate on one weak storage host.
+- Re-run the exact-target timed benchmark after the no-byte escape work before attempting another full best-snapshot soak.
+
+## Phase 91: Downloader Throughput Audit + macOS Storage Reclassification (2026-03-10)
+
+**Status: Implemented and live-benchmarked on exact Qilin / Arti download paths**
+
+Implemented in this pass:
+- `src-tauri/src/aria_downloader.rs` now promotes mid-size onion files into the large-file lane (`large > 16MB` on heavy hidden-service batches) and keeps aggregate batch throughput honest once the run enters the large-file phase.
+- `src-tauri/src/resource_governor.rs` now uses a macOS `diskutil` mount-point fallback so Arti bootstrap sees Apple Fabric / NVMe storage instead of collapsing to `Unknown`.
+- Hidden-service multi-file batches deliberately do **not** use the full NVMe first-wave lane shape by default. The retained default is the mixed profile: keep the `12`-client NVMe-aware bootstrap, but keep the transfer first wave at `16/8/10/24` because the more aggressive live variants did not improve useful-work throughput.
+
+Recommendations now active:
+- Any operator-facing “full download” workflow must surface `best` vs `current` snapshot counts before the transfer starts. On the exact target, `best` is `5078` entries / `4240` files while `current` is only `2926` / `2394`.
+- Treat hidden-service batch downloads as network-bound, not disk-bound. NVMe helps bootstrap and local I/O margins, but wider first-wave circuit spray is not automatically a win against rotating Qilin storage.
+- Keep aggressive onion batch fan-out behind live proof. If a wider posture does not improve completed bytes over the first few minutes, do not promote it to the default.
+
+Next recommended steps:
+- Add an adaptive onion batch controller that narrows probe/active fan-out when the first success window does not produce useful completions.
+- Run one uninterrupted best-snapshot Qilin download soak to completion and record terminal throughput / failure distribution instead of only early and mid-run comparisons.
+- Expose authoritative `best/current` snapshot counts plus total byte hints in the Downloads tab before the operator starts mirroring.
+
+## Phase 90: Winner-Quality Memory + Tail-Latency Biasing (2026-03-10)
+
+**Status: Implemented and live-validated on exact Qilin / Arti reruns**
+
+Implemented in this pass:
+- `src-tauri/src/adapters/qilin_nodes.rs` now persists winner-host quality signals (`effective entries/sec`, completion time, throttle/failover pressure) and folds them into Stage D / redirect-ring ranking instead of treating all recently-seen winners as equivalent.
+- `src-tauri/src/runtime_metrics.rs`, `src-tauri/src/cli.rs`, `src-tauri/src/binary_telemetry.rs`, `src-tauri/src/telemetry_bridge.rs`, and `src/telemetry.proto` now expose compact final tail-latency facts: `winner_host`, `slowest_circuit`, `late_throttles`, and `outlier_isolations`.
+- `src-tauri/src/adapters/qilin.rs` now drives worker repin cadence from winner quality instead of a fixed interval, and the reconciliation tail now preserves retry history plus a hard wall-clock escape budget instead of reopening missing folders forever.
+
+Recommendations now active:
+- Keep productive-winner memory separate from raw freshness. A host that merely appeared in Stage A is not as valuable as a host that finished the full tree quickly and cleanly.
+- End-of-run tail summaries should be compact but mandatory. Deep-crawl slowdowns are now diagnosable from a single final line instead of raw log archaeology.
+- Adaptive repinning is the right next lever before default concurrency changes. The useful-work bottleneck is winner quality and tail churn, not lack of workers.
+
+Next recommended steps:
+- Add stronger winner stickiness on warm reruns so a fresh Stage A host must beat a productive cached winner by a higher bar before replacing it.
+- Persist a tiny redirect-freshness ring that tracks both freshness and productivity so Stage A does not overvalue newly seen but weak hosts.
+- Surface a compact final note when a warm rerun abandons a previously productive winner and later pays for it in subtree reroutes / failovers.
+
+## Phase 89: Deep-Crawl Stall Audit + Throttle/Outlier Repair (2026-03-10)
+
+**Status: Implemented and live-validated on exact Qilin / Arti full crawls**
+
+Implemented in this pass:
+- `src-tauri/src/adapters/qilin_nodes.rs` now bounds cached fast-path probing to two deduplicated candidates before falling back to fresh Stage A, so reruns no longer burn long serial probe chains before real discovery starts.
+- `src-tauri/src/adapters/qilin.rs` now classifies first-attempt `503/429/403/400` responses as `Throttle`, routes them through circuit isolation + telemetry, and includes a governor-side latency-outlier stall guard with cooldown for true no-progress windows.
+- `src-tauri/src/lib.rs` now reports effective entry counts at crawl completion when the adapter writes straight into the VFS instead of returning an in-memory `Vec<FileEntry>`.
+- Two full exact-target crawls were used to separate deadlock risk from route-quality variance: one on `3pe26tqc...` and one on `aay7nawy...`.
+
+Recommendations now active:
+- Do not treat deep-layer slowdown as proof of a stuck crawl until both discovered-entry growth and processed-node growth stop. On March 10, 2026 the exact target kept making progress even on the slow winner.
+- First-attempt throttle statuses must feed the same telemetry and healing path as retry-lane throttles. Otherwise the operator plane will underreport the real cause of late crawl slowdown.
+- Qilin completion logs must report effective entries, not just raw returned vectors, because the adapter can stream directly into the VFS and still succeed completely.
+
+Next recommended steps:
+- Persist winner-host quality memory (`effective req/s`, late `503` rate, failover count, average completion time) and feed it into redirect-ring / Stage D ranking so slow winners are deprioritized across reruns.
+- Add a compact final tail-latency summary to the CLI (`winner_host`, `slowest_circuit`, `outlier_isolations`, `late_throttles`) so deep-layer slowdowns are visible without log forensics.
+- Make worker re-pin cadence adaptive to winner quality before touching default concurrency knobs. The remaining waste is route quality, not lack of worker count.
+
+## Phase 88: Binary Telemetry Parity + Clean Same-Output Restore Validation (2026-03-10)
+
+**Status: Implemented and live-validated on exact Qilin / Arti reruns**
+
+Implemented in this pass:
+- `src-tauri/src/binary_telemetry.rs`, `src-tauri/src/telemetry_bridge.rs`, and `src/telemetry.proto` now agree on the full `ResourceMetricsFrame`, including `throttle_rate_per_sec`, `phantom_pool_depth`, `subtree_reroutes`, `subtree_quarantine_hits`, and `off_winner_child_requests`.
+- `src/telemetry.js` and `src/telemetry.d.ts` were regenerated from the protobuf schema so the frontend ring-buffer decoder sees the same fields and defaults as the backend.
+- `src-tauri/src/cli.rs` now emits a compact `[summary:final]` line with `req=total/success/fail` and `subtree=reroutes/quarantine/offwinner` when a crawl reaches `complete`, `cancelled`, or `error`.
+- The exact Qilin target was then run twice against the same output root to validate live restore of subtree host memory without an alarm wrapper.
+
+Recommendations now active:
+- Keep Rust binary telemetry structs, `telemetry.proto`, and generated frontend bindings in lockstep. Metric drift across those three surfaces silently drops operator data.
+- Preserve a dedicated final CLI summary even when periodic summaries exist. Route/request totals are completion facts, not rolling status.
+- Validate subtree route memory against the same output root, not fresh directories. Otherwise the restore path is never exercised for real.
+
+Next recommended steps:
+- Add a controlled degraded-route harness that forces non-zero `subtree_reroutes`, `subtree_quarantine_hits`, and `off_winner_child_requests` so the new counters are tested outside the happy path.
+- Persist a tiny freshness-ranked redirect ring alongside subtree host memory so reruns spend fewer requests when the cached winner rotates away between sessions.
+
+## Phase 87: Subtree Route Telemetry + Host-Based Memory (2026-03-10)
+
+**Status: Implemented and revalidated on repeated live Qilin / Arti reruns**
+
+Implemented in this pass:
+- `src-tauri/src/runtime_metrics.rs` now tracks subtree reroutes, subtree quarantine hits, and off-winner child requests in the same shared telemetry plane as the existing request/fingerprint metrics.
+- `src-tauri/src/bin/adapter_benchmark.rs` and `src-tauri/src/bin/crawl_stats.rs` now print those counters directly in the `[EFF]` line and the final summary/CSV columns (`SUB_RER`, `Q_HITS`, `OFFWIN`).
+- `src-tauri/src/adapters/qilin.rs` now persists subtree preferred hosts per target, but only by host and only when that host is still present in the current winner/standby set, so old UUID paths do not poison new runs.
+- `src-tauri/src/cli.rs` now keeps `--no-stealth-ramp` benchmark-only in behavior unless `CRAWLI_ALLOW_BENCHMARK_FLAGS=1`, while the benchmark binary still uses `stealth_ramp=false` for controlled comparison work.
+
+Recommendations now active:
+- Keep subtree-route waste measurable in shared telemetry. Route planning that only exists in logs will regress silently.
+- Persist subtree preferred hosts by host identity, not raw full seed URLs, and only reuse them when that host survives into the current candidate set.
+- Keep `--no-stealth-ramp` out of the default operator path until a stable target proves a real useful-work gain.
+
+Next recommended steps:
+- Carry the new subtree-route counters into the binary telemetry/protobuf plane and compact CLI final summaries so operator surfaces stay consistent.
+- Revalidate the new subtree host-memory path on a clean full same-output rerun that exits normally, not an alarm-capped replay.
+
+## Phase 86E: Subtree Host Affinity + Standby Quarantine (2026-03-10)
+
+**Status: Implemented and revalidated on repeated live Qilin / Arti reruns**
+
+Implemented in this pass:
+- `src-tauri/src/adapters/qilin.rs` now tracks subtree-local preferred seeds, subtree-local host health, and subtree-local standby quarantine instead of treating every child-path failure as evidence against the global winner route.
+- Child requests now try the subtree-preferred winner first, skip quarantined standby seeds for that subtree, and only fall back to global failover rules on true root/global failures.
+- The exact-target replay on `afa2a0ea-20ba-3ddf-8c5c-2aeea9e5dc43` reached `seen=544 processed=282 queue=262 workers=16/16` in `120.01s`, kept child traffic pinned to the confirmed winner, and pushed adapter-local progress to `entries=2336 pending=216`.
+
+Recommendations now active:
+- Keep subtree-level route memory separate from the global winner lease. A failing child subtree must not demote a still-good root path.
+- Quarantine stale standby routes per subtree before spending second or third attempts on them again.
+- Keep `--no-stealth-ramp` benchmark-only until a stable target proves it beats the repaired default path on useful work, not just quicker worker induction.
+
+Next recommended steps:
+- Add telemetry for subtree reroutes, quarantine hits, and off-winner child requests so future audits do not require log-forensics to quantify request waste.
+- Persist subtree preferred-seed summaries across runs only if repeated live targets show meaningful cross-run subtree churn.
+
+## Phase 86D: Root Durability + Active-Host Affinity (2026-03-10)
+
+**Status: Implemented and revalidated on repeated live Qilin / Arti reruns**
+
+Implemented in this pass:
+- `src-tauri/src/adapters/qilin_nodes.rs` now promotes a winner lease only after a real root listing fetch/parse confirms that the storage route is durable, not just after a speculative discovery probe.
+- `src-tauri/src/tor_native.rs` now replenishes empty phantom slots from the already-live Arti swarm with cheap isolated clients before it falls back to cold bootstrap.
+- `src-tauri/src/adapters/qilin.rs` now protects root retries from standby remap and keeps the first ordinary child retry on the confirmed active host instead of spilling directly onto standby routes.
+- The same exact-target rerun that previously failed to enumerate now reaches a durable winner and real file/folder expansion (`kent/` -> `133 files / 133 folders`, timed window ending at `seen=288 processed=59 queue=229`, adapter-local `entries=670`).
+
+Recommendations now active:
+- Promote storage winners only after a real root parse. Probe success alone is not durable truth on rotating onion storage.
+- When the root winner is known-good, keep the first child retry on that same host. Spending second attempts on standby routes too early wastes requests and increases tail latency.
+- Refill phantom capacity from the hot swarm first; cold bootstrap during an active crawl is last-resort behavior.
+
+Next recommended steps:
+- Add subtree-aware host affinity and standby quarantine so degraded subtrees stop bouncing between stale alternate hosts.
+- Track subtree-level host failures separately from global winner failures so root health and child-path health do not contaminate each other.
+- Keep `--no-stealth-ramp` as a benchmark-only knob until a stable target shows a clear useful-work gain over the default ramp.
+
+## Phase 86C: Arti Hot-Start + Hinted Warmup Bypass (2026-03-10)
+
+**Status: Implemented and revalidated on repeated live Qilin / Arti reruns**
+
+Implemented in this pass:
+- `src-tauri/src/multi_client_pool.rs` now seeds follow-on pools from already-hot swarm clients instead of cold-bootstrapping a second Arti vanguard after storage resolution.
+- `src-tauri/src/frontier.rs` / `src-tauri/src/lib.rs` now refresh live Arti clients before hinted onion execution so the crawl can use swarm growth that happens after the initial bootstrap quorum returns.
+- `src-tauri/src/lib.rs` now skips blocking onion warmup when a strong URL hint already selected the adapter and the fingerprint GET will be skipped anyway.
+- `src-tauri/src/adapters/qilin_nodes.rs` now reserves first-wave Stage D capacity for a stable cached winner instead of letting two fresh redirect candidates crowd it out entirely.
+
+Recommendations now active:
+- Treat strong-hint Qilin/CMS ingress as a direct handoff path. Do not spend a blocking warmup and then a skipped fingerprint on the same request chain.
+- Reuse live Arti clients whenever a second-stage crawl pool is needed. Shared state plus isolated handles are materially cheaper than re-bootstrapping a cold pool.
+- Keep at least one first-wave slot in Stage D for the best stable node, even when fresh redirects were just captured.
+
+Next recommended steps:
+- Promote a storage host to the winner lease only after it survives both probe validation and one real root fetch.
+- Prevent phantom-pool depletion from forcing rebootstrap while the crawl is already on the critical path.
+- Benchmark Qilin with `stealth_ramp=false` or a faster ramp interval only after root durability is high enough to support a broader worker wave.
+
+## Phase 86: Arti Fingerprint Bypass + Discovery Telemetry (2026-03-10)
+
+**Status: Implemented in part and revalidated on live Qilin / Arti reruns**
+
+Implemented in this pass:
+- `src-tauri/src/lib.rs` and the benchmark binaries now bypass the network fingerprint GET for strong Qilin CMS ingress URLs (`/site/view?uuid=...` and `/site/data?uuid=...`).
+- `src-tauri/src/runtime_metrics.rs`, `src/App.tsx`, and `src/components/Dashboard.tsx` now expose swarm runtime/client/traffic-class/request/fingerprint metrics and render a dedicated swarm-efficiency panel with sparklines.
+- `src-tauri/src/adapters/qilin_nodes.rs` now counts Stage A/B/D discovery requests into telemetry and lazy-seeds fallback mirrors only when the cached node pool is too sparse for a meaningful Stage D race.
+
+Recommendations now active:
+- Treat known Qilin CMS ingress as a URL-classification problem first, not a fingerprint-fetch problem. Do not spend a network GET when the URL already proves the adapter.
+- Count discovery-plane requests in the same telemetry plane as frontier worker requests, or Qilin efficiency charts and benchmarks will lie.
+- Keep fallback mirror seeding lazy. Broad mirror insertions are insurance, not the first thing a warm run should do.
+- Do not interpret empty Arti managed port lists as lack of concurrency. For this codebase, in-process client slots are the real scaling surface.
+
+Next recommended steps:
+- Add Stage A/B/C/D duration counters and a winner-host stability ring so the next audit can quantify redirect volatility directly.
+- Replace the single cached redirect hint with a tiny freshness-ranked redirect ring (`1-2` probes max) before Stage A.
+- Add a benchmark-only readiness knob that can compare "start on quorum" versus "wait for full client pool" without conflating that experiment with local SOCKS port count.
+
+## Phase 85: Arti Swarm Efficiency Audit Recommendations (2026-03-10)
+
+**Status: Implemented and revalidated on live Qilin / Arti swarm runs**
+
+Implemented in this pass:
+- `src-tauri/src/lib.rs` now uses first-ready quorum warmup for onion swarms instead of waiting for the slowest prewarm task.
+- `src-tauri/src/tor.rs` and `src-tauri/src/tor_native.rs` now expose traffic-class-aware onion bootstrap/healing paths, and the Qilin/onion call sites use `SwarmTrafficClass::OnionService`.
+- `src-tauri/src/adapters/qilin_nodes.rs` now merge-seeds nodes, preserves learned latency/failure/cooldown state, caches redirect hints and winner leases, and probes Stage D in bounded isolated waves.
+- `src-tauri/src/adapters/qilin.rs` now attempts a warm-cache winner before full mirror seeding and retries direct mirrors through isolated ranked waves instead of a shared-client fan-out.
+- `src-tauri/src/bin/adapter_benchmark.rs`, `src-tauri/src/bin/crawl_stats.rs`, and the onion E2E harnesses now bootstrap the Arti swarm with explicit onion-service traffic class during validation.
+
+Recommendations now active:
+- Keep onion warmup on quorum semantics; do not reintroduce blocking full-fanout prewarm waits anywhere in the crawl path.
+- Treat Qilin node inserts as merge-only unless a live request proves new state. Seed time is not success.
+- Use warm cached winner/redirect probes before broad mirror seeding whenever the target ingress is still the same victim UUID.
+- Keep direct retry hedging bounded (`2-3` independent probes) and isolated; never return to unbounded fan-out.
+- Use onion-service traffic class in any benchmark or E2E harness that is meant to measure swarm behavior for `.onion` workloads.
+
+Next recommended steps:
+- Reduce fingerprint wall time on known Qilin/CMS ingress. The March 10, 2026 warm-cache reruns still spent roughly 13-20s in fingerprinting before discovery even began.
+- Add request-efficiency counters to synthetic/live benchmark output before attempting another concurrency increase.
+- Replace Arti-native `ports=[]` benchmark/operator reporting with actual client count / runtime / traffic-class health so the swarm surface matches reality.
+- Add dashboard chart metrics for `requests/discovered_entry`, Stage A/B/C/D timing, winner-host stability, and phantom-swap reasons.
+
+## Phase 84: Qilin Telemetry Alignment Recommendations (2026-03-10)
+
+**Status: Implemented — shared Qilin counters now surface through the main binary and GUI**
+
+Recommendations now active:
+- Use `--progress-summary` for long live CLI crawls. It exposes the real shared worker/queue/node state without forcing transport-frame inspection.
+- Do not respond to the March 10, 2026 live Qilin volatility by blindly increasing worker counts. Both the CLI and GUI parity reruns showed the dominant bottleneck as rotated storage-node reachability, not insufficient concurrency.
+- Keep the frontier overlay pattern for any future fast-path adapter work. Hidden work is an operator bug.
+- Preserve the zeroed terminal worker snapshot on session shutdown so GUI and CLI surfaces agree on completion.
+
+Next recommended steps:
+- Add a short opportunistic re-probe lane for freshly captured Stage A redirects before the full 90s discovery timeout burns out.
+- Expose the live rotated storage redirect host plus remapped UUID directly in the GUI dashboard so operators can compare runs without digging through logs.
+- Consider persisting a short-lived “fresh redirect cache” keyed by victim UUID and probe timestamp to bias immediate follow-up runs toward the newest live storage host.
+
+## Phase 83: Main-Binary CLI Recommendations (2026-03-10)
+
+**Status: Implemented — Main binary now supports first-class CLI mode**
+
+Recommendations now active:
+- Use the primary `crawli` binary itself for headless validation. The canonical path is now `cargo run --manifest-path 'crawli/src-tauri/Cargo.toml' -- <subcommand>`, not helper examples.
+- Keep default CLI stderr focused on actionable events. Only turn on `--include-telemetry-events` when you explicitly need raw bridge-frame inspection.
+- Prefer CLI commands that reuse saved crawl snapshots or direct backend functions instead of adding bespoke one-off harnesses.
+- For live Qilin operator runs, expect the cost stack to be dominated by hidden-service bootstrap/discovery and storage-node rotation, not adapter matching.
+
+Next recommended steps:
+- Unify Qilin adapter-local queue progress with `CrawlerFrontier` counters so `processedNodes` and `activeWorkers` reflect real work during recursive child parsing.
+- Consider a small onion-specific CLI prewarm knob (for example `--daemons 2` as an operator default recommendation) for users who prioritize faster first-response over strict GUI-default parity.
+- Add an opt-in CLI summary mode that periodically prints condensed `entries/pending/currentNodeHost` snapshots instead of forcing operators to infer progress from raw child-fetch logs.
+
+## Phase 75: Probe Timeout Tuning & DOM Offloading (2026-03-09)
+
+**Status: Implemented & Verified — 759+ entries crawled from live Qilin target**
+
+Implementations:
+- **Probe timeouts relaxed**: `PROBE_TIMEOUT_SECS` 10→20s, `PREFERRED_NODE_TIMEOUT_SECS` 6→12s, `STAGE_D_BATCH_TIMEOUT_SECS` 30→60s. This resolved the critical bug where all Qilin storage nodes were being demoted as "dead" before slow Tor circuits could complete handshakes.
+- **Global discovery ceiling**: 45s→120s for the `discover_and_resolve()` wrapper, allowing full 4-stage discovery to complete over congested Tor relays.
+- **Explorer adapter DOM offloading**: `scraper::Html::parse_document()` in `explorer.rs` migrated to `tokio::task::spawn_blocking`, preventing async runtime starvation on large HTML pages.
+- **Prevention Rule PR-PROBE-001**: Storage node probe timeouts must be at least 2× the typical Tor 3-hop RTT (~1.5-2s). Timeouts under 10s will systematically demote healthy-but-slow nodes.
+
 
 ## Phase 74E: Telemetry-to-UI Mapping Recommendation (2026-03-09)
 

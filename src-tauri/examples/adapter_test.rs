@@ -37,6 +37,10 @@ const DEFAULT_CIRCUITS: usize = 12;
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
 const FINGERPRINT_MAX_RETRIES: usize = 3;
 const HEALTH_PROBE_TIMEOUT_SECS: u64 = 45;
+const ONION_TOURNAMENT_WAVE_SIZE: usize = 4;
+const ONION_TOURNAMENT_MAX_CANDIDATES: usize = 12;
+const CLEARNET_TOURNAMENT_WAVE_SIZE: usize = 12;
+const CLEARNET_TOURNAMENT_MAX_CANDIDATES: usize = 60;
 
 // ─── Canonical test URLs from adapter documentation ──────────────────────────
 
@@ -78,6 +82,33 @@ fn all_adapter_ids() -> Vec<&'static str> {
         "pear",
         "play",
     ]
+}
+
+fn is_onion_url(url: &str) -> bool {
+    url.contains(".onion")
+}
+
+fn tournament_candidate_limit(url: &str, circuits: usize) -> usize {
+    let dynamic = tor::tournament_candidate_count(circuits.max(1));
+    if is_onion_url(url) {
+        dynamic.clamp(
+            circuits.max(ONION_TOURNAMENT_WAVE_SIZE),
+            ONION_TOURNAMENT_MAX_CANDIDATES,
+        )
+    } else {
+        dynamic.clamp(
+            circuits.max(CLEARNET_TOURNAMENT_WAVE_SIZE),
+            CLEARNET_TOURNAMENT_MAX_CANDIDATES,
+        )
+    }
+}
+
+fn tournament_wave_size(url: &str) -> usize {
+    if is_onion_url(url) {
+        ONION_TOURNAMENT_WAVE_SIZE
+    } else {
+        CLEARNET_TOURNAMENT_WAVE_SIZE
+    }
 }
 
 // ─── Failure Classification ──────────────────────────────────────────────────
@@ -416,69 +447,162 @@ async fn run_adapter_test(
     let test_start = Instant::now();
 
     // ─── Phase 1: High-Frequency Tournament Selection ────────────────────
+    let tournament_candidates = tournament_candidate_limit(test_url, circuits);
+    let tournament_wave = tournament_wave_size(test_url).min(tournament_candidates.max(1));
+    let target_winners = 3.min(tournament_candidates.max(1));
+    let mut recorded_latencies_ms = Vec::new();
+
     log_phase(
         adapter_id,
         "TOURNAMENT",
-        "Spinning 60 parallel isolated circuits to find the fastest Tor path...",
+        &format!(
+            "Spinning {} isolated circuits in waves of {} to find the fastest Tor path...",
+            tournament_candidates, tournament_wave
+        ),
     );
     let _tournament_start = Instant::now();
+    let mut winners = Vec::new();
+    let mut next_candidate = 0usize;
+    let total_waves = tournament_candidates.div_ceil(tournament_wave);
 
-    let mut race_tasks = tokio::task::JoinSet::new();
-    let mut accumulated_jitter_ms: u64 = 0;
+    'wave_probe: while next_candidate < tournament_candidates && winners.len() < target_winners {
+        let wave_start = next_candidate;
+        let wave_end = (wave_start + tournament_wave).min(tournament_candidates);
+        log_phase(
+            adapter_id,
+            "TOURNAMENT",
+            &format!(
+                "Wave {}/{}: probing candidates {}-{}",
+                (wave_start / tournament_wave) + 1,
+                total_waves,
+                wave_start + 1,
+                wave_end
+            ),
+        );
 
-    for i in 0..60 {
-        let (cid, client) = frontier.get_client();
-        let target_url_clone = test_url.to_string();
+        let mut race_tasks = tokio::task::JoinSet::new();
+        let mut accumulated_jitter_ms: u64 = 0;
 
-        use rand::Rng;
+        for i in wave_start..wave_end {
+            let (cid, client) = frontier.get_client();
+            let target_url_clone = test_url.to_string();
 
-        let my_jitter = if i == 0 || i == 1 {
-            0
-        } else if i % 2 == 1 {
-            accumulated_jitter_ms
-        } else {
-            let step = rand::thread_rng().gen_range(50..=150) as u64;
-            accumulated_jitter_ms + step
-        };
-        accumulated_jitter_ms = my_jitter;
+            use rand::Rng;
 
-        race_tasks.spawn(async move {
-            if my_jitter > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(my_jitter)).await;
+            let my_jitter = if i == wave_start || i == wave_start + 1 {
+                0
+            } else if i % 2 == 1 {
+                accumulated_jitter_ms
+            } else {
+                let step = rand::thread_rng().gen_range(50..=150) as u64;
+                accumulated_jitter_ms + step
+            };
+            accumulated_jitter_ms = my_jitter;
+
+            race_tasks.spawn(async move {
+                if my_jitter > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(my_jitter)).await;
+                }
+
+                let start = tokio::time::Instant::now();
+                let res = tokio::time::timeout(
+                    Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECS),
+                    // Use GET over HEAD since many misconfigured nginx Tor sites drop HTTP HEAD payloads
+                    client.get(&target_url_clone).send(),
+                )
+                .await;
+                (i, cid, client, start.elapsed().as_millis(), res)
+            });
+        }
+
+        while let Some(res) = race_tasks.join_next().await {
+            if let Ok((_i, cid, client, latency, Ok(Ok(resp)))) = res {
+                winners.push((cid, client, latency, resp.status().as_u16()));
+                recorded_latencies_ms.push(latency as u64);
+                log_phase(
+                    adapter_id,
+                    "TOURNAMENT",
+                    &format!("✓ Circuit C-{} won! Latency: {}ms", cid, latency),
+                );
+                if winners.len() >= target_winners {
+                    race_tasks.abort_all();
+                    break 'wave_probe;
+                }
             }
+        }
 
-            let start = tokio::time::Instant::now();
-            let res = tokio::time::timeout(
-                Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECS),
-                // Use GET over HEAD since many misconfigured nginx Tor sites drop HTTP HEAD payloads
-                client.get(&target_url_clone).send(),
-            )
-            .await;
-            (i, cid, client, start.elapsed().as_millis(), res)
-        });
+        race_tasks.abort_all();
+        next_candidate = wave_end;
     }
 
-    let mut winners = Vec::new();
-    while let Some(res) = race_tasks.join_next().await {
-        if let Ok((_i, cid, client, latency, Ok(Ok(resp)))) = res {
-            winners.push((cid, client, latency, resp.status().as_u16()));
-            log_phase(
-                adapter_id,
-                "TOURNAMENT",
-                &format!("✓ Circuit C-{} won! Latency: {}ms", cid, latency),
-            );
-            if winners.len() >= 3 {
-                break;
+    tor::update_tournament_telemetry(&recorded_latencies_ms, winners.len(), tournament_candidates);
+
+    if winners.is_empty() {
+        log_phase(
+            adapter_id,
+            "TOURNAMENT",
+            &format!(
+                "No winning circuit in {} candidates. Falling back to {} sequential rotated probes...",
+                tournament_candidates, FINGERPRINT_MAX_RETRIES
+            ),
+        );
+
+        for attempt in 1..=FINGERPRINT_MAX_RETRIES {
+            let (cid, client) = frontier.get_client();
+            let start = tokio::time::Instant::now();
+            match tokio::time::timeout(
+                Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECS),
+                client.get(test_url).send(),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => {
+                    let latency = start.elapsed().as_millis();
+                    winners.push((cid, client, latency, resp.status().as_u16()));
+                    frontier.record_success(cid, 0, latency as u64);
+                    log_phase(
+                        adapter_id,
+                        "TOURNAMENT",
+                        &format!(
+                            "✓ Sequential fallback winner on attempt {}/{} via C-{} ({}ms)",
+                            attempt, FINGERPRINT_MAX_RETRIES, cid, latency
+                        ),
+                    );
+                    break;
+                }
+                Ok(Err(err)) => {
+                    log_phase(
+                        adapter_id,
+                        "TOURNAMENT",
+                        &format!(
+                            "Sequential fallback attempt {}/{} failed: {}",
+                            attempt, FINGERPRINT_MAX_RETRIES, err
+                        ),
+                    );
+                }
+                Err(_) => {
+                    log_phase(
+                        adapter_id,
+                        "TOURNAMENT",
+                        &format!(
+                            "Sequential fallback attempt {}/{} timed out after {}s",
+                            attempt, FINGERPRINT_MAX_RETRIES, HEALTH_PROBE_TIMEOUT_SECS
+                        ),
+                    );
+                }
+            }
+
+            if attempt < FINGERPRINT_MAX_RETRIES {
+                tokio::time::sleep(Duration::from_millis((attempt as u64) * 750)).await;
             }
         }
     }
 
-    // Abort the slower 7 remaining circuits instantly
-    race_tasks.abort_all();
-
     if winners.is_empty() {
-        let fc =
-            FailureClass::EndpointUnreachable("All 60 tournament circuits failed.".to_string());
+        let fc = FailureClass::EndpointUnreachable(format!(
+            "All {} tournament circuits failed and {} sequential fallback probes failed.",
+            tournament_candidates, FINGERPRINT_MAX_RETRIES
+        ));
         log_phase(adapter_id, "TOURNAMENT", &format!("✗ FAILED: {}", fc));
         result.failure_class = Some(fc);
         return result;

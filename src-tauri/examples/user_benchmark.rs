@@ -22,13 +22,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         resume: false,
         resume_index: None,
         mega_password: None,
-                stealth_ramp: true,
+        stealth_ramp: true,
     };
 
     println!("Bootstrapping Tor cluster...");
     let tor_daemons = 8;
     let (_swarm, ports) =
-        crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), tor_daemons).await?;
+        crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), tor_daemons, tor_daemons)
+            .await?;
     println!("Tor cluster bootstrapped on ports: {:?}", ports);
 
     if let Some(&port) = ports.first() {

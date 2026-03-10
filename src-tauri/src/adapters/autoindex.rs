@@ -13,41 +13,61 @@ pub struct AutoindexAdapter;
 /// This is the shared parser used by both AutoindexAdapter and PlayAdapter.
 pub fn parse_autoindex_html(html: &str) -> Vec<(String, Option<u64>, bool)> {
     let mut results = Vec::new();
+    let mut cursor = 0;
 
-    for line in html.lines() {
-        if let Some(href_start) = line.find("href=\"") {
-            let after_href = &line[href_start + 6..];
-            if let Some(href_end) = after_href.find('"') {
-                let raw_href = &after_href[..href_end];
+    while let Some(pos) = html[cursor..].find("href=\"") {
+        let href_start = cursor + pos + 6;
+        cursor = href_start;
 
-                // Skip parent directory link and invalid absolute/template targets
-                if raw_href == "../"
-                    || raw_href == ".."
-                    || raw_href == "/"
-                    || raw_href.starts_with("?")
-                    || raw_href.starts_with("/")
-                    || raw_href.starts_with("http://")
-                    || raw_href.starts_with("https://")
-                    || raw_href.starts_with("${")
-                {
-                    continue;
-                }
+        let href_end = match html[cursor..].find('"') {
+            Some(end_pos) => cursor + end_pos,
+            None => break,
+        };
 
-                // URL-decode the href to get the real filename
-                let decoded_name = path_utils::url_decode(raw_href);
-                let is_dir = raw_href.ends_with('/');
-                let clean_name = decoded_name.trim_end_matches('/').to_string();
+        let raw_href = &html[href_start..href_end];
+        cursor = href_end + 1;
 
-                if clean_name.is_empty() {
-                    continue;
-                }
+        if raw_href == "../"
+            || raw_href == ".."
+            || raw_href == "/"
+            || raw_href.starts_with('?')
+            || raw_href.starts_with('/')
+            || raw_href.starts_with("http://")
+            || raw_href.starts_with("https://")
+            || raw_href.starts_with("${")
+        {
+            continue;
+        }
 
-                // Try to extract size from the line text after the closing </a>
-                let size = extract_size_from_line(line);
+        let decoded_name = path_utils::url_decode(raw_href);
+        let is_dir = raw_href.ends_with('/');
+        let clean_name = decoded_name.trim_end_matches('/').to_string();
 
-                results.push((clean_name, size, is_dir));
+        if clean_name.is_empty() {
+            continue;
+        }
+
+        // To extract size, we find the closing </a> and read the text after it up to the newline or the next tag.
+        let mut size: Option<u64> = None;
+        if let Some(tag_close) = html[cursor..].find("</a>") {
+            let search_start = cursor + tag_close + 4;
+
+            // Find the boundary to stop searching for size (either a newline or another tag)
+            let newline_pos = html[search_start..]
+                .find('\n')
+                .unwrap_or(html.len() - search_start);
+            let next_tag_pos = html[search_start..]
+                .find('<')
+                .unwrap_or(html.len() - search_start);
+            let bound_pos = std::cmp::min(newline_pos, next_tag_pos);
+
+            let text_after_tag = html[search_start..search_start + bound_pos].trim();
+            if !text_after_tag.is_empty() {
+                size = extract_size_from_line(text_after_tag);
             }
         }
+
+        results.push((clean_name, size, is_dir));
     }
 
     results
@@ -199,7 +219,7 @@ impl CrawlerAdapter for AutoindexAdapter {
                         ).await;
                         (cid1, res)
                     });
-                    
+
                     let req2 = Box::pin(async {
                         let res = tokio::time::timeout(
                             std::time::Duration::from_secs(45),
@@ -207,17 +227,17 @@ impl CrawlerAdapter for AutoindexAdapter {
                         ).await;
                         (cid2, res)
                     });
-                    
+
                     let (winner_cid, fetch_result) = match futures::future::select(req1, req2).await {
                         futures::future::Either::Left((res, _)) => res,
                         futures::future::Either::Right((res, _)) => res,
                     };
-                    
+
                     let (mut fetch_success, mut html) = (false, None);
 
                     match fetch_result {
                         Ok(Ok(resp)) => {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16()) {
+                            if let Some(delay) = ddos_guard.record_response_legacy(resp.status().as_u16()) {
                                 tokio::time::sleep(delay).await;
                             }
                             if resp.status().is_success() {

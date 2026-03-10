@@ -416,12 +416,35 @@ impl CrawlerAdapter for DragonForceAdapter {
                 multi_clients
             ),
         );
-        let telemetry = app.try_state::<crate::AppState>().map(|s| s.telemetry.clone());
+        let telemetry = app
+            .try_state::<crate::AppState>()
+            .map(|s| s.telemetry.clone());
+        let seeded_clients = if let Some(guard_arc) = &frontier.swarm_guard {
+            let guard = guard_arc.lock().await;
+            let shared_clients = guard.get_arti_clients();
+            crate::multi_client_pool::snapshot_seed_clients(&shared_clients, multi_clients)
+        } else {
+            Vec::new()
+        };
         let multi_pool = Arc::new(
-            crate::multi_client_pool::MultiClientPool::new(multi_clients, telemetry)
-                .await
-                .unwrap(),
+            crate::multi_client_pool::MultiClientPool::new_seeded(
+                multi_clients,
+                seeded_clients,
+                telemetry,
+            )
+            .await
+            .unwrap(),
         );
+
+        if multi_pool.borrowed_client_count() > 0 {
+            let message = format!(
+                "[DragonForce] Seeded MultiClientPool with {}/{} hot Arti clients from the active swarm.",
+                multi_pool.borrowed_client_count(),
+                multi_clients
+            );
+            timer.emit_log(&message);
+            let _ = app.emit("log", message);
+        }
 
         timer.emit_log("[DragonForce] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors...");
         let _ = app.emit("log", "[DragonForce] Concurrent Pre-heating of MultiClientPool circuits to cache HS descriptors...".to_string());
@@ -434,12 +457,22 @@ impl CrawlerAdapter for DragonForceAdapter {
                 let preheat_client = crate::arti_client::ArtiClient::new((*tor_arc).clone(), None);
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(55),
-                    preheat_client.get(&target_heat_url).send(),
+                    preheat_client.head(&target_heat_url).send(),
                 )
                 .await;
             }));
         }
-        futures::future::join_all(preheats).await;
+        if multi_pool.borrowed_client_count() > 0 {
+            drop(preheats);
+        } else if !preheats.is_empty() {
+            let (result, _index, remaining) = futures::future::select_all(preheats).await;
+            let _ = result;
+            for handle in remaining {
+                tokio::spawn(async move {
+                    let _ = handle.await;
+                });
+            }
+        }
         timer.emit_log("[DragonForce] Pre-heating complete. Unleashing workers.");
         let _ = app.emit(
             "log",
@@ -539,7 +572,8 @@ impl CrawlerAdapter for DragonForceAdapter {
                         if let Ok(Ok(resp)) =
                             tokio::time::timeout(std::time::Duration::from_secs(45), req).await
                         {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            if let Some(delay) =
+                                ddos_guard.record_response_legacy(resp.status().as_u16())
                             {
                                 tokio::time::sleep(delay).await;
                             }

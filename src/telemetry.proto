@@ -19,6 +19,15 @@ message ResourceMetricsFrame {
     uint32 node_failovers = 10;
     uint32 throttle_count = 11;
     uint32 timeout_count = 12;
+    double throttle_rate_per_sec = 13;
+    uint32 phantom_pool_depth = 14;
+    uint32 subtree_reroutes = 15;
+    uint32 subtree_quarantine_hits = 16;
+    uint32 off_winner_child_requests = 17;
+    optional string winner_host = 18;
+    optional string slowest_circuit = 19;
+    uint32 late_throttles = 20;
+    uint32 outlier_isolations = 21;
 }
 
 message CrawlStatusFrame {

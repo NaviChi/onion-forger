@@ -454,6 +454,7 @@ async fn test_politeness_semaphore_bottleneck() {
         vec![9051, 9052, 9053, 9054],
         Vec::new(),
         CrawlOptions {
+            stealth_ramp: false,
             listing: true,
             sizes: true,
             download: true,

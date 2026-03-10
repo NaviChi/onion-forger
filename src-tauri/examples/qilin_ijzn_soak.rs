@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
             CrawlOptions {
                 listing: true,
                 sizes: true,
-                download: false,
+                download: true,
                 circuits: Some(config.circuits_ceiling),
                 daemons: Some(config.daemons),
                 agnostic_state: false,
@@ -393,29 +393,74 @@ fn write_html_report(path: &PathBuf, report: &SoakReport) -> Result<()> {
     };
 
     // Compute peak metrics
-    let peak_workers = report.metrics_timeline.iter().map(|m| m.metrics.active_workers).max().unwrap_or(0);
+    let peak_workers = report
+        .metrics_timeline
+        .iter()
+        .map(|m| m.metrics.active_workers)
+        .max()
+        .unwrap_or(0);
     let avg_workers: f64 = if !report.metrics_timeline.is_empty() {
-        report.metrics_timeline.iter().map(|m| m.metrics.active_workers as f64).sum::<f64>()
+        report
+            .metrics_timeline
+            .iter()
+            .map(|m| m.metrics.active_workers as f64)
+            .sum::<f64>()
             / report.metrics_timeline.len() as f64
-    } else { 0.0 };
-    let peak_cpu = report.metrics_timeline.iter().map(|m| (m.metrics.process_cpu_percent * 10.0) as u64).max().unwrap_or(0) as f64 / 10.0;
-    let peak_rss = report.metrics_timeline.iter().map(|m| m.metrics.process_memory_bytes).max().unwrap_or(0) as f64 / (1024.0 * 1024.0);
+    } else {
+        0.0
+    };
+    let peak_cpu = report
+        .metrics_timeline
+        .iter()
+        .map(|m| (m.metrics.process_cpu_percent * 10.0) as u64)
+        .max()
+        .unwrap_or(0) as f64
+        / 10.0;
+    let peak_rss = report
+        .metrics_timeline
+        .iter()
+        .map(|m| m.metrics.process_memory_bytes)
+        .max()
+        .unwrap_or(0) as f64
+        / (1024.0 * 1024.0);
 
     // Count throttles and ceiling changes from logs
-    let throttle_count = report.crawl_logs.iter().filter(|l| l.contains("503")).count();
-    let thompson_count = report.crawl_logs.iter().filter(|l| l.contains("Thompson")).count();
-    let _ceiling_changes: Vec<&String> = report.crawl_logs.iter().filter(|l| l.contains("ceiling") || l.contains("PHASE 74")).collect();
+    let throttle_count = report
+        .crawl_logs
+        .iter()
+        .filter(|l| l.contains("503"))
+        .count();
+    let thompson_count = report
+        .crawl_logs
+        .iter()
+        .filter(|l| l.contains("Thompson"))
+        .count();
+    let _ceiling_changes: Vec<&String> = report
+        .crawl_logs
+        .iter()
+        .filter(|l| l.contains("ceiling") || l.contains("PHASE 74"))
+        .collect();
 
     // Build workers SVG sparkline (simple inline chart)
-    let max_timeline_workers = report.metrics_timeline.iter().map(|m| m.metrics.active_workers).max().unwrap_or(1).max(1);
+    let max_timeline_workers = report
+        .metrics_timeline
+        .iter()
+        .map(|m| m.metrics.active_workers)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let svg_width = 800;
     let svg_height = 120;
     let mut svg_points = String::new();
     for (i, m) in report.metrics_timeline.iter().enumerate() {
         let x = (i as f64 / report.metrics_timeline.len().max(1) as f64) * svg_width as f64;
-        let y = svg_height as f64 - (m.metrics.active_workers as f64 / max_timeline_workers as f64) * svg_height as f64;
-        if i == 0 { svg_points.push_str(&format!("M{:.0},{:.0}", x, y)); }
-        else { svg_points.push_str(&format!(" L{:.0},{:.0}", x, y)); }
+        let y = svg_height as f64
+            - (m.metrics.active_workers as f64 / max_timeline_workers as f64) * svg_height as f64;
+        if i == 0 {
+            svg_points.push_str(&format!("M{:.0},{:.0}", x, y));
+        } else {
+            svg_points.push_str(&format!(" L{:.0},{:.0}", x, y));
+        }
     }
 
     // Build CPU SVG sparkline
@@ -423,9 +468,13 @@ fn write_html_report(path: &PathBuf, report: &SoakReport) -> Result<()> {
     let mut cpu_points = String::new();
     for (i, m) in report.metrics_timeline.iter().enumerate() {
         let x = (i as f64 / report.metrics_timeline.len().max(1) as f64) * svg_width as f64;
-        let y = svg_height as f64 - (m.metrics.process_cpu_percent as f64 / max_cpu) * svg_height as f64;
-        if i == 0 { cpu_points.push_str(&format!("M{:.0},{:.0}", x, y)); }
-        else { cpu_points.push_str(&format!(" L{:.0},{:.0}", x, y)); }
+        let y = svg_height as f64
+            - (m.metrics.process_cpu_percent as f64 / max_cpu) * svg_height as f64;
+        if i == 0 {
+            cpu_points.push_str(&format!("M{:.0},{:.0}", x, y));
+        } else {
+            cpu_points.push_str(&format!(" L{:.0},{:.0}", x, y));
+        }
     }
 
     // Extract circuit latencies from last governor log
@@ -433,7 +482,7 @@ fn write_html_report(path: &PathBuf, report: &SoakReport) -> Result<()> {
     for log in report.crawl_logs.iter().rev() {
         if log.contains("latency=[") {
             if let Some(start) = log.find("latency=[") {
-                let lat_str = &log[start+9..];
+                let lat_str = &log[start + 9..];
                 if let Some(end) = lat_str.find(']') {
                     for part in lat_str[..end].split(' ') {
                         let cleaned = part.trim();
@@ -453,13 +502,23 @@ fn write_html_report(path: &PathBuf, report: &SoakReport) -> Result<()> {
     // Build circuit heatmap HTML
     let mut circuit_rows = String::new();
     for (cid, latency_str) in &circuit_data {
-        let ms_str = latency_str.split(':').nth(1).unwrap_or("0ms").trim_end_matches("ms");
+        let ms_str = latency_str
+            .split(':')
+            .nth(1)
+            .unwrap_or("0ms")
+            .trim_end_matches("ms");
         let ms: f64 = ms_str.parse().unwrap_or(0.0);
-        let tier = if ms < 900.0 { ("S", "#10b981", "🟢") }
-            else if ms < 1100.0 { ("A", "#3b82f6", "🟢") }
-            else if ms < 1300.0 { ("B", "#f59e0b", "🟡") }
-            else if ms < 1500.0 { ("C", "#ef4444", "🟠") }
-            else { ("D", "#dc2626", "🔴") };
+        let tier = if ms < 900.0 {
+            ("S", "#10b981", "🟢")
+        } else if ms < 1100.0 {
+            ("A", "#3b82f6", "🟢")
+        } else if ms < 1300.0 {
+            ("B", "#f59e0b", "🟡")
+        } else if ms < 1500.0 {
+            ("C", "#ef4444", "🟠")
+        } else {
+            ("D", "#dc2626", "🔴")
+        };
         circuit_rows.push_str(&format!(
             "<tr><td>c{}</td><td style='color:{}'>{:.0}ms</td><td>{} {}</td></tr>\n",
             cid, tier.1, ms, tier.2, tier.0
@@ -467,13 +526,20 @@ fn write_html_report(path: &PathBuf, report: &SoakReport) -> Result<()> {
     }
 
     // Log entries (last 50)
-    let log_entries: Vec<String> = report.crawl_logs.iter().rev().take(50).rev()
+    let log_entries: Vec<String> = report
+        .crawl_logs
+        .iter()
+        .rev()
+        .take(50)
+        .rev()
         .map(|l| {
             let cleaned = l.trim().trim_matches('"').replace("\\\"", "\"");
             format!("<div class='log-line'>{}</div>", html_escape(&cleaned))
-        }).collect();
+        })
+        .collect();
 
-    let html = format!(r##"<!DOCTYPE html>
+    let html = format!(
+        r##"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -651,17 +717,31 @@ fn write_html_report(path: &PathBuf, report: &SoakReport) -> Result<()> {
         peak_rss = peak_rss,
         peak_cpu = peak_cpu,
         throttle_count = throttle_count,
-        throttle_color = if throttle_count > 30 { "var(--orange)" } else { "var(--green)" },
+        throttle_color = if throttle_count > 30 {
+            "var(--orange)"
+        } else {
+            "var(--green)"
+        },
         thompson_count = thompson_count,
         svg_width = svg_width,
         svg_height = svg_height,
         svg_points = svg_points,
         cpu_points = cpu_points,
         circuit_rows = circuit_rows,
-        node_list = report.node_decisions.iter()
-            .map(|n| format!("<div style='padding:0.25rem 0;font-size:0.85rem;'>{}</div>", html_escape(n.trim().trim_matches('"'))))
-            .collect::<Vec<_>>().join(""),
-        throttle_badge = if throttle_count > 50 { "badge-warn" } else { "badge-ok" },
+        node_list = report
+            .node_decisions
+            .iter()
+            .map(|n| format!(
+                "<div style='padding:0.25rem 0;font-size:0.85rem;'>{}</div>",
+                html_escape(n.trim().trim_matches('"'))
+            ))
+            .collect::<Vec<_>>()
+            .join(""),
+        throttle_badge = if throttle_count > 50 {
+            "badge-warn"
+        } else {
+            "badge-ok"
+        },
         log_html = log_entries.join("\n"),
     );
 

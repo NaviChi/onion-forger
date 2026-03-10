@@ -1,5 +1,149 @@
 # Lessons Learned Whitepaper
 
+## 2026-03-10 (Phase 95: Clearnet Direct-File Audit + Direct Mode Fix)
+- **PR-DIRECT-095-001:** Do not classify every non-MEGA/non-torrent target as `onion`. URL mode detection must inspect the hostname, not just fall through to an onion default, or clearnet archives get misrouted before download policy even starts.
+- **PR-DIRECT-095-002:** Clearnet direct-download policy must stay separate from onion policy. The March 10, 2026 direct benchmark improved only after the clearnet path stopped inheriting onion-era handshake culling and excessive first-wave fan-out.
+- **PR-DIRECT-095-003:** Piece-mode resume state must size partial-offset tracking to `total_pieces`, not `effective_circuits`. Large interrupted downloads can span hundreds of pieces; tracking only the first wave corrupts persisted progress and resume accounting.
+- **PR-DIRECT-095-004:** For direct HTTP(S) benchmarking, use safe public range-enabled artifacts rather than suspected breach payloads. On March 10, 2026 the tool was validated with `https://proof.ovh.net/files/10Gb.dat`; the user-provided BreachForums `.7z` was limited to non-download verification (`HEAD` + mode detection).
+- **LESSON-DIRECT-LIVE-095-001:** The clearnet path now materially outperforms the old build and the single-stream baseline on the same host/file pair. The rebuilt `60s` run reached about `3.8 GiB` (`~63 MiB/s`, `~530 Mbps`) versus the earlier `~95.7 Mbps` build and a same-day `curl` control at `~208 Mbps`.
+- **LESSON-DIRECT-LIVE-095-002:** Official transport guidance matched the measured fix. Reqwest’s connection pooling knobs (`pool_idle_timeout`, `pool_max_idle_per_host`) and aria2’s parallel split controls (`split`, `max-connection-per-server`, `min-split-size`) are beneficial for large clearnet artifacts, but the same posture should not be copied into onion workloads. Primary sources reviewed: reqwest rustdocs `ClientBuilder` and the official aria2 manual.
+
+## 2026-03-10 (Phase 91: Downloader Throughput Audit + macOS Storage Reclassification)
+- **PR-DL-091-001:** Qilin “full download” validation must use the authoritative `best` snapshot, not the mutable `current` snapshot. On the March 10 exact target, `best` contained `5078` entries / `4240` files while `current` contained only `2926` / `2394`.
+- **PR-DL-091-002:** macOS APFS / Apple Fabric hosts need a `diskutil` mount-point fallback for storage classification. `sysinfo` alone can under-classify fast internal storage and suppress Arti bootstrap/client budgets.
+- **PR-DL-091-003:** Hidden-service batch downloads are network-bound. Promoting the batch path to full NVMe-style first-wave fan-out (`24/12/16/36`) did not improve useful-work throughput on the live Qilin target even though it improved bootstrap.
+- **PR-DL-091-004:** The best default posture for the audited Qilin download path was mixed: keep NVMe-aware bootstrap (`12` Arti clients on this host) but keep the transfer first wave at the benchmark-proven `16/8/10/24` lane shape.
+- **PR-OBS-091-001:** Batch progress telemetry must continue reporting real aggregate speed after the run enters the large-file phase. Hardcoded `speed=0.0` in that stage makes tail analysis unreliable.
+
+## 2026-03-10 (Phase 90: Winner-Quality Memory + Tail-Latency Biasing)
+- **PR-WINNER-090-001:** Stage D and redirect-ring ranking must prefer proven productive winners, not just the freshest seen host. Freshness alone is insufficient on rotating Qilin storage.
+- **PR-TAIL-090-001:** Every full crawl should end with a compact tail summary that names the durable winner, slowest circuit, late throttles, and outlier isolates. Without that, late-layer slowdown still requires raw log forensics.
+- **PR-REPIN-090-001:** Worker repin cadence should adapt to winner quality and tail pressure. Fixed repin intervals are too blunt once host quality diverges this sharply.
+- **PR-RECON-090-001:** Reconciliation must never reset retry history for late missing folders. Reopening them as fresh work recreates the exact "stalls near the end" failure mode even when the early crawl was healthy.
+- **LESSON-QILIN-LIVE-090-001:** The March 10, 2026 degraded exact-target run reproduced the real deep-tail bug. The crawl was not deadlocked; it kept reopening missing folders near `99.4%` because reconciliation reintroduced them as attempt-1 work after heavy route churn.
+- **LESSON-QILIN-LIVE-090-002:** The rebuilt exact-target rerun proved the reconciliation-tail fix is real. On winner `4xl2hta3...`, the crawl finished in `213.52s` with `3180` effective entries / `2533` files / `647` folders, `failovers=0`, `timeouts=0`, and final tail summary `winner_host=4xl2hta3... slowest_circuit=c0:2436ms late_throttles=0 outlier_isolations=0`.
+- **LESSON-QILIN-LIVE-090-003:** Winner-quality memory is active but not yet sufficient on its own. The immediate warm rerun probed cached winner `4xl2hta3...` first, then later accepted fresh host `sc2qyv6...` and degraded into heavy subtree reroutes (`84.0%` progress, `failovers=547`, `timeouts=11` by the captured tail), which means fresh Stage A discoveries can still override productive cached winners too aggressively.
+
+## 2026-03-10 (Phase 89: Deep-Crawl Stall Audit + Throttle/Outlier Repair)
+- **PR-THROTTLE-089-001:** First-attempt `503/429/403/400` responses must feed the same throttle telemetry and healing path as retry-lane throttles. If they are downgraded to plain HTTP failures, late-layer slowdown becomes invisible to the operator plane.
+- **PR-OBS-089-001:** Qilin completion logs must report effective VFS entries, not just `Vec<FileEntry>` length. A crawl can legitimately return `raw entries=0` and still finish with a complete tree because the adapter streamed directly into the VFS.
+- **PR-STALL-089-001:** A stall guard should trigger only on real no-progress windows. Slow but advancing queues are route-quality problems, not deadlocks.
+- **LESSON-QILIN-LIVE-089-001:** March 10, 2026 full exact-target crawls proved the deep-layer issue is winner-host variance, not a hidden crawl deadlock. The same target completed with the same `3180` effective entries in `139.86s` on `3pe26tqc...` and `487.71s` on `aay7nawy...`.
+- **LESSON-QILIN-LIVE-089-002:** After the Phase 89 repair, late throttles are now honest in the shared summary. The rebuilt-binary replay surfaced `429/503=2 failovers=2` and immediate phantom-swap healing instead of silently ending with zero throttle counts.
+
+## 2026-03-10 (Phase 88: Binary Telemetry Parity + Clean Same-Output Restore Validation)
+- **PR-TELEMETRY-088-001:** `binary_telemetry.rs`, `telemetry.proto`, and generated frontend protobuf bindings must move together. If one surface lags, the binary telemetry plane silently drops metrics even while the JSON bridge stays correct.
+- **PR-CLI-088-001:** Periodic progress summaries are not enough for operator forensics. Always emit a final one-shot summary with request and route counters on `complete`, `cancelled`, or `error`.
+- **PR-VALIDATION-088-001:** Cross-run memory features must be validated against the same output root, not a fresh directory. Otherwise a rerun only proves the code compiles, not that persisted state restores.
+- **LESSON-QILIN-LIVE-088-001:** The March 10, 2026 clean same-output reruns proved subtree host-memory restore in practice. Run 1 on `afa2a0ea-20ba-3ddf-8c5c-2aeea9e5dc43` finished in `165.19s`, persisted `647` subtree host preferences, and produced `3180` discovered entries; run 2 restored those `647` preferences, rotated to a different durable winner, and still matched the same `3180` discovered entries / `2533` files / `647` folders.
+- **LESSON-QILIN-LIVE-088-002:** Restored subtree host memory is useful even when the winner host rotates. On March 10, 2026 the winner changed from `rbuio2ug...` to `ytbhximf...`, but the rerun still finished cleanly in `157.88s` and matched the best-known output.
+
+## 2026-03-10 (Phase 87: Subtree Route Telemetry + Host-Based Memory)
+- **PR-TELEMETRY-087-001:** Subtree reroutes, subtree quarantine hits, and off-winner child requests must live in shared runtime telemetry and benchmark output, not only in Qilin-specific logs.
+- **PR-MEMORY-087-001:** Persist subtree preferred routes by host identity, not raw full seed URLs. Only restore a persisted subtree preference when that host still exists in the current winner/standby set.
+- **PR-RAMP-087-001:** Keep `--no-stealth-ramp` benchmark-only in main CLI behavior unless a deliberate benchmark override is enabled. Do not let a comparison knob drift into the default operator path.
+- **LESSON-QILIN-LIVE-087-001:** Repeated March 10, 2026 exact-target live reruns showed cross-run winner churn again: `chygwjfx...` -> `2wyohlh5...` -> `lqcxwo4c...`. That justified enabling subtree preferred-host persistence.
+- **LESSON-QILIN-BENCH-087-001:** Benchmark output is now honest about subtree route waste. The `[EFF]` line and final row expose `subtree_reroutes`, `quarantine_hits`, and `off_winner_child_requests` directly.
+
+## 2026-03-10 (Phase 86E: Subtree Host Affinity + Standby Quarantine)
+- **PR-ROUTE-086E-001:** Maintain subtree-local preferred seeds and subtree-local standby quarantine separately from the global Qilin winner lease. Child-path instability is not proof that the root route is bad.
+- **PR-ROUTE-086E-002:** Child retries should stay on the confirmed subtree winner unless that subtree-host pair itself has failed enough times to justify quarantine.
+- **PR-ROUTE-086E-003:** Global failover should be reserved for root/global failures. Do not let ordinary subtree failures rewrite the global winner path.
+- **LESSON-QILIN-LIVE-086E-001:** The March 10, 2026 exact-target subtree-affinity replay eliminated off-winner churn in practice. Compared with the prior repaired run, off-active child fetches/failures fell from `9/10` to `0/0` while the replay reached `seen=544 processed=282 queue=262` and adapter-local `entries=2336`.
+- **LESSON-QILIN-LIVE-086E-002:** Once subtree standby churn is removed, the next improvements are observability and cross-run memory, not a default `--no-stealth-ramp` change.
+
+## 2026-03-10 (Phase 86D: Root Durability + Active-Host Affinity)
+- **PR-WINNER-086D-001:** Do not promote a Qilin winner lease from discovery probes alone. A storage node becomes the winner only after a full root listing fetch/parse succeeds.
+- **PR-PHANTOM-086D-001:** When the phantom pool is empty during an active crawl, reuse isolated clients from the hot Arti swarm before cold-bootstrapping a replacement. Mid-crawl cold bootstrap is last-resort behavior.
+- **PR-ROUTE-086D-001:** Root retries must never be remapped onto standby seeds. The active root path must either succeed or fail on its own merits before route failover logic engages.
+- **PR-ROUTE-086D-002:** The first ordinary child retry should stay on the confirmed active host. Spending attempt 2 on standby storage hosts is request waste unless the active host has already proven bad for that subtree.
+- **LESSON-QILIN-LIVE-086D-001:** The March 10, 2026 exact-target rerun fixed the prior fail scenario in practice: durable winner confirmed, root parsed, `kent/` expanded to `133 files / 133 folders`, and the timed window reached `seen=288 processed=59 queue=229` with adapter-local `entries=670`.
+- **LESSON-QILIN-LIVE-086D-002:** The no-stealth-ramp comparison did not prove a better default. After root durability was restored, the next waste point is subtree standby churn, not worker induction speed.
+
+## 2026-03-10 (Phase 86C: Arti Hot-Start + Hinted Warmup Bypass)
+- **PR-POOL-086C-001:** Do not cold-bootstrap a second Arti client pool after storage resolution if the main swarm is already hot. Seed follow-on pools from the live swarm first and derive extra slots with `isolated_client()` semantics.
+- **PR-FRONTIER-086C-001:** The frontier must not stay pinned to the bootstrap-quorum snapshot. Refresh live Arti clients before hinted onion execution or the crawl will underuse a swarm that has already expanded in the background.
+- **PR-WARMUP-086C-001:** If a strong URL hint already selects the adapter and fingerprinting is skipped, do not pay a blocking onion warmup first. The adapter's real requests should own that warmup budget.
+- **PR-STAGED-086C-001:** Stage D must reserve at least one first-wave slot for a stable cached winner. Two fresh redirect candidates alone can waste a full discovery timeout even when the known-good node is still alive.
+- **LESSON-QILIN-LIVE-086C-001:** On the March 10, 2026 exact-target reruns, the strong-hint warmup bypass moved adapter handoff from `138.83s` to `71.08s` and the seeded pool removed the old `~55s` post-resolution hot-start gap.
+- **LESSON-QILIN-LIVE-086C-002:** After these hot-start fixes, the remaining live blockers are root durability and phantom-pool depletion. Discovery and handoff are no longer the dominant costs on this target.
+
+## 2026-03-10 (Phase 86: Arti Fingerprint Bypass + Discovery Telemetry)
+- **PR-FP-086-001:** If a Qilin ingress URL already has the strong CMS shape (`/site/view?uuid=` or `/site/data?uuid=`), skip the network fingerprint probe entirely. URL classification is cheaper and was enough to drive `FP_SECS=0.00` on the live benchmark.
+- **PR-QILIN-086-001:** Fallback mirror seeding must be lazy. A warm rerun should not broad-seed known mirrors before Stage A unless the cached node pool is actually sparse.
+- **PR-TELEMETRY-086-001:** Request-efficiency counters must include discovery-plane traffic, not just frontier worker requests. Otherwise Qilin benchmarks can show `0` requests while the node cache is actively spending probes.
+- **LESSON-QILIN-LIVE-086-001:** The March 10, 2026 rerun proved the fingerprint bypass is real and the new telemetry is honest: `FP_SECS=0.00`, `requests=3`, `success=1`, `failure=2`.
+- **LESSON-QILIN-LIVE-086-002:** Removing warm-path seed churn did not fix the live timeout by itself. The remaining bottleneck is redirect-host volatility: Stage A keeps discovering fresh storage hosts that are unreachable by the time listing validation runs.
+- **LESSON-PORTS-086-001:** Managed Arti `ports=[]` is not evidence that the swarm lacks parallelism. The hot path uses in-process clients directly; more local SOCKS ports are not the primary optimization lever for this application.
+
+## 2026-03-10 (Phase 85: Arti Swarm Efficiency Audit)
+- **PR-WARMUP-085-001:** Hidden-service warmup must unblock on first-ready quorum, not `join_all` over every prewarm task. The critical path is first usable circuits, not last straggler completion.
+- **PR-HEALTH-085-001:** Automatic healing for onion-first sessions must not be driven by a default clearnet probe target. Probe traffic must match the active traffic class, or the swarm will rotate healthy clients for the wrong reason.
+- **PR-NODECACHE-085-001:** Seeding known mirrors must merge with existing per-node state. Never overwrite cooldown, failure streak, latency, or success history when inserting known hosts.
+- **PR-HEDGE-085-001:** Redundant discovery requests are only worth spending in tiny bounded waves (`2-3`) against the highest-value candidates. Full sequential probing wastes tail latency; full fan-out wastes circuits.
+- **PR-CACHEFAST-085-001:** Warm-cache winner/redirect probes must execute before broad mirror seeding. Otherwise the system still pays avoidable sled writes, logs, and seed bookkeeping before the fastest known route is even tried.
+- **LESSON-QILIN-BENCH-085-001:** The Phase 85 live Qilin reruns proved the new fast path is real: the cold run discovered a fresh Stage A redirect host, and the warm-cache rerun reached the cached winner lease immediately instead of replaying broad discovery first.
+- **LESSON-FP-085-001:** After the Phase 85 fixes, fingerprinting became the dominant remaining wall-time cost on the canonical Qilin benchmark. Warm-cache discovery improved materially, but end-to-end runtime still spent roughly 13-20s in fingerprint/first-page acquisition.
+- **LESSON-OBS-085-001:** Arti-native benchmark surfaces that print `ports=[]` are misleading. For Arti swarms, the operator plane should report runtime label, client count, and traffic class rather than pretending SOCKS/control ports are the primary readiness signal.
+- **LESSON-SWARM-085-001:** The next performance ceiling is not raw concurrency. It is control-loop quality: warmup quorum, correct healing signals, and preserving learned storage-node state.
+
+## 2026-03-10 (Phase 84: Qilin Frontier Telemetry Alignment + Compact CLI Summary + Live GUI Parity)
+- **PR-QILIN-084-001:** If an adapter keeps a private fast-path queue, it must project `pending / active / target` state back into the shared frontier snapshot. Otherwise the operator plane lies even while the crawl is healthy.
+- **PR-QILIN-084-002:** Shared frontier request accounting must include the adapter fast path, not just the slow/governed lane.
+- **PR-QILIN-084-003:** Count success after body decode succeeds. A single response must not be recorded as both a success and a decode failure.
+- **PR-CLI-084-001:** The primary binary needs a condensed summary mode for long live crawls. Operators should not have to infer queue depth and worker state from raw log fragments or bridge-frame JSON.
+- **PR-TELEMETRY-084-001:** Publish a terminal zeroed worker snapshot when crawl sessions end, or GUI/CLI surfaces will keep the last live worker metrics indefinitely.
+- **LESSON-QILIN-LIVE-084-001:** After the frontier alignment fix, the dominant remaining live bottleneck on March 10, 2026 was rotated storage-node reachability, not hidden progress counters. Both CLI and GUI parity runs captured fresh Stage A redirects to different `.onion` hosts, and both fresh hosts were unreachable at probe time.
+- **LESSON-AUDIT-084-001:** Self-audit score for Phase 84 was 95/100. The only material gap was GUI evidence fidelity: live Tauri session logs and native input automation proved parity, but the captured window image was not reliable enough to serve as the sole proof surface.
+
+## 2026-03-10 (Phase 83: Main-Binary CLI Mode & Live Qilin CLI Validation)
+- **PR-CLI-001:** If a Tauri library crate exposes both GUI and CLI entrypaths, `tauri::generate_context!()` must be expanded exactly once behind a shared helper. Multiple macro expansions in one crate will link-fail with duplicate embedded symbols during `cargo test`.
+- **PR-CLI-002:** GUI-style detached commands (`spawn and return Ok(())`) are not valid one-shot CLI semantics. Always expose a blocking helper for CLI reuse when the command must complete before process exit.
+- **PR-CLI-003:** Default human CLI logs must filter out high-frequency dashboard transport frames. Make bridge-frame flooding opt-in (`--include-telemetry-events`) so the operator can actually see bootstrap, adapter, and storage decisions.
+- **LESSON-QILIN-LIVE-001:** The live main-binary CLI run against `ijzn3sic.../site/view?uuid=f0668431-ee3f-3570-99cb-ea7d9c0691c6` proved that adapter matching is not the bottleneck. The real cost stack on GUI-equivalent defaults is hidden-service bootstrap -> fingerprint -> redirect capture/storage-node rotation -> first recursive storage expansion.
+- **LESSON-QILIN-LIVE-002:** Qilin can be actively discovering folders/files while shared frontier telemetry still reports `processedNodes=0` and `activeWorkers=0`. Until those counters are unified, operator conclusions should rely on adapter-local progress logs (`entries=... pending=...`, child parse/fetch lines, storage-node resolution) rather than the generic frontier status alone.
+
+## 2026-03-09 (Phase 78: Zero-Copy SIMD Parsing & Batched Sled Streaming)
+- **LESSON-ZERO-COPY-001:** `regex::Regex` execution during heavy HTML extraction burns extreme amounts of CPU and induces allocation stalls on massive directory listings. By utilizing raw `[u8]` slice windowing and `.find()` (which inherently delegates to `memchr` SIMD routines in Rust), we achieved gigabytes/sec parser speeds devoid of allocation bottlenecks.
+- **LESSON-SLED-BATCH-001:** `vfs::insert_entries` flushing to the sled database every 500 items at a 500ms cadence induced massive disk-sync overhead during explosive directory discoveries. By upgrading batch caps to 5,000 items and expanding the interval to 2,000ms, synchronous `flush_async` blockades on Tokio threads were entirely eliminated.
+## 2026-03-09 (Phase 77C-77E: Qilin CMS Bypass, UUID Remapping, Auto-Discovery)
+
+### Phase 77C: CMS Architecture
+- **LESSON-CMS-001:** Ransomware CMS presentation pages (`/site/view`) are victim profiles, not file listings. Always verify HTML structure before assuming file metadata is present.
+- **LESSON-WAVE-PROBE-001:** Concurrent blast-probing of 18+ `.onion` nodes causes circuit pool starvation in arti. Staggered waves of 3 maintain circuit pool pressure within budget.
+- **LESSON-404-SEMANTICS-001:** HTTP 404 from a `.onion` node means "reachable but not hosting this content" — NOT "offline." Never demote a 404-producing node in scoring.
+
+### Phase 77D: UUID Remapping & Storage Rotation
+- **PR-77D-001:** CMS UUIDs do NOT match storage paths. The CMS silently remaps victim UUIDs in its 302 redirect. ALWAYS use the redirect Location header, never construct storage URLs from CMS UUIDs.
+- **PR-77D-002:** `.onion` addresses found in CMS HTML may be affiliate links to completely separate ransomware platforms. Always probe root `/` to verify site identity before classifying as storage.
+- **PR-77D-003:** Qilin rotates storage nodes between requests. The same victim's 302 redirect may point to different `.onion` hosts and different UUID paths on each request.
+- **PR-77D-004:** To capture redirect targets from potentially-offline storage nodes, disable redirect following and read the Location header directly (`send_capturing_redirect()` pattern).
+
+### Phase 77E: Pending Counter Fix & Auto-Discovery
+- **PR-77E-001:** NEVER use raw `fetch_sub(1)` on atomic counters that track queue depth. With high worker counts (≥16), race conditions can cause more decrements than items exist. Use `fetch_update(|v| Some(v.saturating_sub(1)))`.
+- **PR-77E-002:** Storage node discoveries from 302 redirects MUST be persisted globally (not per-UUID). Store under `global_host:<host>` keys so future crawls of different victims benefit from prior discoveries.
+- **PR-77E-003:** Every time the node inventory changes (new discovery, seed merge), emit a Tauri event (`qilin_nodes_updated`) so the UI can display growing infrastructure telemetry.
+- **LESSON-ROTATION-001:** Across 4 test runs, 5 unique storage nodes were discovered for a single victim — confirming ≥4 live replicas per victim with per-request load balancing.
+
+## 2026-03-09 (Phase 76: Qilin Production Hardening — DDoS Guard + Heatmap + Phantom Pool)
+- **PR-THROTTLE-JITTER-001:** Never fire back-to-back requests from same circuit within 200ms. The old DDoS guard used static sleeps that blocked workers for entire quarantine periods. The EKF covariance-driven jitter dynamically adapts to target gateway aggressiveness and BBR min-RTT, producing quarantine durations that scale with observed conditions.
+- **PR-PHANTOM-POOL-002:** Phantom pool must be ≥4 standbys with replenish interval ≤10s. The 12h soak test showed 156 pool-empty warnings with pool_size=2 and replenish_interval=20s. Doubling the pool and halving the interval eliminates exhaustion under all tested load patterns.
+- **PR-HEATMAP-DEFAULT-001:** Subtree heatmap must be enabled by default. The `lazy_static! CACHED_HEATMAP: Mutex<Option>` pattern was fundamentally dead code — the Mutex was never populated. Replaced with a proper `LazyLock<RwLock>` static with explicit lifecycle management (install/uninstall).
+- **LESSON-API-COMPAT-001:** When rewriting a shared utility (DDoS guard), always provide a backward-compatible wrapper (`record_response_legacy()`) for non-target adapters. Bulk-replacing 11 call sites with the new API would risk regressions in DragonForce, Play, LockBit, etc. The legacy wrapper converts the new enum to the old `Option<Duration>` return type.
+- **LESSON-SCOPE-ORDERING-001:** When wiring global static installation into a large function (~3000 lines), verify the variable's definition site vs. the installation site. `actual_seed_url` was defined 200 lines below our initial `install_global_heatmap()` placement — caught only by cargo check. Always look for `let ... actual_seed_url` before reference.
+- **PR-QUARANTINE-DRAIN-001:** Quarantine queues must be drained immediately after the primary queue in the worker idle-check path. Placing them after retry/degraded queues would cause starvation — quarantined URLs have a time-lock and need prompt re-check to maintain throughput.
+- **PR-QUARANTINE-BREAK-001:** Every worker break-condition check ("all queues empty → terminate") must include the quarantine queue. Forgetting it causes workers to terminate while quarantined URLs are still waiting their unlock timestamp.
+- **PR-HEATMAP-REFRESH-001:** Global heatmap must be refreshed periodically (≤30s) during crawl, not only at end. Boot-time snapshot becomes stale within minutes of aggressive crawling — subtrees that recover are still penalized, and newly-degraded subtrees keep getting hammered.
+- **PR-TRAFFIC-PARTITION-001:** When `reserve_for_downloads=true`, the circuit pool MUST be partitioned into listing-reserved (first 2/3) and download-reserved (last 1/3) ranges. Without partitioning, heavy downloads consume all circuits and starve listing workers, causing the crawl to stall.
+- **PR-SPECULATIVE-DEPTH-001:** Speculative dual-circuit racing should only activate for deep URLs (depth > 2 relative to seed). Shallow folder requests (root, level 1-2) have near-100% first-attempt success and racing them wastes circuit bandwidth that deep requests need.
+
+## 2026-03-09 (Phase 75: Probe Timeout Tuning & Persistent Subtree Heatmaps)
+- **PR-PROBE-001:** Storage node probe timeouts must be ≥2× the typical Tor 3-hop RTT (~1.5-2s). The original 10s `PROBE_TIMEOUT_SECS` systematically demoted ALL healthy-but-slow nodes, causing 0-entry crawls. Doubling to 20s resolved the issue immediately — 8,600+ entries discovered.
+- **PR-HEATMAP-PERSIST-001:** Subtree heatmap data must be persisted to a crash-safe store (Sled VFS named tree) in addition to JSON flat files. JSON files can be lost or corrupted; Sled survives process crashes and provides atomic writes.
+- Discovery pipeline global timeouts (formerly 45s) must accommodate 4-stage sequential probing + slow Tor circuits. 120s provides sufficient headroom for Stage D batch probes of 11 mirrors.
+- `scraper::Html::parse_document()` blocks the tokio runtime for several milliseconds on large DOMs. Always wrap in `tokio::task::spawn_blocking` even when the result is needed immediately — the cost of the spawn is negligible vs the parsing time.
+- When merging heatmap data from multiple backends (JSON + Sled), always compare `last_failure_epoch` / `last_success_epoch` timestamps and prefer the more recent record per key. Do not blindly overwrite.
+
 ## 2026-03-09 (Phase 74E: Start Queue Renderer Stability)
 - Proto3 omits default scalar values in transport payloads; UI state that depends on numeric fields must decode with defaults or normalize missing values before render.
 - Transport frame objects are not safe drop-in replacements for React view state. Always merge sparse telemetry with prior state snapshots to preserve fields not present in the wire schema.
@@ -273,3 +417,19 @@ We rolled out the complete military-grade predictive pacing suite inside `qilin_
 
 ## Network Requests & Size Probing Optimization
 *   **Merge `HEAD` probes**: Do not make secondary or standalone `HEAD` requests to ascertain `Content-Length`. Instead, initiate an initial HTTP connection employing standard `GET` requests with header modifiers (`Range: bytes=0-0` or `bytes=0-1`) explicitly. Processing `Content-Range` logic inherently circumvents double-striking targets. Eliminates half of the connection handshake burden on aggressive proxy layers natively.
+
+
+## Phase 76D: HS Rendezvous Cold-Start Hardening
+
+**PR-HS-COLDSTART-001**: Arti connect_timeout MUST be ≥30s for v3 hidden services. First-contact HS connections require descriptor fetch + introduction point negotiation + rendezvous circuit build, which routinely takes 20-45s. A 15s timeout causes immediate false "Connect" failures on first-contact storage nodes while previously-cached descriptors (like the CMS) work fine.
+
+**PR-HS-PROBE-ALIGN-001**: All probe timeouts in the Qilin discovery pipeline MUST be >= the arti connect_timeout. Otherwise nodes will be demoted as "dead" before arti even finishes the HS handshake. Specifically: PROBE_TIMEOUT ≥ connect_timeout+5, STAGE_HTTP_TIMEOUT ≥ connect_timeout+5, STAGE_D_BATCH_TIMEOUT ≥ 2×connect_timeout.
+
+**PR-HS-CMS-FALLBACK-001**: When all storage nodes fail but the CMS is reachable, seed the CMS host as a fallback storage node. The CMS host may serve autoindex at /<uuid>/ paths as a degraded mode.
+
+**PR-HS-IMMEDIATE-CONNECT-001**: "client error (Connect)" with instant failure (not timeout) on .onion addresses indicates arti could not build the HS rendezvous circuit at ALL — not a slow connection. This can mean the node truly offline, descriptor not found, or introduction points exhausted. Increasing timeout alone will not fix this; CMS fallback paths are needed.
+
+
+### Phase 77F: Qilin Top-3 Performance Execution
+- **PR-77F-001 (Inverted Queues):** Clear deeper paths and retries before fetching new root/shallow paths to prevent long tail stalls.
+- **PR-77F-002 (Circuit Pinning):** Spray concurrent workers across multiple mirror endpoints natively instead of shifting the entire proxy rotation on failover.

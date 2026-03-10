@@ -11,10 +11,10 @@ async fn main() -> Result<()> {
         .manage(AppState::default())
         .build(tauri::generate_context!())
         .map_err(|e| anyhow!("build tauri app: {}", e))?;
-    
+
     let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let logs_sink = logs.clone();
-    
+
     app.listen_any("crawl_log", move |evt: Event| {
         if let Ok(line) = serde_json::from_str::<String>(evt.payload()) {
             println!(">> TELEMETRY: {}", line);
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     )?;
     let ledger = crawli_lib::target_state::load_or_default_ledger(&paths)?;
     let explorer = AdaptiveUniversalExplorer::new(std::sync::Arc::new(ledger));
-    
+
     println!("=== TEST 1: QILIN AUTOINDEX (MODE 3 HYDRATOR) ===");
     let html_autoindex = r#"
         <html><body>
@@ -38,7 +38,11 @@ async fn main() -> Result<()> {
         QData browser
         </body></html>
     "#;
-    let entries = explorer.parse_page_from_body(html_autoindex, "http://qilin-onion.onion", Some(&app.handle()));
+    let entries = explorer.parse_page_from_body(
+        html_autoindex,
+        "http://qilin-onion.onion",
+        Some(&app.handle()),
+    );
     assert!(entries.is_some(), "Mode 3 Autoindex failed to hydrate");
     println!("Extracted Entries: {}", entries.unwrap().len());
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -49,7 +53,11 @@ async fn main() -> Result<()> {
         <script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"files":[{"fsguest":"token123","path":"/api/dl/1"}]}}}</script>
         </body></html>
     "#;
-    let entries = explorer.parse_page_from_body(html_nextjs, "http://advanced-qilin.onion", Some(&app.handle()));
+    let entries = explorer.parse_page_from_body(
+        html_nextjs,
+        "http://advanced-qilin.onion",
+        Some(&app.handle()),
+    );
     println!("Extracted SPA Entries: {:?}", entries.is_some());
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -59,15 +67,28 @@ async fn main() -> Result<()> {
         <iframe src="http://advanced-qilin.onion/api/files?token=secure"></iframe>
         </body></html>
     "#;
-    let entries = explorer.parse_page_from_body(html_iframe, "http://advanced-qilin.onion", Some(&app.handle()));
+    let entries = explorer.parse_page_from_body(
+        html_iframe,
+        "http://advanced-qilin.onion",
+        Some(&app.handle()),
+    );
     println!("Extracted Iframe Entries: {:?}", entries.is_some());
     tokio::time::sleep(Duration::from_millis(100)).await;
-    
+
     let captured_logs = logs.lock().unwrap();
-    let modes_detected = captured_logs.iter().filter(|l| l.contains("Tier-4 Hydrator")).count();
-    println!("\nTier-4 Hydrator Observability Validated. Detected {} telemetry pulses.", modes_detected);
-    
-    assert!(modes_detected >= 3, "Missing Tier-4 Hydrator Telemetry pulses");
-    
+    let modes_detected = captured_logs
+        .iter()
+        .filter(|l| l.contains("Tier-4 Hydrator"))
+        .count();
+    println!(
+        "\nTier-4 Hydrator Observability Validated. Detected {} telemetry pulses.",
+        modes_detected
+    );
+
+    assert!(
+        modes_detected >= 3,
+        "Missing Tier-4 Hydrator Telemetry pulses"
+    );
+
     Ok(())
 }

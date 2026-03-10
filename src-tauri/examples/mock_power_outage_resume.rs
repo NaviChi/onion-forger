@@ -8,7 +8,7 @@ use tauri::Manager;
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    
+
     let app = tauri::Builder::default()
         .manage(AppState::default())
         .build(tauri::generate_context!())
@@ -28,9 +28,9 @@ async fn main() -> Result<()> {
     let url = "http://lockbit6vhrjaqzsdj6pqalyideigxv4xycfeyunpx35znogiwmojnid.onion/".to_string();
 
     println!("=== PHASE 1: INITIATING CRAWL (MOCKING POWER OUTAGE IN 15 SECONDS) ===");
-    
+
     let crawl_result = tokio::time::timeout(
-        Duration::from_secs(15), 
+        Duration::from_secs(15),
         start_crawl_for_example(
             url.clone(),
             CrawlOptions {
@@ -48,7 +48,8 @@ async fn main() -> Result<()> {
             output_dir.to_string_lossy().to_string(),
             app.handle().clone(),
         ),
-    ).await;
+    )
+    .await;
 
     match crawl_result {
         Ok(Ok(_)) => {
@@ -61,9 +62,9 @@ async fn main() -> Result<()> {
             println!("=== SYSTEM CRASH (TIMEOUT) TRIGGERED ===");
             println!("Simulating hardware reboot... waiting 5 seconds.");
             tokio::time::sleep(Duration::from_secs(5)).await;
-            
+
             println!("=== PHASE 2: SYSTEM RECOVERED. EXECUTING MULTI-STAGE RESUME ===");
-            
+
             let resume_result = tokio::time::timeout(
                 Duration::from_secs(45),
                 start_crawl_for_example(
@@ -83,8 +84,9 @@ async fn main() -> Result<()> {
                     output_dir.to_string_lossy().to_string(),
                     app.handle().clone(),
                 ),
-            ).await;
-            
+            )
+            .await;
+
             match resume_result {
                 Ok(Ok(res)) => {
                     println!("Resume completed successfully.");

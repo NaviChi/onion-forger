@@ -300,6 +300,15 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
      * @property {number|null} [nodeFailovers] ResourceMetricsFrame nodeFailovers
      * @property {number|null} [throttleCount] ResourceMetricsFrame throttleCount
      * @property {number|null} [timeoutCount] ResourceMetricsFrame timeoutCount
+     * @property {number|null} [throttleRatePerSec] ResourceMetricsFrame throttleRatePerSec
+     * @property {number|null} [phantomPoolDepth] ResourceMetricsFrame phantomPoolDepth
+     * @property {number|null} [subtreeReroutes] ResourceMetricsFrame subtreeReroutes
+     * @property {number|null} [subtreeQuarantineHits] ResourceMetricsFrame subtreeQuarantineHits
+     * @property {number|null} [offWinnerChildRequests] ResourceMetricsFrame offWinnerChildRequests
+     * @property {string|null} [winnerHost] ResourceMetricsFrame winnerHost
+     * @property {string|null} [slowestCircuit] ResourceMetricsFrame slowestCircuit
+     * @property {number|null} [lateThrottles] ResourceMetricsFrame lateThrottles
+     * @property {number|null} [outlierIsolations] ResourceMetricsFrame outlierIsolations
      */
 
     /**
@@ -413,12 +422,96 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
      */
     ResourceMetricsFrame.prototype.timeoutCount = 0;
 
+    /**
+     * ResourceMetricsFrame throttleRatePerSec.
+     * @member {number} throttleRatePerSec
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.throttleRatePerSec = 0;
+
+    /**
+     * ResourceMetricsFrame phantomPoolDepth.
+     * @member {number} phantomPoolDepth
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.phantomPoolDepth = 0;
+
+    /**
+     * ResourceMetricsFrame subtreeReroutes.
+     * @member {number} subtreeReroutes
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.subtreeReroutes = 0;
+
+    /**
+     * ResourceMetricsFrame subtreeQuarantineHits.
+     * @member {number} subtreeQuarantineHits
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.subtreeQuarantineHits = 0;
+
+    /**
+     * ResourceMetricsFrame offWinnerChildRequests.
+     * @member {number} offWinnerChildRequests
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.offWinnerChildRequests = 0;
+
+    /**
+     * ResourceMetricsFrame winnerHost.
+     * @member {string|null|undefined} winnerHost
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.winnerHost = null;
+
+    /**
+     * ResourceMetricsFrame slowestCircuit.
+     * @member {string|null|undefined} slowestCircuit
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.slowestCircuit = null;
+
+    /**
+     * ResourceMetricsFrame lateThrottles.
+     * @member {number} lateThrottles
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.lateThrottles = 0;
+
+    /**
+     * ResourceMetricsFrame outlierIsolations.
+     * @member {number} outlierIsolations
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.outlierIsolations = 0;
+
     // OneOf field names bound to virtual getters and setters
     let $oneOfFields;
 
     // Virtual OneOf for proto3 optional field
     Object.defineProperty(ResourceMetricsFrame.prototype, "_currentNodeHost", {
         get: $util.oneOfGetter($oneOfFields = ["currentNodeHost"]),
+        set: $util.oneOfSetter($oneOfFields)
+    });
+
+    // Virtual OneOf for proto3 optional field
+    Object.defineProperty(ResourceMetricsFrame.prototype, "_winnerHost", {
+        get: $util.oneOfGetter($oneOfFields = ["winnerHost"]),
+        set: $util.oneOfSetter($oneOfFields)
+    });
+
+    // Virtual OneOf for proto3 optional field
+    Object.defineProperty(ResourceMetricsFrame.prototype, "_slowestCircuit", {
+        get: $util.oneOfGetter($oneOfFields = ["slowestCircuit"]),
         set: $util.oneOfSetter($oneOfFields)
     });
 
@@ -470,6 +563,24 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             writer.uint32(/* id 11, wireType 0 =*/88).uint32(message.throttleCount);
         if (message.timeoutCount != null && Object.hasOwnProperty.call(message, "timeoutCount"))
             writer.uint32(/* id 12, wireType 0 =*/96).uint32(message.timeoutCount);
+        if (message.throttleRatePerSec != null && Object.hasOwnProperty.call(message, "throttleRatePerSec"))
+            writer.uint32(/* id 13, wireType 1 =*/105).double(message.throttleRatePerSec);
+        if (message.phantomPoolDepth != null && Object.hasOwnProperty.call(message, "phantomPoolDepth"))
+            writer.uint32(/* id 14, wireType 0 =*/112).uint32(message.phantomPoolDepth);
+        if (message.subtreeReroutes != null && Object.hasOwnProperty.call(message, "subtreeReroutes"))
+            writer.uint32(/* id 15, wireType 0 =*/120).uint32(message.subtreeReroutes);
+        if (message.subtreeQuarantineHits != null && Object.hasOwnProperty.call(message, "subtreeQuarantineHits"))
+            writer.uint32(/* id 16, wireType 0 =*/128).uint32(message.subtreeQuarantineHits);
+        if (message.offWinnerChildRequests != null && Object.hasOwnProperty.call(message, "offWinnerChildRequests"))
+            writer.uint32(/* id 17, wireType 0 =*/136).uint32(message.offWinnerChildRequests);
+        if (message.winnerHost != null && Object.hasOwnProperty.call(message, "winnerHost"))
+            writer.uint32(/* id 18, wireType 2 =*/146).string(message.winnerHost);
+        if (message.slowestCircuit != null && Object.hasOwnProperty.call(message, "slowestCircuit"))
+            writer.uint32(/* id 19, wireType 2 =*/154).string(message.slowestCircuit);
+        if (message.lateThrottles != null && Object.hasOwnProperty.call(message, "lateThrottles"))
+            writer.uint32(/* id 20, wireType 0 =*/160).uint32(message.lateThrottles);
+        if (message.outlierIsolations != null && Object.hasOwnProperty.call(message, "outlierIsolations"))
+            writer.uint32(/* id 21, wireType 0 =*/168).uint32(message.outlierIsolations);
         return writer;
     };
 
@@ -554,6 +665,42 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
                     message.timeoutCount = reader.uint32();
                     break;
                 }
+            case 13: {
+                    message.throttleRatePerSec = reader.double();
+                    break;
+                }
+            case 14: {
+                    message.phantomPoolDepth = reader.uint32();
+                    break;
+                }
+            case 15: {
+                    message.subtreeReroutes = reader.uint32();
+                    break;
+                }
+            case 16: {
+                    message.subtreeQuarantineHits = reader.uint32();
+                    break;
+                }
+            case 17: {
+                    message.offWinnerChildRequests = reader.uint32();
+                    break;
+                }
+            case 18: {
+                    message.winnerHost = reader.string();
+                    break;
+                }
+            case 19: {
+                    message.slowestCircuit = reader.string();
+                    break;
+                }
+            case 20: {
+                    message.lateThrottles = reader.uint32();
+                    break;
+                }
+            case 21: {
+                    message.outlierIsolations = reader.uint32();
+                    break;
+                }
             default:
                 reader.skipType(tag & 7);
                 break;
@@ -628,6 +775,37 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
         if (message.timeoutCount != null && message.hasOwnProperty("timeoutCount"))
             if (!$util.isInteger(message.timeoutCount))
                 return "timeoutCount: integer expected";
+        if (message.throttleRatePerSec != null && message.hasOwnProperty("throttleRatePerSec"))
+            if (typeof message.throttleRatePerSec !== "number")
+                return "throttleRatePerSec: number expected";
+        if (message.phantomPoolDepth != null && message.hasOwnProperty("phantomPoolDepth"))
+            if (!$util.isInteger(message.phantomPoolDepth))
+                return "phantomPoolDepth: integer expected";
+        if (message.subtreeReroutes != null && message.hasOwnProperty("subtreeReroutes"))
+            if (!$util.isInteger(message.subtreeReroutes))
+                return "subtreeReroutes: integer expected";
+        if (message.subtreeQuarantineHits != null && message.hasOwnProperty("subtreeQuarantineHits"))
+            if (!$util.isInteger(message.subtreeQuarantineHits))
+                return "subtreeQuarantineHits: integer expected";
+        if (message.offWinnerChildRequests != null && message.hasOwnProperty("offWinnerChildRequests"))
+            if (!$util.isInteger(message.offWinnerChildRequests))
+                return "offWinnerChildRequests: integer expected";
+        if (message.winnerHost != null && message.hasOwnProperty("winnerHost")) {
+            properties._winnerHost = 1;
+            if (!$util.isString(message.winnerHost))
+                return "winnerHost: string expected";
+        }
+        if (message.slowestCircuit != null && message.hasOwnProperty("slowestCircuit")) {
+            properties._slowestCircuit = 1;
+            if (!$util.isString(message.slowestCircuit))
+                return "slowestCircuit: string expected";
+        }
+        if (message.lateThrottles != null && message.hasOwnProperty("lateThrottles"))
+            if (!$util.isInteger(message.lateThrottles))
+                return "lateThrottles: integer expected";
+        if (message.outlierIsolations != null && message.hasOwnProperty("outlierIsolations"))
+            if (!$util.isInteger(message.outlierIsolations))
+                return "outlierIsolations: integer expected";
         return null;
     };
 
@@ -688,6 +866,24 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             message.throttleCount = object.throttleCount >>> 0;
         if (object.timeoutCount != null)
             message.timeoutCount = object.timeoutCount >>> 0;
+        if (object.throttleRatePerSec != null)
+            message.throttleRatePerSec = Number(object.throttleRatePerSec);
+        if (object.phantomPoolDepth != null)
+            message.phantomPoolDepth = object.phantomPoolDepth >>> 0;
+        if (object.subtreeReroutes != null)
+            message.subtreeReroutes = object.subtreeReroutes >>> 0;
+        if (object.subtreeQuarantineHits != null)
+            message.subtreeQuarantineHits = object.subtreeQuarantineHits >>> 0;
+        if (object.offWinnerChildRequests != null)
+            message.offWinnerChildRequests = object.offWinnerChildRequests >>> 0;
+        if (object.winnerHost != null)
+            message.winnerHost = String(object.winnerHost);
+        if (object.slowestCircuit != null)
+            message.slowestCircuit = String(object.slowestCircuit);
+        if (object.lateThrottles != null)
+            message.lateThrottles = object.lateThrottles >>> 0;
+        if (object.outlierIsolations != null)
+            message.outlierIsolations = object.outlierIsolations >>> 0;
         return message;
     };
 
@@ -728,6 +924,13 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             object.nodeFailovers = 0;
             object.throttleCount = 0;
             object.timeoutCount = 0;
+            object.throttleRatePerSec = 0;
+            object.phantomPoolDepth = 0;
+            object.subtreeReroutes = 0;
+            object.subtreeQuarantineHits = 0;
+            object.offWinnerChildRequests = 0;
+            object.lateThrottles = 0;
+            object.outlierIsolations = 0;
         }
         if (message.processCpuPercent != null && message.hasOwnProperty("processCpuPercent"))
             object.processCpuPercent = options.json && !isFinite(message.processCpuPercent) ? String(message.processCpuPercent) : message.processCpuPercent;
@@ -765,6 +968,30 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             object.throttleCount = message.throttleCount;
         if (message.timeoutCount != null && message.hasOwnProperty("timeoutCount"))
             object.timeoutCount = message.timeoutCount;
+        if (message.throttleRatePerSec != null && message.hasOwnProperty("throttleRatePerSec"))
+            object.throttleRatePerSec = options.json && !isFinite(message.throttleRatePerSec) ? String(message.throttleRatePerSec) : message.throttleRatePerSec;
+        if (message.phantomPoolDepth != null && message.hasOwnProperty("phantomPoolDepth"))
+            object.phantomPoolDepth = message.phantomPoolDepth;
+        if (message.subtreeReroutes != null && message.hasOwnProperty("subtreeReroutes"))
+            object.subtreeReroutes = message.subtreeReroutes;
+        if (message.subtreeQuarantineHits != null && message.hasOwnProperty("subtreeQuarantineHits"))
+            object.subtreeQuarantineHits = message.subtreeQuarantineHits;
+        if (message.offWinnerChildRequests != null && message.hasOwnProperty("offWinnerChildRequests"))
+            object.offWinnerChildRequests = message.offWinnerChildRequests;
+        if (message.winnerHost != null && message.hasOwnProperty("winnerHost")) {
+            object.winnerHost = message.winnerHost;
+            if (options.oneofs)
+                object._winnerHost = "winnerHost";
+        }
+        if (message.slowestCircuit != null && message.hasOwnProperty("slowestCircuit")) {
+            object.slowestCircuit = message.slowestCircuit;
+            if (options.oneofs)
+                object._slowestCircuit = "slowestCircuit";
+        }
+        if (message.lateThrottles != null && message.hasOwnProperty("lateThrottles"))
+            object.lateThrottles = message.lateThrottles;
+        if (message.outlierIsolations != null && message.hasOwnProperty("outlierIsolations"))
+            object.outlierIsolations = message.outlierIsolations;
         return object;
     };
 

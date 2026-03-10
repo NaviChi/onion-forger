@@ -245,7 +245,8 @@ impl CrawlerAdapter for IncRansomAdapter {
                         f.record_success(cid, 4096, start_time.elapsed().as_millis() as u64);
 
                         if let Ok(resp) = &resp_result {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            if let Some(delay) =
+                                ddos_guard.record_response_legacy(resp.status().as_u16())
                             {
                                 tokio::time::sleep(delay).await;
                             }

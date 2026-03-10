@@ -6,7 +6,7 @@ async fn main() {
         .build(tauri::generate_context!())
         .expect("build tauri app");
 
-    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 1)
+    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 2, 2)
         .await
         .unwrap();
 

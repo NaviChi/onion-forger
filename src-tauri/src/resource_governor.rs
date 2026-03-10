@@ -1,6 +1,12 @@
 use crate::io_vanguard::DirectIoPolicy;
 use crate::runtime_metrics::RuntimeTelemetry;
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::{
+    collections::HashMap,
+    process::Command,
+    sync::{Mutex, OnceLock},
+};
 use sysinfo::{DiskKind, Disks, Pid, ProcessesToUpdate, System};
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -417,7 +423,24 @@ pub fn recommend_listing_budget(
     let profile = detect_profile(None);
     let snapshot = sample_runtime_snapshot(telemetry);
     let pressure = measure_pressure(&profile, &snapshot);
+    listing_budget_for_profile(
+        active_clients,
+        permit_budget,
+        is_onion,
+        reserve_for_downloads,
+        &profile,
+        pressure,
+    )
+}
 
+fn listing_budget_for_profile(
+    active_clients: usize,
+    permit_budget: usize,
+    is_onion: bool,
+    reserve_for_downloads: bool,
+    profile: &ResourceGovernorProfile,
+    pressure: GovernorPressure,
+) -> ListingBudget {
     let limit = permit_budget.max(1);
     let base = if is_onion {
         if reserve_for_downloads {
@@ -484,8 +507,32 @@ pub fn recommend_download_budget(
     let profile = detect_profile(output_path);
     let snapshot = sample_runtime_snapshot(telemetry);
     let pressure = measure_pressure(&profile, &snapshot);
+    download_budget_for_profile(
+        requested_circuits,
+        content_length,
+        is_onion,
+        &profile,
+        pressure,
+    )
+}
 
-    let base_cap: usize = match profile.storage_class {
+fn download_budget_for_profile(
+    requested_circuits: usize,
+    content_length: Option<u64>,
+    is_onion: bool,
+    profile: &ResourceGovernorProfile,
+    pressure: GovernorPressure,
+) -> DownloadBudget {
+    let download_storage_class = if is_onion && content_length.is_none() {
+        match profile.storage_class {
+            StorageClass::Nvme => StorageClass::Ssd,
+            other => other,
+        }
+    } else {
+        profile.storage_class
+    };
+
+    let base_cap: usize = match download_storage_class {
         StorageClass::Hdd => 8,
         StorageClass::Ssd => 16,
         StorageClass::Nvme => 24,
@@ -505,7 +552,7 @@ pub fn recommend_download_budget(
         _ => onion_cap,
     };
 
-    let circuit_cap = apply_pressure_to_budget(
+    let mut circuit_cap = apply_pressure_to_budget(
         requested_circuits
             .max(1)
             .min(onion_cap)
@@ -513,10 +560,28 @@ pub fn recommend_download_budget(
         1,
         onion_cap.max(1),
         pressure.total_pressure,
-        matches!(profile.storage_class, StorageClass::Nvme),
+        matches!(download_storage_class, StorageClass::Nvme),
     );
 
-    let small_file_parallelism = match profile.storage_class {
+    // Hidden-service batch downloads benefit from NVMe-class lane sizing, but not from
+    // blindly expanding the first-wave circuit spray beyond the proven stable cap.
+    if is_onion && content_length.is_none() {
+        let onion_batch_cap = env_cap("CRAWLI_ONION_BATCH_CIRCUIT_CAP_MAX")
+            .unwrap_or(16)
+            .clamp(8, 24);
+        circuit_cap = circuit_cap.min(onion_batch_cap);
+    }
+
+    // Large direct clearnet artifacts saturate sooner than hidden-service files on this path.
+    // Keep the default direct-file fan-out below the point where handshake churn dominates.
+    if !is_onion && content_length.unwrap_or(0) >= GIB {
+        let clearnet_large_cap = env_cap("CRAWLI_CLEARNET_LARGE_CIRCUIT_CAP_MAX")
+            .unwrap_or(32)
+            .clamp(8, 48);
+        circuit_cap = circuit_cap.min(clearnet_large_cap);
+    }
+
+    let small_file_parallelism = match download_storage_class {
         StorageClass::Hdd => circuit_cap.min(4),
         StorageClass::Ssd => circuit_cap.min(8),
         StorageClass::Nvme => circuit_cap.min(12),
@@ -524,7 +589,7 @@ pub fn recommend_download_budget(
     }
     .max(1);
 
-    let initial_active_cap = match profile.storage_class {
+    let initial_active_cap = match download_storage_class {
         StorageClass::Hdd => circuit_cap.min(4),
         StorageClass::Ssd => circuit_cap.min(10),
         StorageClass::Nvme => circuit_cap.min(16),
@@ -532,7 +597,7 @@ pub fn recommend_download_budget(
     }
     .max(1);
 
-    let tournament_cap = match profile.storage_class {
+    let tournament_cap = match download_storage_class {
         StorageClass::Hdd => (circuit_cap + (circuit_cap / 4).max(1)).min(10),
         StorageClass::Ssd => (circuit_cap + (circuit_cap / 2).max(1)).min(24),
         StorageClass::Nvme => (circuit_cap + (circuit_cap / 2).max(2)).min(36),
@@ -633,13 +698,18 @@ fn recommend_arti_cap_with_storage(
 }
 
 fn detect_storage_class(output_path: Option<&Path>) -> StorageClass {
-    let Some(path) = output_path else {
+    #[cfg(target_os = "macos")]
+    let path = output_path.unwrap_or_else(|| Path::new("/"));
+    #[cfg(not(target_os = "macos"))]
+    let Some(path) = output_path
+    else {
         return StorageClass::Unknown;
     };
 
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let disks = Disks::new_with_refreshed_list();
     let mut best_match: Option<(DiskKind, String)> = None;
+    let mut best_mount: Option<std::path::PathBuf> = None;
     let mut best_len = 0usize;
 
     for disk in disks.list() {
@@ -652,11 +722,12 @@ fn detect_storage_class(output_path: Option<&Path>) -> StorageClass {
                     disk.kind(),
                     disk.name().to_string_lossy().to_ascii_lowercase(),
                 ));
+                best_mount = Some(mount.to_path_buf());
             }
         }
     }
 
-    match best_match {
+    let detected = match best_match {
         Some((DiskKind::HDD, _)) => StorageClass::Hdd,
         Some((DiskKind::SSD, name)) => {
             if name.contains("nvme") || name.contains("raid") {
@@ -667,7 +738,105 @@ fn detect_storage_class(output_path: Option<&Path>) -> StorageClass {
         }
         Some((_, name)) if name.contains("nvme") => StorageClass::Nvme,
         _ => StorageClass::Unknown,
+    };
+
+    #[cfg(target_os = "macos")]
+    if let Some(fallback) =
+        macos_storage_class_fallback(best_mount.as_deref().unwrap_or_else(|| Path::new("/")))
+    {
+        if storage_class_rank(fallback) > storage_class_rank(detected) {
+            return fallback;
+        }
     }
+
+    detected
+}
+
+fn storage_class_rank(class: StorageClass) -> u8 {
+    match class {
+        StorageClass::Unknown => 0,
+        StorageClass::Hdd => 1,
+        StorageClass::Ssd => 2,
+        StorageClass::Nvme => 3,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_storage_class_fallback(path: &Path) -> Option<StorageClass> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<StorageClass>>>> = OnceLock::new();
+
+    let key = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(&key) {
+            return *cached;
+        }
+    }
+
+    let detected = macos_diskutil_storage_class(path);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, detected);
+    }
+    detected
+}
+
+#[cfg(target_os = "macos")]
+fn macos_diskutil_storage_class(path: &Path) -> Option<StorageClass> {
+    let output = Command::new("diskutil")
+        .arg("info")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_macos_diskutil_storage_class(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_diskutil_storage_class(output: &str) -> Option<StorageClass> {
+    let mut solid_state: Option<bool> = None;
+    let mut protocol = String::new();
+    let mut media_type = String::new();
+
+    for line in output.lines() {
+        if !line.contains(':') {
+            continue;
+        }
+        let mut parts = line.splitn(2, ':');
+        let key = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let value = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        match key.as_str() {
+            "solid state" => {
+                solid_state = Some(matches!(value.as_str(), "yes" | "true"));
+            }
+            "protocol" => protocol = value,
+            "media type" => media_type = value,
+            _ => {}
+        }
+    }
+
+    if solid_state == Some(false) {
+        return Some(StorageClass::Hdd);
+    }
+
+    let nvme_like = protocol.contains("nvme")
+        || protocol.contains("apple fabric")
+        || media_type.contains("nvme");
+    if nvme_like {
+        return Some(StorageClass::Nvme);
+    }
+
+    if solid_state == Some(true) || media_type.contains("ssd") {
+        return Some(StorageClass::Ssd);
+    }
+
+    None
 }
 
 fn env_cap(name: &str) -> Option<usize> {
@@ -704,11 +873,31 @@ fn apply_pressure_to_budget(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::parse_macos_diskutil_storage_class;
     use super::{
-        apply_pressure_to_budget, measure_pressure, recommend_arti_cap,
-        recommend_arti_cap_with_storage, recommend_download_budget, recommend_listing_budget,
-        GovernorPressure, ResourceGovernorProfile, RuntimeGovernorSnapshot, StorageClass,
+        apply_pressure_to_budget, download_budget_for_profile, listing_budget_for_profile,
+        measure_pressure, recommend_arti_cap, recommend_arti_cap_with_storage,
+        recommend_download_budget, GovernorPressure, ResourceGovernorProfile,
+        RuntimeGovernorSnapshot, StorageClass, GIB,
     };
+
+    fn synthetic_profile(storage_class: StorageClass) -> ResourceGovernorProfile {
+        ResourceGovernorProfile {
+            cpu_cores: 8,
+            total_memory_bytes: 16 * GIB,
+            available_memory_bytes: 8 * GIB,
+            storage_class,
+            recommended_arti_cap: 12,
+            recommended_quorum: 4,
+            direct_io_policy: match storage_class {
+                StorageClass::Hdd => crate::io_vanguard::DirectIoPolicy::Off,
+                StorageClass::Ssd | StorageClass::Nvme | StorageClass::Unknown => {
+                    crate::io_vanguard::DirectIoPolicy::Auto
+                }
+            },
+        }
+    }
 
     #[test]
     fn low_resource_hosts_cap_low() {
@@ -773,20 +962,66 @@ mod tests {
 
     #[test]
     fn listing_budget_stays_conservative_on_hdd() {
-        let budget = recommend_listing_budget(12, 64, true, true, None);
+        let budget = listing_budget_for_profile(
+            12,
+            64,
+            true,
+            true,
+            &synthetic_profile(StorageClass::Hdd),
+            GovernorPressure::default(),
+        );
         assert!(budget.worker_cap <= 8);
     }
 
     #[test]
     fn download_budget_caps_small_file_parallelism() {
-        let budget = recommend_download_budget(24, Some(32 * 1024 * 1024), true, None, None);
+        let budget = download_budget_for_profile(
+            24,
+            Some(32 * 1024 * 1024),
+            true,
+            &synthetic_profile(StorageClass::Hdd),
+            GovernorPressure::default(),
+        );
         assert!(budget.circuit_cap <= 4);
         assert!(budget.small_file_parallelism <= budget.circuit_cap);
+    }
+
+    #[test]
+    fn onion_batch_budget_keeps_first_wave_capped() {
+        let budget = recommend_download_budget(120, None, true, None, None);
+        assert!(budget.circuit_cap <= 16);
+    }
+
+    #[test]
+    fn clearnet_large_download_budget_caps_nvme_fanout() {
+        let budget = download_budget_for_profile(
+            120,
+            Some(10 * GIB),
+            false,
+            &synthetic_profile(StorageClass::Nvme),
+            GovernorPressure::default(),
+        );
+        assert!(budget.circuit_cap <= 32);
+        assert!(budget.initial_active_cap <= budget.circuit_cap);
     }
 
     #[test]
     fn governor_pressure_defaults_are_stable() {
         let pressure = GovernorPressure::default();
         assert_eq!(pressure.total_pressure, 0.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_diskutil_parser_detects_nvme_ssd() {
+        let sample = r#"
+   Media Type:                Generic
+   Protocol:                  Apple Fabric
+   Solid State:               Yes
+"#;
+        assert_eq!(
+            parse_macos_diskutil_storage_class(sample),
+            Some(StorageClass::Nvme)
+        );
     }
 }

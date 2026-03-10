@@ -13,7 +13,7 @@ pub struct GenesisAdapter;
 impl CrawlerAdapter for GenesisAdapter {
     async fn can_handle(&self, fingerprint: &SiteFingerprint) -> bool {
         let url_lower = fingerprint.url.to_ascii_lowercase();
-        url_lower.contains("genesis6ixpb5mcy4kudybtw5op2wqlrkocfogbnenz3c647ibqixiad") 
+        url_lower.contains("genesis6ixpb5mcy4kudybtw5op2wqlrkocfogbnenz3c647ibqixiad")
             || url_lower.contains("genesis")
     }
 

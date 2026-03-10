@@ -122,7 +122,7 @@ impl CrawlerAdapter for PearAdapter {
                         html = match fetch_result {
                             Ok(Ok(resp)) => {
                                 if let Some(delay) =
-                                    ddos_guard.record_response(resp.status().as_u16())
+                                    ddos_guard.record_response_legacy(resp.status().as_u16())
                                 {
                                     tokio::time::sleep(delay).await;
                                 }

@@ -168,19 +168,29 @@ impl CrawlerAdapter for ExplorerAdapter {
         let mut speculative_joinset = tokio::task::JoinSet::new();
 
         // Extract heuristic links from root body
-        let root_url = reqwest::Url::parse(&final_url)?;
-        let mut temp_links = Vec::new();
 
-        // 1. Synchronously parse DOM (scraper objects are NOT `Send`, cannot cross await boundaries)
-        {
-            let doc = scraper::Html::parse_document(&body);
+        // 1. Phase 75: Offload DOM parsing to spawn_blocking for large HTML (scraper objects are NOT `Send`)
+        let body_for_parse = body.clone();
+        let final_url_for_parse = final_url.clone();
+        let learned_for_parse = learned.clone();
+        let temp_links = tokio::task::spawn_blocking(move || {
+            let mut links = Vec::new();
+            let doc = scraper::Html::parse_document(&body_for_parse);
             let selector = scraper::Selector::parse("a").unwrap();
+            let root_url_inner = reqwest::Url::parse(&final_url_for_parse)
+                .unwrap_or_else(|_| reqwest::Url::parse("http://localhost/").unwrap());
             for element in doc.select(&selector) {
                 if let Some(href) = element.value().attr("href") {
-                    if let Ok(joined) = root_url.join(href) {
+                    if let Ok(joined) = root_url_inner.join(href) {
                         let text = element.text().collect::<Vec<_>>().join(" ");
-                        let score = calculate_link_score(&joined, &final_url, &text, 1, &learned);
-                        temp_links.push(ScoredLink {
+                        let score = calculate_link_score(
+                            &joined,
+                            &final_url_for_parse,
+                            &text,
+                            1,
+                            &learned_for_parse,
+                        );
+                        links.push(ScoredLink {
                             score,
                             url: joined.to_string(),
                             depth: 1,
@@ -188,7 +198,10 @@ impl CrawlerAdapter for ExplorerAdapter {
                     }
                 }
             }
-        }
+            links
+        })
+        .await
+        .unwrap_or_default();
 
         // 2. Safely push extracted links into the Async Mutex Queue
         let mut queue_lock = queue.lock().await;

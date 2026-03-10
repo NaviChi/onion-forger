@@ -45,8 +45,10 @@ pub fn detect_input_mode(input: &str) -> &'static str {
         "mega"
     } else if is_magnet_link(input) || is_torrent_file(input) {
         "torrent"
-    } else {
+    } else if crate::url_targets_onion(input) {
         "onion"
+    } else {
+        "direct"
     }
 }
 
@@ -461,7 +463,13 @@ mod tests {
         assert_eq!(detect_input_mode("magnet:?xt=urn:btih:abc"), "torrent");
         assert_eq!(detect_input_mode("/tmp/test.torrent"), "torrent");
         assert_eq!(detect_input_mode("http://example.onion/files/"), "onion");
-        assert_eq!(detect_input_mode("https://google.com"), "onion");
+        assert_eq!(detect_input_mode("https://google.com"), "direct");
+        assert_eq!(
+            detect_input_mode(
+                "https://cdn.breachforums.as/pay_or_leak/shouldve_paid_the_ransom_pathstone.com_shinyhunters.7z"
+            ),
+            "direct"
+        );
     }
 
     #[test]

@@ -292,33 +292,37 @@ impl CrawlerAdapter for AlphaLockerAdapter {
                             f.get_client()
                         };
                         let (retry_cid2, retry_client2) = f.get_client();
-                        
+
                         let next_url_clone1 = next_url.clone();
                         let next_url_clone2 = next_url.clone();
-                        
+
                         let req1 = Box::pin(async move {
                             let res = tokio::time::timeout(
                                 std::time::Duration::from_secs(45),
                                 retry_client1.get(&next_url_clone1).send(),
-                            ).await;
+                            )
+                            .await;
                             (retry_cid1, res)
                         });
-                        
+
                         let req2 = Box::pin(async move {
                             let res = tokio::time::timeout(
                                 std::time::Duration::from_secs(45),
                                 retry_client2.get(&next_url_clone2).send(),
-                            ).await;
+                            )
+                            .await;
                             (retry_cid2, res)
                         });
-                        
-                        let (winner_cid, fetch_result) = match futures::future::select(req1, req2).await {
-                            futures::future::Either::Left((res, _)) => res,
-                            futures::future::Either::Right((res, _)) => res,
-                        };
+
+                        let (winner_cid, fetch_result) =
+                            match futures::future::select(req1, req2).await {
+                                futures::future::Either::Left((res, _)) => res,
+                                futures::future::Either::Right((res, _)) => res,
+                            };
 
                         if let Ok(Ok(resp)) = fetch_result {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            if let Some(delay) =
+                                ddos_guard.record_response_legacy(resp.status().as_u16())
                             {
                                 tokio::time::sleep(delay).await;
                             }
@@ -389,9 +393,7 @@ impl CrawlerAdapter for AlphaLockerAdapter {
                                 let (hcid, hclient) = f.get_client();
                                 if let Ok(Ok(size_resp)) = tokio::time::timeout(
                                     std::time::Duration::from_secs(10),
-                                    hclient.get(&nf.raw_url)
-                                        .header("Range", "bytes=0-0")
-                                        .send(),
+                                    hclient.get(&nf.raw_url).header("Range", "bytes=0-0").send(),
                                 )
                                 .await
                                 {

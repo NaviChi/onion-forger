@@ -85,6 +85,7 @@ pub mod alphalocker;
 pub mod autoindex;
 pub mod dragonforce;
 pub mod explorer;
+pub mod genesis;
 pub mod inc_ransom;
 pub mod lockbit;
 pub mod nu;
@@ -95,7 +96,6 @@ pub mod qilin;
 pub mod qilin_ddos_guard;
 pub mod qilin_nodes;
 pub mod tengu;
-pub mod genesis;
 pub mod universal_explorer;
 pub mod worldleaks;
 
@@ -259,7 +259,38 @@ impl Default for AdapterRegistry {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::AdapterRegistry;
+
+    #[test]
+    fn url_hint_routes_qilin_cms_launcher() {
+        let registry = AdapterRegistry::new();
+
+        let view_adapter = registry
+            .determine_adapter_from_url_hint(
+                "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=afa2a0ea-20ba-3ddf-8c5c-2aeea9e5dc43",
+            )
+            .expect("view URL should resolve to Qilin");
+        assert_eq!(view_adapter.name(), "Qilin Nginx Autoindex / CMS");
+
+        let data_adapter = registry
+            .determine_adapter_from_url_hint(
+                "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/data?uuid=afa2a0ea-20ba-3ddf-8c5c-2aeea9e5dc43",
+            )
+            .expect("data URL should resolve to Qilin");
+        assert_eq!(data_adapter.name(), "Qilin Nginx Autoindex / CMS");
+    }
+}
+
 impl AdapterRegistry {
+    fn adapter_by_id(&self, adapter_id: &str) -> Option<&dyn CrawlerAdapter> {
+        self.adapters
+            .iter()
+            .find(|(id, _)| id == adapter_id)
+            .map(|(_, adapter)| adapter.as_ref())
+    }
+
     pub fn new() -> Self {
         Self::with_plugin_dir(None)
     }
@@ -362,11 +393,7 @@ impl AdapterRegistry {
         if let Ok(parsed_url) = reqwest::Url::parse(&fingerprint.url) {
             if let Some(domain) = parsed_url.domain() {
                 if let Some(adapter_id) = self.domain_cache.get(domain) {
-                    for (id, adapter) in &self.adapters {
-                        if id == adapter_id {
-                            return Some(adapter.as_ref());
-                        }
-                    }
+                    return self.adapter_by_id(adapter_id);
                 }
             }
         }
@@ -406,6 +433,26 @@ impl AdapterRegistry {
             if adapter.can_handle(fingerprint).await {
                 return Some(adapter.as_ref());
             }
+        }
+
+        None
+    }
+
+    pub fn determine_adapter_from_url_hint(&self, url: &str) -> Option<&dyn CrawlerAdapter> {
+        let parsed_url = reqwest::Url::parse(url).ok()?;
+
+        if let Some(domain) = parsed_url.domain() {
+            if let Some(adapter_id) = self.domain_cache.get(domain) {
+                return self.adapter_by_id(adapter_id);
+            }
+        }
+
+        let path = parsed_url.path();
+        let query = parsed_url.query().unwrap_or_default();
+        let has_uuid_query = query.contains("uuid=");
+
+        if has_uuid_query && (path.contains("/site/view") || path.contains("/site/data")) {
+            return self.adapter_by_id("qilin");
         }
 
         None

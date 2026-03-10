@@ -8,7 +8,7 @@ async fn main() {
 
     crawli_lib::tor::cleanup_stale_tor_daemons();
 
-    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 2)
+    let (swarm_guard, ports) = crawli_lib::tor::bootstrap_tor_cluster(app.handle().clone(), 2, 2)
         .await
         .unwrap();
 

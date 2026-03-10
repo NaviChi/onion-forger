@@ -1,4 +1,45 @@
-> **Last Updated:** 2026-03-09T03:36 CST
+> **Last Updated:** 2026-03-10T06:00 CDT
+
+## Phase 86C: Arti Hot-Start + Hinted Warmup Bypass (2026-03-10)
+Implemented in this pass:
+- `src-tauri/src/multi_client_pool.rs` now seeds Qilin/DragonForce follow-on pools from already-hot Arti swarm clients and derives additional slots from isolated handles instead of cold-bootstrapping a second pool.
+- `src-tauri/src/frontier.rs` + `src-tauri/src/lib.rs` now refresh live Arti clients before hinted onion execution so the crawl can use swarm expansion that happened after the initial bootstrap quorum returned.
+- `src-tauri/src/lib.rs` now skips the blocking onion warmup on strong Qilin URL-hint paths, because the same request chain also skips the network fingerprint probe.
+- `src-tauri/src/adapters/qilin_nodes.rs` now reserves first-wave Stage D space for a stable cached winner instead of letting two fresh redirect candidates crowd it out.
+
+Live validation highlights:
+- Global handoff to the Qilin adapter on the exact live CMS target dropped from `138.83s` to `71.08s` after the hinted-path warmup bypass.
+- The seeded-pool path removed the prior `~55s` `storage resolved -> first circuit hot` delay.
+- One live Stage D rerun resolved the node in `48.68s` instead of the `97.72s` direct-mirror fallback path, though root durability remains volatile after discovery.
+
+## Phase 84: Qilin Frontier Telemetry Alignment + Compact CLI Summary + Live CLI/GUI Parity (2026-03-10)
+Implemented in this pass:
+- **`src-tauri/src/frontier.rs`:** Added adapter progress overlay fields plus `progress_snapshot()` so shared crawl status can merge generic frontier counts with adapter-private pending/worker state.
+- **`src-tauri/src/adapters/qilin.rs`:** Added RAII request / pending guards that synchronize fast-path request activity into the frontier overlay and runtime telemetry. Fast-path request outcomes now count through the frontier, and success is only recorded after body decode succeeds.
+- **`src-tauri/src/lib.rs`:** Shared crawl status snapshots now consume `frontier.progress_snapshot()`. Final crawl shutdown publishes a zeroed worker-metrics resource snapshot before clearing the adapter overlay.
+- **`src-tauri/src/cli.rs`:** Added global `--progress-summary` and `--progress-summary-interval-ms` flags. The summary is rendered from the real `telemetry_bridge_update` payloads emitted by the main binary itself.
+- **Live parity validation:** Re-ran the canonical Qilin target through both the direct main-binary CLI and the live Tauri GUI on March 10, 2026.
+
+Validations:
+- `cargo check --manifest-path 'crawli/src-tauri/Cargo.toml'`
+- `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' cli::tests --quiet`
+- `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' frontier::tests --quiet`
+- Live CLI: rotated redirect `2dgrxjhee2rgibck...onion/cd6e50e2-bfe0-462e-b2c8-bb51993acd87/`, summary advanced to `workers=1/8`, final `processed=1`
+- Live GUI: rotated redirect `x54h7i3afmu6clyg...onion/0edc707e-1d39-459a-a424-ee0b0c7d05f2/`, same bootstrap/fingerprint/Qilin discovery path reached on the actual Tauri window
+
+## Phase 83: First-Class Main-Binary CLI Mode (2026-03-10)
+Implemented in this pass:
+- **`src-tauri/src/cli.rs`:** Added a first-class CLI dispatcher to the primary `crawli` binary. Supported subcommands now cover crawl execution, download operations, adapter catalog inspection, input detection, VFS-backed queries, subtree heatmap reads, telemetry toggles, and network-disk fetch helpers through the real backend.
+- **`src-tauri/src/lib.rs`:** Split startup into `install_runtime_prereqs()`, shared `tauri_context()`, GUI `run_gui()`, and CLI-aware `run()`. Added reusable blocking helpers for single-file downloads and onion pre-resolve so the CLI path can reuse real backend logic without GUI-detached behavior.
+- **Headless AppHandle Reuse:** The CLI path builds a headless Tauri `AppHandle`, manages the same `AppState`, starts the runtime metrics + telemetry bridge emitters, and calls the existing backend functions directly instead of spawning a separate helper binary.
+- **CLI Event Streaming Policy:** Default stderr mirrors actionable app-native logs/statuses. `telemetry_bridge_update` is now opt-in via `--include-telemetry-events` to avoid flooding human operators during live runs.
+
+Validations:
+- `cargo check --manifest-path 'crawli/src-tauri/Cargo.toml'`
+- `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' cli::tests`
+- `cargo run --quiet --manifest-path 'crawli/src-tauri/Cargo.toml' -- adapter-catalog --compact-json`
+- `cargo run --quiet --manifest-path 'crawli/src-tauri/Cargo.toml' -- detect-input-mode --input 'http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=f0668431-ee3f-3570-99cb-ea7d9c0691c6' --compact-json`
+- Live main-binary Qilin crawl reached real rotated storage discovery and recursive child parsing under `crawli/tmp/live_cli_qilin_f0668431`
 
 ## Phase 74E: Start Queue Renderer Stability (2026-03-09)
 Implemented in this pass:
@@ -357,7 +398,7 @@ Implemented in this pass:
   - current Windows `DIR /S`-style
   - best canonical
   - best Windows `DIR /S`-style
-- Added timestamped crawl-history listing snapshots under `temp_onionforge_forger/targets/<target_key>/crawl_history/`
+- Added timestamped crawl-history listing snapshots under `<selected_output>/targets/<target_key>/crawl_history/`
 - Added baseline-aware crawl finalization in `lib.rs`: repeat runs now compare raw count, prior best count, and merged effective count before choosing `first_run`, `matched_best`, `exceeded_best`, or `degraded`
 - Added bounded same-session catch-up retry in `lib.rs` when a crawl underperforms the best prior result and runtime telemetry shows instability
 - Added failure-first download planning from the authoritative best crawl snapshot instead of relying only on the transient in-memory VFS queue
@@ -408,7 +449,7 @@ Implemented behavior:
   - Batch classifier uses `size_hint` first and only probes entries without known size.
   - Emits `download_batch_started` with total file count and listing-size hints.
   - Emits enriched `batch_progress` with completed/failed totals for aggregate UI tracking.
-  - Stores support artifacts under `<output_root>/temp_onionforge_forger` (manifest, sidecars, downloader logs/state, VFS db).
+  - Stores support artifacts under a hidden sibling root: `<output_root_parent>/.onionforge_support/<support_key>/` (manifest/index, downloader support files, and future non-payload state).
 - Backend frontier/scaling:
   - Worker permit cap derived from configured circuits.
   - AIMD initial window starts at configured circuit ceiling.

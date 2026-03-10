@@ -117,7 +117,8 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
                         if let Ok(Ok(resp)) =
                             tokio::time::timeout(std::time::Duration::from_secs(45), req).await
                         {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            if let Some(delay) =
+                                ddos_guard.record_response_legacy(resp.status().as_u16())
                             {
                                 tokio::time::sleep(delay).await;
                             }

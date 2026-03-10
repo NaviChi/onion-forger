@@ -59,6 +59,25 @@ pub struct ResourceMetricsFrame {
     pub throttle_count: u32,
     #[prost(uint32, tag = "12")]
     pub timeout_count: u32,
+    // Phase 76: DDoS guard telemetry
+    #[prost(double, tag = "13")]
+    pub throttle_rate_per_sec: f64,
+    #[prost(uint32, tag = "14")]
+    pub phantom_pool_depth: u32,
+    #[prost(uint32, tag = "15")]
+    pub subtree_reroutes: u32,
+    #[prost(uint32, tag = "16")]
+    pub subtree_quarantine_hits: u32,
+    #[prost(uint32, tag = "17")]
+    pub off_winner_child_requests: u32,
+    #[prost(string, optional, tag = "18")]
+    pub winner_host: Option<String>,
+    #[prost(string, optional, tag = "19")]
+    pub slowest_circuit: Option<String>,
+    #[prost(uint32, tag = "20")]
+    pub late_throttles: u32,
+    #[prost(uint32, tag = "21")]
+    pub outlier_isolations: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -170,7 +189,9 @@ pub fn emit_frame(kind: EventKind, payload: impl Message) {
             if let Ok(mut sink) = file_mutex.lock() {
                 let _ = sink.file.write_all(&encoded);
                 sink.pending_frames = std::cmp::max(sink.pending_frames + 1, 1);
-                if sink.pending_frames >= 16 || sink.last_flush.elapsed() >= Duration::from_millis(250) {
+                if sink.pending_frames >= 16
+                    || sink.last_flush.elapsed() >= Duration::from_millis(250)
+                {
                     let _ = sink.file.flush();
                     sink.pending_frames = 0;
                     sink.last_flush = Instant::now();
@@ -185,4 +206,59 @@ fn unix_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_metrics_frame_round_trips_subtree_counters() {
+        let payload = ResourceMetricsFrame {
+            process_cpu_percent: 3.5,
+            process_memory_bytes: 1024,
+            system_memory_used_bytes: 2048,
+            system_memory_total_bytes: 4096,
+            active_workers: 6,
+            worker_target: 16,
+            active_circuits: 4,
+            peak_active_circuits: 8,
+            current_node_host: Some("winner.onion".to_string()),
+            node_failovers: 2,
+            throttle_count: 1,
+            timeout_count: 0,
+            throttle_rate_per_sec: 0.25,
+            phantom_pool_depth: 5,
+            subtree_reroutes: 7,
+            subtree_quarantine_hits: 3,
+            off_winner_child_requests: 1,
+            winner_host: Some("winner.onion".to_string()),
+            slowest_circuit: Some("c7:8450ms".to_string()),
+            late_throttles: 2,
+            outlier_isolations: 1,
+        };
+        let frame = TelemetryFrame {
+            ts_ms: 42,
+            kind: EventKind::ResourceMetrics as u32,
+            payload: payload.encode_to_vec(),
+        };
+        let encoded = frame.encode_length_delimited_to_vec();
+
+        let decoded_frame = TelemetryFrame::decode_length_delimited(encoded.as_slice()).unwrap();
+        let decoded_payload =
+            ResourceMetricsFrame::decode(decoded_frame.payload.as_slice()).unwrap();
+
+        assert_eq!(decoded_payload.throttle_rate_per_sec, 0.25);
+        assert_eq!(decoded_payload.phantom_pool_depth, 5);
+        assert_eq!(decoded_payload.subtree_reroutes, 7);
+        assert_eq!(decoded_payload.subtree_quarantine_hits, 3);
+        assert_eq!(decoded_payload.off_winner_child_requests, 1);
+        assert_eq!(decoded_payload.winner_host.as_deref(), Some("winner.onion"));
+        assert_eq!(
+            decoded_payload.slowest_circuit.as_deref(),
+            Some("c7:8450ms")
+        );
+        assert_eq!(decoded_payload.late_throttles, 2);
+        assert_eq!(decoded_payload.outlier_isolations, 1);
+    }
 }

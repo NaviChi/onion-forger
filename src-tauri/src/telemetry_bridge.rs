@@ -242,6 +242,16 @@ pub(crate) fn publish_resource_metrics(app: &AppHandle, snapshot: ResourceMetric
             node_failovers: snapshot.node_failovers as u32,
             throttle_count: snapshot.throttle_count as u32,
             timeout_count: snapshot.timeout_count as u32,
+            // Phase 76: DDoS guard telemetry
+            throttle_rate_per_sec: snapshot.throttle_rate_per_sec,
+            phantom_pool_depth: snapshot.phantom_pool_depth as u32,
+            subtree_reroutes: snapshot.subtree_reroutes as u32,
+            subtree_quarantine_hits: snapshot.subtree_quarantine_hits as u32,
+            off_winner_child_requests: snapshot.off_winner_child_requests as u32,
+            winner_host: snapshot.winner_host.clone(),
+            slowest_circuit: snapshot.slowest_circuit.clone(),
+            late_throttles: snapshot.late_throttles as u32,
+            outlier_isolations: snapshot.outlier_isolations as u32,
         },
     );
 

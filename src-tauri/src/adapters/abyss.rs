@@ -309,7 +309,8 @@ impl CrawlerAdapter for AbyssAdapter {
                         )
                         .await
                         {
-                            if let Some(delay) = ddos_guard.record_response(resp.status().as_u16())
+                            if let Some(delay) =
+                                ddos_guard.record_response_legacy(resp.status().as_u16())
                             {
                                 tokio::time::sleep(delay).await;
                             }

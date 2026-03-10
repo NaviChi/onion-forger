@@ -1,4 +1,5 @@
 use crate::adapters::FileEntry;
+use crate::subtree_heatmap::SubtreeHeatRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::mem;
@@ -8,6 +9,7 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct SledVfs {
     db: Arc<Mutex<Option<sled::Db>>>,
+    heatmap_tree: Arc<Mutex<Option<sled::Tree>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,6 +25,7 @@ impl Default for SledVfs {
     fn default() -> Self {
         Self {
             db: Arc::new(Mutex::new(None)),
+            heatmap_tree: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -37,9 +40,16 @@ impl SledVfs {
             .use_compression(false) // Optimize for maximum I/O throughput over disk savings
             .open()
             .context("Failed to open aerospace-grade sled database")?;
-            
+
+        // Phase 75: Open a dedicated named tree for persistent subtree heatmap indices
+        let heatmap = db
+            .open_tree("heatmap")
+            .context("Failed to open heatmap tree")?;
+
         let mut guard = self.db.lock().await;
         *guard = Some(db);
+        let mut hm_guard = self.heatmap_tree.lock().await;
+        *hm_guard = Some(heatmap);
         Ok(())
     }
 
@@ -217,10 +227,11 @@ impl SledVfs {
             db.clear()?;
             db.flush_async().await?;
         }
+        // Note: heatmap tree is NOT cleared here — it persists across crawl sessions
         Ok(())
     }
 
-    // Phase 72: Aerospace-Grade Auto-Compacting VFS Ledger 
+    // Phase 72: Aerospace-Grade Auto-Compacting VFS Ledger
     // Triggers manual compaction and synchronous flush boundaries inside Sled DB memory.
     pub async fn compact_database(&self) -> Result<()> {
         let guard = self.db.lock().await;
@@ -229,5 +240,86 @@ impl SledVfs {
             db.flush_async().await?;
         }
         Ok(())
+    }
+
+    // ─── Phase 75: Persistent Subtree Heatmap Sled Index ────────────────────────
+    // Uses a dedicated named tree within the same Sled DB for crash-safe,
+    // cross-session subtree failure tracking. Survives clear() calls on the
+    // main VFS tree since heatmap data has a different lifecycle.
+
+    /// Insert or update a single heatmap record.
+    pub async fn upsert_heatmap_record(&self, record: &SubtreeHeatRecord) -> Result<()> {
+        let guard = self.heatmap_tree.lock().await;
+        if let Some(tree) = guard.as_ref() {
+            let bytes = serde_json::to_vec(record)?;
+            tree.insert(record.subtree_key.as_bytes(), bytes)?;
+            tree.flush_async().await?;
+        }
+        Ok(())
+    }
+
+    /// Batch-upsert multiple heatmap records in a single atomic write.
+    pub async fn upsert_heatmap_batch(&self, records: &[SubtreeHeatRecord]) -> Result<()> {
+        let guard = self.heatmap_tree.lock().await;
+        if let Some(tree) = guard.as_ref() {
+            let mut batch = sled::Batch::default();
+            for record in records {
+                let bytes = serde_json::to_vec(record)?;
+                batch.insert(record.subtree_key.as_bytes(), bytes);
+            }
+            tree.apply_batch(batch)?;
+            tree.flush_async().await?;
+        }
+        Ok(())
+    }
+
+    /// Load all heatmap records from the persistent Sled tree.
+    pub async fn load_heatmap_records(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, SubtreeHeatRecord>> {
+        let guard = self.heatmap_tree.lock().await;
+        let mut map = std::collections::BTreeMap::new();
+        if let Some(tree) = guard.as_ref() {
+            for (key_bytes, value_bytes) in tree.iter().flatten() {
+                if let Ok(record) = serde_json::from_slice::<SubtreeHeatRecord>(&value_bytes) {
+                    if let Ok(key) = String::from_utf8(key_bytes.to_vec()) {
+                        map.insert(key, record);
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// Look up a single heatmap record by subtree key.
+    pub async fn get_heatmap_record(&self, subtree_key: &str) -> Result<Option<SubtreeHeatRecord>> {
+        let guard = self.heatmap_tree.lock().await;
+        if let Some(tree) = guard.as_ref() {
+            if let Some(bytes) = tree.get(subtree_key.as_bytes())? {
+                let record: SubtreeHeatRecord = serde_json::from_slice(&bytes)?;
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Clear only the heatmap tree (used for explicit resets, NOT during normal clear()).
+    pub async fn clear_heatmap(&self) -> Result<()> {
+        let guard = self.heatmap_tree.lock().await;
+        if let Some(tree) = guard.as_ref() {
+            tree.clear()?;
+            tree.flush_async().await?;
+        }
+        Ok(())
+    }
+
+    /// Count of entries in the heatmap tree.
+    pub async fn heatmap_count(&self) -> usize {
+        let guard = self.heatmap_tree.lock().await;
+        if let Some(tree) = guard.as_ref() {
+            tree.len()
+        } else {
+            0
+        }
     }
 }

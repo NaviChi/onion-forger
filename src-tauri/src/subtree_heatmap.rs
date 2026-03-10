@@ -3,6 +3,17 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::RwLock;
+
+/// Phase 76: Global heatmap state for cross-thread `is_subtree_penalized()` access.
+struct GlobalHeatmapState {
+    active_seed_url: String,
+    heatmap: SubtreeHeatmap,
+}
+
+/// Phase 76: The global static heatmap. Populated via `install_global_heatmap()` at crawl start.
+static GLOBAL_HEATMAP: std::sync::LazyLock<RwLock<Option<GlobalHeatmapState>>> =
+    std::sync::LazyLock::new(|| RwLock::new(None));
 
 const MAX_ENTRIES: usize = 512;
 const STALE_WINDOW_SECS: u64 = 14 * 24 * 60 * 60;
@@ -112,20 +123,50 @@ impl SubtreeHeatmap {
         record.failure_score >= 4 || record.consecutive_failures >= 2
     }
 
+    /// Phase 76: Wire is_subtree_penalized() to the live global heatmap.
+    /// The global cache is populated via install_global_heatmap() at crawl start
+    /// and cleared via uninstall_global_heatmap() at crawl end.
     pub fn is_subtree_penalized(url: &str) -> bool {
-        // Global static check utility for vanguard fusion
-        lazy_static::lazy_static! {
-            static ref CACHED_HEATMAP: std::sync::Mutex<Option<SubtreeHeatmap>> = std::sync::Mutex::new(None);
-        }
-        
-        let Ok(hm) = CACHED_HEATMAP.lock() else { return false };
-        let hm = match hm.as_ref() {
+        let guard = match GLOBAL_HEATMAP.read() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let hm = match guard.as_ref() {
             Some(h) => h,
             None => return false,
         };
 
-        let Some(key) = Self::subtree_key(&hm.target_key, url) else { return false };
-        hm.should_route_to_degraded(&key)
+        let Some(key) = Self::subtree_key(&hm.active_seed_url, url) else {
+            return false;
+        };
+        hm.heatmap.should_route_to_degraded(&key)
+    }
+
+    /// Phase 76: Install the live heatmap into the global cache so
+    /// `is_subtree_penalized()` returns correct results from any thread.
+    pub fn install_global_heatmap(active_seed_url: String, heatmap: SubtreeHeatmap) {
+        if let Ok(mut guard) = GLOBAL_HEATMAP.write() {
+            *guard = Some(GlobalHeatmapState {
+                active_seed_url,
+                heatmap,
+            });
+        }
+    }
+
+    /// Phase 76: Clear the global heatmap at crawl end.
+    pub fn uninstall_global_heatmap() {
+        if let Ok(mut guard) = GLOBAL_HEATMAP.write() {
+            *guard = None;
+        }
+    }
+
+    /// Phase 76: Update the global heatmap with fresh data (called periodically during crawl).
+    pub fn refresh_global_heatmap(heatmap: &SubtreeHeatmap) {
+        if let Ok(mut guard) = GLOBAL_HEATMAP.write() {
+            if let Some(ref mut state) = *guard {
+                state.heatmap = heatmap.clone();
+            }
+        }
     }
 
     pub fn record_failure(&mut self, subtree_key: &str, kind: HeatFailureKind) {
@@ -242,5 +283,42 @@ mod tests {
         heatmap.record_failure("T/Test Logic", HeatFailureKind::Circuit);
         heatmap.record_success("T/Test Logic");
         assert!(!heatmap.should_route_to_degraded("T/Test Logic"));
+    }
+
+    #[test]
+    fn global_heatmap_lifecycle_install_refresh_uninstall() {
+        // Clean slate
+        SubtreeHeatmap::uninstall_global_heatmap();
+        assert!(!SubtreeHeatmap::is_subtree_penalized(
+            "http://x.onion/root/A/B/file.txt"
+        ));
+
+        // Install with degraded subtree
+        let mut hm = SubtreeHeatmap {
+            target_key: "test".to_string(),
+            entries: Default::default(),
+        };
+        hm.record_failure("A/B", HeatFailureKind::Timeout);
+        hm.record_failure("A/B", HeatFailureKind::Timeout);
+        SubtreeHeatmap::install_global_heatmap("http://x.onion/root/".to_string(), hm.clone());
+        assert!(SubtreeHeatmap::is_subtree_penalized(
+            "http://x.onion/root/A/B/file.txt"
+        ));
+
+        // Refresh: add success to heal the subtree
+        hm.record_success("A/B");
+        hm.record_success("A/B");
+        hm.record_success("A/B");
+        hm.record_success("A/B");
+        SubtreeHeatmap::refresh_global_heatmap(&hm);
+        assert!(!SubtreeHeatmap::is_subtree_penalized(
+            "http://x.onion/root/A/B/file.txt"
+        ));
+
+        // Uninstall: should return false for everything
+        SubtreeHeatmap::uninstall_global_heatmap();
+        assert!(!SubtreeHeatmap::is_subtree_penalized(
+            "http://x.onion/root/A/B/file.txt"
+        ));
     }
 }

@@ -5,9 +5,10 @@ import { VFSExplorer, FileEntry } from "./components/VFSExplorer";
 import { Dashboard } from "./components/Dashboard";
 import { AzureConnectivityModal } from "./components/AzureConnectivityModal";
 import { VibeLoader } from "./components/VibeLoader";
+import { HexViewer } from "./components/HexViewer";
 import { downloadDir, join } from "@tauri-apps/api/path";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp, Cloud, Magnet, ShieldAlert } from "lucide-react";
+import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp, Cloud, Magnet, ShieldAlert, HardDrive } from "lucide-react";
 import { FIXTURE_RESOURCE_METRICS, VFS_FIXTURE_STATS, isVfsFixtureMode } from "./fixtures/vfsFixture";
 
 import "./App.css";
@@ -132,14 +133,47 @@ interface ResourceMetricsSnapshot {
   timeoutCount: number;
   uptimeSeconds: number;
   consensusWeight: number;
+  swarmRuntimeLabel?: string | null;
+  swarmTrafficClass?: string | null;
+  swarmClientCount?: number;
+  managedPortCount?: number;
+  healthProbeTarget?: string | null;
+  totalRequests?: number;
+  successfulRequests?: number;
+  failedRequests?: number;
+  fingerprintLatencyMs?: number;
+  cachedRouteHits?: number;
+  subtreeReroutes?: number;
+  subtreeQuarantineHits?: number;
+  offWinnerChildRequests?: number;
+  winnerHost?: string | null;
+  slowestCircuit?: string | null;
+  lateThrottles?: number;
+  outlierIsolations?: number;
 }
 
+interface EfficiencyHistory {
+  requestsPerEntry: number[];
+  requestSuccessRate: number[];
+  activeCircuits: number[];
+  fingerprintLatencyMs: number[];
+}
 
 interface TorStatus {
   state: string;
   message: string;
   daemon_count: number;
   ports?: number[];
+  runtime?: string;
+  traffic_class?: string;
+  ready_clients?: number;
+  managed_port_count?: number;
+  health_probe_target?: string;
+}
+
+interface TelemetryBridgeUpdate {
+  crawlStatus?: Partial<CrawlStatusEvent>;
+  resourceMetrics?: Partial<ResourceMetricsSnapshot>;
 }
 
 interface ToastInfo {
@@ -411,6 +445,30 @@ const INITIAL_RESOURCE_METRICS: ResourceMetricsSnapshot = {
   timeoutCount: 0,
   uptimeSeconds: 0,
   consensusWeight: 0,
+  swarmRuntimeLabel: null,
+  swarmTrafficClass: null,
+  swarmClientCount: 0,
+  managedPortCount: 0,
+  healthProbeTarget: null,
+  totalRequests: 0,
+  successfulRequests: 0,
+  failedRequests: 0,
+  fingerprintLatencyMs: 0,
+  cachedRouteHits: 0,
+  subtreeReroutes: 0,
+  subtreeQuarantineHits: 0,
+  offWinnerChildRequests: 0,
+  winnerHost: null,
+  slowestCircuit: null,
+  lateThrottles: 0,
+  outlierIsolations: 0,
+};
+
+const INITIAL_EFFICIENCY_HISTORY: EfficiencyHistory = {
+  requestsPerEntry: [],
+  requestSuccessRate: [],
+  activeCircuits: [],
+  fingerprintLatencyMs: [],
 };
 
 function toFiniteNumber(value: unknown, fallback = 0): number {
@@ -538,19 +596,117 @@ function normalizeResourceMetricsFrame(
     timeoutCount: toNonNegativeInteger(frame.timeoutCount, previous.timeoutCount),
     uptimeSeconds: toNonNegativeInteger(frame.uptimeSeconds, previous.uptimeSeconds),
     consensusWeight: toNonNegativeInteger(frame.consensusWeight, previous.consensusWeight),
+    swarmRuntimeLabel:
+      frame.swarmRuntimeLabel === undefined
+        ? previous.swarmRuntimeLabel
+        : frame.swarmRuntimeLabel,
+    swarmTrafficClass:
+      frame.swarmTrafficClass === undefined
+        ? previous.swarmTrafficClass
+        : frame.swarmTrafficClass,
+    swarmClientCount: toNonNegativeInteger(
+      frame.swarmClientCount,
+      previous.swarmClientCount ?? 0,
+    ),
+    managedPortCount: toNonNegativeInteger(
+      frame.managedPortCount,
+      previous.managedPortCount ?? 0,
+    ),
+    healthProbeTarget:
+      frame.healthProbeTarget === undefined
+        ? previous.healthProbeTarget
+        : frame.healthProbeTarget,
+    totalRequests: toNonNegativeInteger(frame.totalRequests, previous.totalRequests ?? 0),
+    successfulRequests: toNonNegativeInteger(
+      frame.successfulRequests,
+      previous.successfulRequests ?? 0,
+    ),
+    failedRequests: toNonNegativeInteger(frame.failedRequests, previous.failedRequests ?? 0),
+    fingerprintLatencyMs: toNonNegativeInteger(
+      frame.fingerprintLatencyMs,
+      previous.fingerprintLatencyMs ?? 0,
+    ),
+    cachedRouteHits: toNonNegativeInteger(
+      frame.cachedRouteHits,
+      previous.cachedRouteHits ?? 0,
+    ),
+    subtreeReroutes: toNonNegativeInteger(
+      frame.subtreeReroutes,
+      previous.subtreeReroutes ?? 0,
+    ),
+    subtreeQuarantineHits: toNonNegativeInteger(
+      frame.subtreeQuarantineHits,
+      previous.subtreeQuarantineHits ?? 0,
+    ),
+    offWinnerChildRequests: toNonNegativeInteger(
+      frame.offWinnerChildRequests,
+      previous.offWinnerChildRequests ?? 0,
+    ),
+    winnerHost:
+      frame.winnerHost === undefined ? previous.winnerHost : frame.winnerHost,
+    slowestCircuit:
+      frame.slowestCircuit === undefined
+        ? previous.slowestCircuit
+        : frame.slowestCircuit,
+    lateThrottles: toNonNegativeInteger(
+      frame.lateThrottles,
+      previous.lateThrottles ?? 0,
+    ),
+    outlierIsolations: toNonNegativeInteger(
+      frame.outlierIsolations,
+      previous.outlierIsolations ?? 0,
+    ),
   };
+}
+
+export function isOnionTarget(input: string): boolean {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  try {
+    return new URL(trimmed).hostname.toLowerCase().endsWith(".onion");
+  } catch {
+    const authority = trimmed
+      .toLowerCase()
+      .split("://")
+      .pop()
+      ?.split("/")
+      .shift()
+      ?.split("@")
+      .pop()
+      ?.split(":")
+      .shift();
+    return authority?.endsWith(".onion") ?? false;
+  }
+}
+
+export function classifyTargetInputMode(input: string): "onion" | "direct" | "mega" | "torrent" {
+  const val = input.trim();
+  if (val.includes("mega.nz/") || val.includes("mega.co.nz/")) {
+    return "mega";
+  }
+  if (val.toLowerCase().startsWith("magnet:?")) {
+    return "torrent";
+  }
+  if (isOnionTarget(val)) {
+    return "onion";
+  }
+  return "direct";
 }
 
 function App() {
   const isTauriRuntime = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
   const isFixtureMode = !isTauriRuntime && isVfsFixtureMode();
   const [url, setUrl] = useState("");
-  const [inputMode, setInputMode] = useState<"onion" | "mega" | "torrent">("onion");
+  const [inputMode, setInputMode] = useState<"onion" | "direct" | "mega" | "torrent">("onion");
   const [megaPassword, setMegaPassword] = useState("");
   const [megaProgress, setMegaProgress] = useState<{ index: number; total: number; file: string; status: string; completed: number; failed: number; skipped: number } | null>(null);
   const [torrentProgress, setTorrentProgress] = useState<{ downloaded_bytes: number; total_bytes: number; progress_pct: string; download_speed: string; status: string } | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [showAzureModal, setShowAzureModal] = useState(false);
+  const [isOpenHexViewer, setIsOpenHexViewer] = useState(false);
   const [isCrawling, setIsCrawling] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [vfsStats, setVfsStats] = useState({ files: 0, folders: 0, size: 0, totalNodes: 0 });
@@ -580,6 +736,7 @@ function App() {
   const [showSupportPopover, setShowSupportPopover] = useState(false);
   const [supportCatalog, setSupportCatalog] = useState<AdapterSupportInfo[]>([]);
   const [supportCatalogError, setSupportCatalogError] = useState<string | null>(null);
+  const [efficiencyHistory, setEfficiencyHistory] = useState<EfficiencyHistory>(INITIAL_EFFICIENCY_HISTORY);
 
   const urlInputRef = useRef<HTMLInputElement>(null);
   const previewNoticeShownRef = useRef(false);
@@ -592,6 +749,7 @@ function App() {
   const perFileDownloadedBytesRef = useRef<Record<string, number>>({});
   const activeDownloadOutputDirRef = useRef("");
   const processedLogCountRef = useRef(0);
+  const lastEfficiencySampleRef = useRef("");
   // Phase 74B: Adaptive ceiling tracking for Dashboard
   const [ceilingStatus, setCeilingStatus] = useState<{ value: number; direction: 'DECAY' | 'RECOVERY' | null; lastChange: number | null }>({
     value: 0, direction: null, lastChange: null
@@ -652,7 +810,7 @@ function App() {
 
   // Pre-resolve onion descriptors 500ms after user finishes typing
   useEffect(() => {
-    if (url.includes('.onion')) {
+    if (isOnionTarget(url)) {
       const timer = setTimeout(() => {
         if (isTauriRuntime) {
           invoke('pre_resolve_onion', { url }).catch(console.error);
@@ -695,6 +853,58 @@ function App() {
       "[SYSTEM] Fixture VFS mode enabled for browser integrity testing.",
     ]);
   }, [isFixtureMode]);
+
+  useEffect(() => {
+    const totalRequests = resourceMetrics.totalRequests || 0;
+    const successfulRequests = resourceMetrics.successfulRequests || 0;
+    const failedRequests = resourceMetrics.failedRequests || 0;
+    const fingerprintLatencyMs = resourceMetrics.fingerprintLatencyMs || 0;
+    const cachedRouteHits = resourceMetrics.cachedRouteHits || 0;
+    const activeCircuits = resourceMetrics.activeCircuits || 0;
+    const shouldTrack =
+      isCrawling ||
+      totalRequests > 0 ||
+      fingerprintLatencyMs > 0 ||
+      cachedRouteHits > 0;
+
+    if (!shouldTrack) {
+      return;
+    }
+
+    const requestsPerEntry =
+      totalRequests > 0 ? totalRequests / Math.max(vfsStats.totalNodes, 1) : 0;
+    const settledRequests = successfulRequests + failedRequests;
+    const requestSuccessRate =
+      settledRequests > 0 ? (successfulRequests / settledRequests) * 100 : 0;
+    const sampleKey = [
+      requestsPerEntry.toFixed(4),
+      requestSuccessRate.toFixed(2),
+      activeCircuits,
+      fingerprintLatencyMs,
+      cachedRouteHits,
+    ].join("|");
+
+    if (sampleKey === lastEfficiencySampleRef.current) {
+      return;
+    }
+    lastEfficiencySampleRef.current = sampleKey;
+
+    setEfficiencyHistory((previous) => ({
+      requestsPerEntry: [...previous.requestsPerEntry.slice(-39), requestsPerEntry],
+      requestSuccessRate: [...previous.requestSuccessRate.slice(-39), requestSuccessRate],
+      activeCircuits: [...previous.activeCircuits.slice(-39), activeCircuits],
+      fingerprintLatencyMs: [...previous.fingerprintLatencyMs.slice(-39), fingerprintLatencyMs],
+    }));
+  }, [
+    isCrawling,
+    vfsStats.totalNodes,
+    resourceMetrics.totalRequests,
+    resourceMetrics.successfulRequests,
+    resourceMetrics.failedRequests,
+    resourceMetrics.activeCircuits,
+    resourceMetrics.fingerprintLatencyMs,
+    resourceMetrics.cachedRouteHits,
+  ]);
 
   // Keyboard shortcuts: ⌘+Enter to start, Esc to stop, ⌘+E to export
   useEffect(() => {
@@ -1117,10 +1327,26 @@ function App() {
       unlistenPromises.push(Promise.resolve(() => clearInterval(pollId)));
 
       unlistenPromises.push(
+        listen<TelemetryBridgeUpdate>("telemetry_bridge_update", (event) => {
+          if (event.payload.resourceMetrics) {
+            setResourceMetrics((previous) =>
+              normalizeResourceMetricsFrame(event.payload.resourceMetrics, previous),
+            );
+          }
+          if (event.payload.crawlStatus) {
+            setCrawlStatus((previous) =>
+              normalizeCrawlStatusFrame(event.payload.crawlStatus, previous),
+            );
+          }
+        })
+      );
+
+      unlistenPromises.push(
         listen<TorStatus>("tor_status", (event) => {
           setTorStatus(event.payload);
-          if (event.payload.daemon_count) {
-            setActiveDaemons(event.payload.daemon_count);
+          const readyClients = event.payload.ready_clients ?? event.payload.daemon_count;
+          if (readyClients) {
+            setActiveDaemons(readyClients);
           }
           if (event.payload.state === "completed_local" || event.payload.state === "completed_managed") {
             setTorStatus(null);
@@ -1288,6 +1514,8 @@ function App() {
     if (!preserveFixtureState) {
       setResourceMetrics(INITIAL_RESOURCE_METRICS);
     }
+    setEfficiencyHistory(INITIAL_EFFICIENCY_HISTORY);
+    lastEfficiencySampleRef.current = "";
     setLogs((l) => [...l, `--- Initiating Crawl ---`]);
     setLogs((l) => [...l, `> Probing Target: ${url}`]);
     setCrawlStatus({
@@ -1436,7 +1664,7 @@ function App() {
             path: filePath,
             output_root: outputDir,
             connections: crawlOptions.circuits || 8,
-            force_tor: rawUrl.includes(".onion"),
+            force_tor: isOnionTarget(rawUrl),
           }
         });
         showToast("success", "Download Engine Started", `Allocating ${crawlOptions.circuits || 8} Multi-Clients to target...`);
@@ -1673,6 +1901,15 @@ function App() {
           <FileJson size={22} /> Export
         </button>
         <button
+          className="tool-btn"
+          data-testid="btn-hex-view"
+          onClick={() => setIsOpenHexViewer(true)}
+          disabled={!url}
+          title="Inspect Raw Extents (Zero-Copy View)"
+        >
+          <HardDrive size={22} /> Native Hex
+        </button>
+        <button
           ref={supportButtonRef}
           className="tool-btn"
           data-testid="btn-support"
@@ -1688,6 +1925,14 @@ function App() {
           title="Switch to Tor / Onion routing mode"
         >
           <ShieldAlert size={22} /> Tor Node
+        </button>
+        <button
+          className={`tool-btn ${inputMode === 'direct' ? 'active' : ''}`}
+          data-testid="btn-direct"
+          onClick={() => setInputMode('direct')}
+          title="Switch to clearnet / direct HTTP(S) mode"
+        >
+          <Globe size={22} /> Direct
         </button>
         <button
           className={`tool-btn ${inputMode === 'mega' ? 'active' : ''}`}
@@ -1770,26 +2015,20 @@ function App() {
       <div className="url-bar">
         <div className="input-group">
           <span className="input-label">
-            {inputMode === "mega" ? "MEGA.NZ" : inputMode === "torrent" ? "TORRENT" : "Target Source"}
+            {inputMode === "mega" ? "MEGA.NZ" : inputMode === "torrent" ? "TORRENT" : inputMode === "direct" ? "DIRECT URL" : "Target Source"}
           </span>
           <input
             ref={urlInputRef}
             data-testid="input-target-url"
             type="text"
             className="url-input"
-            placeholder={inputMode === "mega" ? "https://mega.nz/folder/..." : inputMode === "torrent" ? "magnet:?xt=... or drop .torrent file" : "http://... (⌘+Enter to start)"}
+            placeholder={inputMode === "mega" ? "https://mega.nz/folder/..." : inputMode === "torrent" ? "magnet:?xt=... or drop .torrent file" : inputMode === "direct" ? "https://example.com/archive.7z" : "http://... (⌘+Enter to start)"}
             value={url}
             onChange={(e) => {
               const val = e.target.value;
               setUrl(val);
               // Phase 52: Auto-detect input mode
-              if (val.includes("mega.nz/") || val.includes("mega.co.nz/")) {
-                setInputMode("mega");
-              } else if (val.trimStart().toLowerCase().startsWith("magnet:?")) {
-                setInputMode("torrent");
-              } else {
-                setInputMode("onion");
-              }
+              setInputMode(classifyTargetInputMode(val));
             }}
             onKeyDown={(e) => {
               if (e.key === 'Enter') handleCrawl();
@@ -1972,13 +2211,38 @@ function App() {
         </button>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: 'auto' }}>
+          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Swarms:</span>
+          <select
+            data-testid="sel-daemons"
+            value={`${crawlOptions.daemons}`}
+            onChange={(e) => {
+              const daemons = Number(e.target.value);
+              setCrawlOptions({ ...crawlOptions, daemons });
+            }}
+            disabled={isCrawling}
+            style={{
+              background: 'var(--bg-dark)',
+              color: 'var(--text-main)',
+              border: '1px solid var(--border-color)',
+              borderRadius: '4px',
+              padding: '4px 8px',
+              fontSize: '0.85rem',
+              outline: 'none',
+              cursor: isCrawling ? 'not-allowed' : 'pointer'
+            }}
+          >
+            <option value="1">1 Swarm</option>
+            <option value="3">3 Swarms</option>
+            <option value="6">6 Swarms</option>
+          </select>
+
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Concurrency:</span>
           <select
             data-testid="sel-circuits"
             value={`${crawlOptions.circuits}`}
             onChange={(e) => {
               const circuits = Number(e.target.value);
-              setCrawlOptions({ ...crawlOptions, daemons: 1, circuits });
+              setCrawlOptions({ ...crawlOptions, circuits });
             }}
             disabled={isCrawling}
             style={{
@@ -2025,6 +2289,7 @@ function App() {
         elapsed={crawlElapsed}
         downloadElapsed={downloadElapsed}
         resourceMetrics={resourceMetrics}
+        efficiencyHistory={efficiencyHistory}
         crawlRunStatus={lastCrawlResult}
         downloadResumePlan={downloadResumePlan}
         ceilingStatus={ceilingStatus}
@@ -2198,6 +2463,9 @@ function App() {
 
       {/* Phase 53: Azure Connectivity Modal */}
       <AzureConnectivityModal isOpen={showAzureModal} onClose={() => setShowAzureModal(false)} />
+
+      {/* Phase 82: Native Hex Viewer */}
+      <HexViewer url={url} isOpen={isOpenHexViewer} onClose={() => setIsOpenHexViewer(false)} />
     </div >
   );
 }

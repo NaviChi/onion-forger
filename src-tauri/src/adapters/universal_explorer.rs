@@ -74,7 +74,12 @@ impl AdaptiveUniversalExplorer {
 
     /// Parse page using raw HTML body directly.
     /// Incorporates Tier-4 Adaptive Hydrator Wire Mode Detection (SPA JSON vs Autoindex)
-    pub fn parse_page_from_body(&self, body: &str, base_url: &str, app: Option<&AppHandle>) -> Option<Vec<FileEntry>> {
+    pub fn parse_page_from_body(
+        &self,
+        body: &str,
+        base_url: &str,
+        app: Option<&AppHandle>,
+    ) -> Option<Vec<FileEntry>> {
         use tauri::Emitter;
         let base_parsed_url =
             Url::parse(base_url).unwrap_or_else(|_| Url::parse("http://unknown.onion").unwrap());
@@ -88,14 +93,23 @@ impl AdaptiveUniversalExplorer {
         if has_next || has_fsguest || has_token {
             if let Some(app) = app {
                 let indicators = [
-                    if has_next { Some("__NEXT_DATA__") } else { None },
+                    if has_next {
+                        Some("__NEXT_DATA__")
+                    } else {
+                        None
+                    },
                     if has_fsguest { Some("fsguest") } else { None },
                     if has_token { Some("token=") } else { None },
-                ].into_iter().flatten().collect::<Vec<_>>().join(", ");
-                
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ");
+
                 let _ = app.emit("crawl_log", format!("[🤖 Tier-4 Hydrator] SPA indicators detected ({}) on target: {}. Abandoning Autoindex for SPA JSON Mode 1 (Mimicry).", indicators, base_url));
             }
-            let spa_entries = crate::adapters::dragonforce::parse_dragonforce_fsguest(body, host, base_url);
+            let spa_entries =
+                crate::adapters::dragonforce::parse_dragonforce_fsguest(body, host, base_url);
             if !spa_entries.is_empty() {
                 if let Some(app) = app {
                     let _ = app.emit("crawl_log", format!("[🤖 Tier-4 Hydrator] Successfully extrapolated {} API routes bridging JS to raw state", spa_entries.len()));
@@ -112,10 +126,17 @@ impl AdaptiveUniversalExplorer {
             if let Some(app) = app {
                 let _ = app.emit("crawl_log", format!("[🤖 Tier-4 Hydrator] Iframe proxy indicators detected (<iframe src=). Abandoning Autoindex for SPA JSON Mode 2 on target: {}", base_url));
             }
-            let spa_entries = crate::adapters::dragonforce::parse_dragonforce_fsguest(body, host, base_url);
+            let spa_entries =
+                crate::adapters::dragonforce::parse_dragonforce_fsguest(body, host, base_url);
             if !spa_entries.is_empty() {
                 if let Some(app) = app {
-                    let _ = app.emit("crawl_log", format!("[🤖 Tier-4 Hydrator] Extracted {} nested entries from Iframe embed", spa_entries.len()));
+                    let _ = app.emit(
+                        "crawl_log",
+                        format!(
+                            "[🤖 Tier-4 Hydrator] Extracted {} nested entries from Iframe embed",
+                            spa_entries.len()
+                        ),
+                    );
                 }
                 return Some(spa_entries);
             }
@@ -126,7 +147,14 @@ impl AdaptiveUniversalExplorer {
 
         if !parsed.is_empty() {
             if let Some(app) = app {
-                let _ = app.emit("crawl_log", format!("[🤖 Tier-4 Hydrator] Mode 3 (Classic Autoindex) matched {} items on: {}", parsed.len(), base_url));
+                let _ = app.emit(
+                    "crawl_log",
+                    format!(
+                        "[🤖 Tier-4 Hydrator] Mode 3 (Classic Autoindex) matched {} items on: {}",
+                        parsed.len(),
+                        base_url
+                    ),
+                );
             }
             let mut entries = Vec::new();
             for (name, size, is_dir) in parsed {
@@ -231,17 +259,17 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
                 let start = std::time::Instant::now();
                 let link_clone1 = link.url.clone();
                 let link_clone2 = link.url.clone();
-                
+
                 let req1 = Box::pin(async {
                     let res = client1.get(&link_clone1).send().await;
                     (cid1, res)
                 });
-                
+
                 let req2 = Box::pin(async {
                     let res = client2.get(&link_clone2).send().await;
                     (cid2, res)
                 });
-                
+
                 let (winner_cid, fetch_result) = match futures::future::select(req1, req2).await {
                     futures::future::Either::Left((res, _)) => res,
                     futures::future::Either::Right((res, _)) => res,
@@ -251,7 +279,11 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
                     Ok(resp) => {
                         let text = resp.text().await.ok();
                         let len = text.as_ref().map(|t| t.len() as u64).unwrap_or(0);
-                        frontier.record_success(winner_cid, len, start.elapsed().as_millis() as u64);
+                        frontier.record_success(
+                            winner_cid,
+                            len,
+                            start.elapsed().as_millis() as u64,
+                        );
                         text
                     }
                     Err(_) => {
@@ -275,14 +307,16 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
                     let body_clone = body.clone();
                     let link_url_clone = link.url.clone();
                     let root_host_clone = root_host.clone();
-                    
+
                     tokio::task::spawn_blocking(move || {
                         let document = Html::parse_document(&body_clone);
                         let selector = Selector::parse("a[href]").unwrap();
                         let mut raw = Vec::new();
                         for element in document.select(&selector) {
                             if let Some(href) = element.value().attr("href") {
-                                if let Ok(full) = Url::parse(&link_url_clone).and_then(|u| u.join(href)) {
+                                if let Ok(full) =
+                                    Url::parse(&link_url_clone).and_then(|u| u.join(href))
+                                {
                                     // FIX H-1: Hard domain boundary — reject off-host links
                                     let link_host = full.host_str().map(|h| h.to_string());
                                     if link_host != root_host_clone {
@@ -294,7 +328,9 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
                             }
                         }
                         raw
-                    }).await.unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default()
                 };
 
                 // Score and deduplicate children
