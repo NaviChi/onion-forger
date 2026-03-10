@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { invoke } from "@tauri-apps/api/core";
 import { Terminal, HardDrive, RefreshCcw, Layers } from "lucide-react";
 import "./HexViewer.css";
+import { invokeCommand } from "../platform/tauriClient";
 
 interface HexViewerProps {
     url: string;
@@ -29,7 +29,7 @@ export function HexViewer({ url, isOpen, onClose }: HexViewerProps) {
         pendingFetches.current.add(lba);
         try {
             // Direct IPC to Rust Zero-Copy Scraper
-            const buf: number[] = await invoke("fetch_network_disk_block_cmd", {
+            const buf = await invokeCommand<number[]>("fetch_network_disk_block_cmd", {
                 url, lba, blockSize: BLOCK_SIZE
             });
             setBlocks(prev => ({ ...prev, [lba]: new Uint8Array(buf) }));

@@ -1,19 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { VFSExplorer, FileEntry } from "./components/VFSExplorer";
 import { Dashboard } from "./components/Dashboard";
 import { AzureConnectivityModal } from "./components/AzureConnectivityModal";
 import { VibeLoader } from "./components/VibeLoader";
 import { HexViewer } from "./components/HexViewer";
-import { downloadDir, join } from "@tauri-apps/api/path";
-import { open, save } from "@tauri-apps/plugin-dialog";
-import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp, Cloud, Magnet, ShieldAlert, HardDrive } from "lucide-react";
-import { FIXTURE_RESOURCE_METRICS, VFS_FIXTURE_STATS, isVfsFixtureMode } from "./fixtures/vfsFixture";
+import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp, Cloud, Magnet, ShieldAlert, HardDrive, Database, Cpu } from "lucide-react";
+import { FIXTURE_RESOURCE_METRICS, VFS_FIXTURE_ENTRIES, VFS_FIXTURE_STATS, isVfsFixtureMode } from "./fixtures/vfsFixture";
+import { getDownloadDir, invokeCommand, isTauriRuntime as getIsTauriRuntime, joinPath, listenEvent, openDialog, saveDialog } from "./platform/tauriClient";
 
 import "./App.css";
-import * as pb from "./telemetry.js";
-import { Reader } from "protobufjs/minimal.js";
 
 
 interface DownloadProgressEvent {
@@ -128,6 +123,8 @@ interface ResourceMetricsSnapshot {
   activeCircuits: number;
   peakActiveCircuits: number;
   currentNodeHost?: string | null;
+  multiClientRotations?: number;
+  multiClientCount?: number;
   nodeFailovers: number;
   throttleCount: number;
   timeoutCount: number;
@@ -697,7 +694,7 @@ export function classifyTargetInputMode(input: string): "onion" | "direct" | "me
 }
 
 function App() {
-  const isTauriRuntime = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
+  const isTauriRuntime = getIsTauriRuntime();
   const isFixtureMode = !isTauriRuntime && isVfsFixtureMode();
   const [url, setUrl] = useState("");
   const [inputMode, setInputMode] = useState<"onion" | "direct" | "mega" | "torrent">("onion");
@@ -750,6 +747,10 @@ function App() {
   const activeDownloadOutputDirRef = useRef("");
   const processedLogCountRef = useRef(0);
   const lastEfficiencySampleRef = useRef("");
+  const telemetryRuntimeRef = useRef<Promise<{
+    pb: typeof import("./telemetry.js");
+    Reader: typeof import("protobufjs/minimal.js").Reader;
+  }> | null>(null);
   // Phase 74B: Adaptive ceiling tracking for Dashboard
   const [ceilingStatus, setCeilingStatus] = useState<{ value: number; direction: 'DECAY' | 'RECOVERY' | null; lastChange: number | null }>({
     value: 0, direction: null, lastChange: null
@@ -780,12 +781,16 @@ function App() {
     }, 6000);
   };
 
+  useEffect(() => {
+    document.title = "Crawli Engine";
+  }, []);
+
   // Phase 67H: Auto-detect system profile and set recommended concurrency
   useEffect(() => {
     if (!isTauriRuntime) return;
     (async () => {
       try {
-        const profile = await invoke<{
+        const profile = await invokeCommand<{
           preset: string; circuits: number; workers: number;
           cpuCores: number; totalRamGb: number; availableRamGb: number;
           storageClass: string; os: string;
@@ -813,7 +818,7 @@ function App() {
     if (isOnionTarget(url)) {
       const timer = setTimeout(() => {
         if (isTauriRuntime) {
-          invoke('pre_resolve_onion', { url }).catch(console.error);
+          invokeCommand('pre_resolve_onion', { url }).catch(console.error);
         }
       }, 500);
       return () => clearTimeout(timer);
@@ -945,8 +950,8 @@ function App() {
         return;
       }
       try {
-        const dl = await downloadDir();
-        const defaultPath = await join(dl, "OnionForger_Downloads");
+        const dl = await getDownloadDir();
+        const defaultPath = await joinPath(dl, "OnionForger_Downloads");
         const normalizedDefaultPath = stripWindowsVerbatimPrefix(defaultPath);
         setOutputDir((prev) => prev || normalizedDefaultPath);
       } catch (e) {
@@ -958,7 +963,7 @@ function App() {
 
     if (isTauriRuntime) {
       unlistenPromises.push(
-        listen<string>("crawl_log", (event) => {
+        listenEvent<string>("crawl_log", (event) => {
           const payload = event.payload;
           const adapterMatch = payload.match(/Match found:\s*(.+)$/);
           if (adapterMatch && adapterMatch[1]) {
@@ -982,15 +987,15 @@ function App() {
         })
       );
       unlistenPromises.push(
-        listen<string>("log", (event) => {
+        listenEvent<string>("log", (event) => {
           setLogs((l) => [...l.slice(-399), `> ${event.payload}`]);
         })
       );
 
       unlistenPromises.push(
-        listen<FileEntry[]>("crawl_progress", (event) => {
+        listenEvent<FileEntry[]>("crawl_progress", (event) => {
           // Stream directly to backend DB
-          invoke("ingest_vfs_entries", { entries: event.payload }).catch(console.error);
+          invokeCommand("ingest_vfs_entries", { entries: event.payload }).catch(console.error);
 
           let newFiles = 0;
           let newFolders = 0;
@@ -1207,7 +1212,7 @@ function App() {
       };
 
       unlistenPromises.push(
-        listen<DownloadBatchStartedEvent>("download_batch_started", (event) => {
+        listenEvent<DownloadBatchStartedEvent>("download_batch_started", (event) => {
           const startedAt = Date.now();
           const normalizedOutput = stripWindowsVerbatimPrefix(event.payload.outputDir || "");
           activeDownloadOutputDirRef.current = normalizedOutput;
@@ -1243,7 +1248,17 @@ function App() {
 
       const pollId = setInterval(async () => {
         try {
-          const buffer = await invoke<Uint8Array>("drain_telemetry_ring");
+          if (!telemetryRuntimeRef.current) {
+            telemetryRuntimeRef.current = Promise.all([
+              import("./telemetry.js"),
+              import("protobufjs/minimal.js"),
+            ]).then(([pb, protobuf]) => ({
+              pb,
+              Reader: protobuf.Reader,
+            }));
+          }
+          const { pb, Reader } = await telemetryRuntimeRef.current;
+          const buffer = await invokeCommand<Uint8Array>("drain_telemetry_ring");
           if (!buffer || buffer.length === 0) return;
 
           const reader = Reader.create(buffer);
@@ -1327,7 +1342,7 @@ function App() {
       unlistenPromises.push(Promise.resolve(() => clearInterval(pollId)));
 
       unlistenPromises.push(
-        listen<TelemetryBridgeUpdate>("telemetry_bridge_update", (event) => {
+        listenEvent<TelemetryBridgeUpdate>("telemetry_bridge_update", (event) => {
           if (event.payload.resourceMetrics) {
             setResourceMetrics((previous) =>
               normalizeResourceMetricsFrame(event.payload.resourceMetrics, previous),
@@ -1342,7 +1357,7 @@ function App() {
       );
 
       unlistenPromises.push(
-        listen<TorStatus>("tor_status", (event) => {
+        listenEvent<TorStatus>("tor_status", (event) => {
           setTorStatus(event.payload);
           const readyClients = event.payload.ready_clients ?? event.payload.daemon_count;
           if (readyClients) {
@@ -1356,13 +1371,13 @@ function App() {
       );
 
       unlistenPromises.push(
-        listen<DownloadResumePlan>("download_resume_plan", (event) => {
+        listenEvent<DownloadResumePlan>("download_resume_plan", (event) => {
           setDownloadResumePlan(event.payload);
         })
       );
 
       unlistenPromises.push(
-        listen<{ url: string; path: string; hash: string; time_taken_secs: number }>("complete", (event) => {
+        listenEvent<{ url: string; path: string; hash: string; time_taken_secs: number }>("complete", (event) => {
           const roots = [activeDownloadOutputDirRef.current, outputDir];
           const displayPath = toDisplayPath(event.payload.path, roots);
           setLogs((l) => [...l.slice(-399), `[✓] Download finished: ${displayPath} (SHA256: ${event.payload.hash})`]);
@@ -1389,7 +1404,7 @@ function App() {
       );
 
       unlistenPromises.push(
-        listen<{ url: string; path: string; error: string }>("download_failed", (event) => {
+        listenEvent<{ url: string; path: string; error: string }>("download_failed", (event) => {
           const displayPath = toDisplayPath(event.payload.path, [activeDownloadOutputDirRef.current, outputDir]);
           setLogs((l) => [...l.slice(-399), `[ERROR] Download failed for ${displayPath}: ${event.payload.error}`]);
           showToast("error", "Download Failed", event.payload.error);
@@ -1397,7 +1412,7 @@ function App() {
       );
 
       unlistenPromises.push(
-        listen<{ url: string; path: string; reason: string }>("download_interrupted", (event) => {
+        listenEvent<{ url: string; path: string; reason: string }>("download_interrupted", (event) => {
           const displayPath = toDisplayPath(event.payload.path, [activeDownloadOutputDirRef.current, outputDir]);
           setLogs((l) => [...l.slice(-399), `[SYSTEM] Download interrupted for ${displayPath}: ${event.payload.reason}`]);
           showToast("success", "Download Interrupted", `${event.payload.reason} for ${displayPath}`);
@@ -1406,7 +1421,7 @@ function App() {
 
       // Phase 52E: Mega/Torrent progress listeners
       unlistenPromises.push(
-        listen<any>("mega_download_progress", (event) => {
+        listenEvent<any>("mega_download_progress", (event) => {
           setMegaProgress(event.payload);
           if (event.payload.status === "done" || event.payload.status === "error") {
             // Clear progress card after last file completes
@@ -1417,7 +1432,7 @@ function App() {
         })
       );
       unlistenPromises.push(
-        listen<any>("torrent_download_progress", (event) => {
+        listenEvent<any>("torrent_download_progress", (event) => {
           setTorrentProgress(event.payload);
           if (event.payload.status === "complete") {
             setTimeout(() => setTorrentProgress(null), 3000);
@@ -1541,7 +1556,7 @@ function App() {
         mega_password: megaPassword || null,
       };
 
-      const result = await invoke<CrawlSessionResult>("start_crawl", { url, options: payloadOptions, outputDir });
+      const result = await invokeCommand<CrawlSessionResult>("start_crawl", { url, options: payloadOptions, outputDir });
       setLastCrawlResult(result);
       setLogs((l) => [...l, `[SYSTEM] Finish signaled. Found ${result.discoveredCount} unique nodes.`]);
       setLogs((l) => [...l, `[SYSTEM] Crawl baseline status: ${result.crawlOutcome} | raw=${result.rawThisRunCount} | best=${result.bestPriorCount} | merged=${result.mergedEffectiveCount} | retries=${result.retryCountUsed}`]);
@@ -1607,7 +1622,7 @@ function App() {
         showToast("success", "Cancel Acknowledged", "Preview mode has no active native crawl workers.");
         return;
       }
-      const result = await invoke<string>("cancel_crawl");
+      const result = await invokeCommand<string>("cancel_crawl");
       setIsCrawling(false);
       setCrawlStartTime(null);
       setCrawlStatus((prev) => ({ ...prev, phase: "cancelled" }));
@@ -1649,7 +1664,7 @@ function App() {
           entry_type: 'Folder',
           raw_url: rawUrl
         };
-        const count = await invoke<number>("download_files", {
+        const count = await invokeCommand<number>("download_files", {
           entries: [entry],
           outputDir,
           connections: crawlOptions.circuits,
@@ -1658,7 +1673,7 @@ function App() {
         setLogs((l) => [...l, `[MIRROR] Saved ${filePath} to disk`]);
       } else {
         // High concurrency chunked download for single files
-        await invoke("initiate_download", {
+        await invokeCommand("initiate_download", {
           args: {
             url: rawUrl,
             path: filePath,
@@ -1684,7 +1699,7 @@ function App() {
       return;
     }
     try {
-      const count = await invoke<number>("download_files", {
+      const count = await invokeCommand<number>("download_files", {
         entries: selectedFiles,
         outputDir,
         connections: crawlOptions.circuits,
@@ -1705,14 +1720,14 @@ function App() {
       return;
     }
     try {
-      const savePath = await save({
+      const savePath = await saveDialog({
         defaultPath: "crawl_results.json",
         filters: [{ name: "JSON", extensions: ["json"] }],
         title: "Export Crawl Results",
       });
       if (!savePath) return;
 
-      const result = await invoke<string>("export_json", { outputPath: savePath });
+      const result = await invokeCommand<string>("export_json", { outputPath: savePath });
       showToast("success", "Export Complete", result);
       setLogs((l) => [...l, `[EXPORT] Successfully saved map to ${savePath}`]);
     } catch (err: any) {
@@ -1731,7 +1746,7 @@ function App() {
     }
     try {
       showToast("success", "Scaffolding Started", `Extracting entire VFS structure to primary disk...`);
-      const count = await invoke<number>("download_all", {
+      const count = await invokeCommand<number>("download_all", {
         outputDir,
         connections: crawlOptions.circuits,
         targetUrl: url || undefined,
@@ -1752,7 +1767,7 @@ function App() {
       return;
     }
     try {
-      const selected = await open({
+      const selected = await openDialog({
         directory: true,
         multiple: false,
         title: "Select Download Location",
@@ -1779,7 +1794,7 @@ function App() {
 
     try {
       if (isTauriRuntime) {
-        const catalog = await invoke<AdapterSupportInfo[]>("get_adapter_support_catalog");
+        const catalog = await invokeCommand<AdapterSupportInfo[]>("get_adapter_support_catalog");
         if (Array.isArray(catalog) && catalog.length > 0) {
           setSupportCatalog(catalog);
           setSupportCatalogError(null);
@@ -1810,6 +1825,7 @@ function App() {
     if (b.count !== a.count) return b.count - a.count;
     return b.lastSeenAt - a.lastSeenAt;
   });
+  const previewLogs = logs.length > 0 ? logs : ["[SYSTEM] Browser preview ready."];
 
   return (
     <div
@@ -2186,7 +2202,7 @@ function App() {
             if (crawlOptions.resumeIndex) {
               setCrawlOptions(prev => ({ ...prev, resumeIndex: undefined, resume: false }));
             } else {
-              const selected = await open({
+              const selected = await openDialog({
                 multiple: false,
                 filters: [{ name: 'Onion Forge Index', extensions: ['txt'] }]
               });
@@ -2276,190 +2292,305 @@ function App() {
 
       </div>
 
-      <Dashboard
-        isCrawling={isCrawling}
-        torStatus={torStatus}
-        activeAdapter={activeAdapter}
-        crawlStatus={crawlStatus}
-        downloadBatchStatus={downloadBatchStatus}
-        logs={logs}
-        vfsCount={vfsStats.totalNodes}
-        vfsRefreshTrigger={vfsRefreshTrigger}
-        downloadProgress={downloadProgress}
-        elapsed={crawlElapsed}
-        downloadElapsed={downloadElapsed}
-        resourceMetrics={resourceMetrics}
-        efficiencyHistory={efficiencyHistory}
-        crawlRunStatus={lastCrawlResult}
-        downloadResumePlan={downloadResumePlan}
-        ceilingStatus={ceilingStatus}
-        onAzureClick={() => setShowAzureModal(true)}
-      />
-
-      <div className="main-workspace">
-        <div className="panel" style={{ flex: 1 }}>
-          <div className="panel-header">
-            <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <Terminal size={14} /> Forensic Log
-            </span>
-          </div>
-          <div className="panel-content">
-            <div style={{
-              display: 'grid',
-              gap: '6px',
-              maxHeight: '180px',
-              overflow: 'auto',
-              padding: '8px 10px',
-              borderBottom: '1px solid rgba(255,255,255,0.06)',
-              background: 'rgba(255,255,255,0.02)'
-            }}>
-              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                Unique Message Summary
+      {!isTauriRuntime ? (
+        <>
+          <div className="ops-dashboard">
+            <div className="dash-card">
+              <div className="dash-icon"><Database size={24} /></div>
+              <div className="dash-info">
+                <div className="dash-title">NODES INDEXED</div>
+                <div className="dash-value" style={{ fontFamily: 'JetBrains Mono' }}>{vfsStats.totalNodes.toLocaleString()}</div>
+                <div className="dash-sub">Preview fixture state</div>
               </div>
-              {aggregateRows.length === 0 ? (
-                <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                  Waiting for crawl and downloader logs...
-                </div>
-              ) : aggregateRows.map((aggregate) => (
-                <div
-                  key={aggregate.key}
-                  style={{
-                    display: 'grid',
-                    gridTemplateColumns: '56px 1fr',
-                    gap: '8px',
-                    padding: '6px 8px',
-                    border: '1px solid rgba(255,255,255,0.06)',
-                    borderRadius: '6px',
-                    background: 'rgba(10, 14, 20, 0.55)'
-                  }}
-                >
-                  <div style={{ fontFamily: 'JetBrains Mono', color: 'var(--accent-primary)', fontSize: '0.78rem' }}>
-                    ×{aggregate.count}
-                  </div>
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: '0.8rem', color: 'var(--text-main)', wordBreak: 'break-word' }}>
-                      {aggregate.sample}
-                    </div>
-                    <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontFamily: 'JetBrains Mono' }}>
-                      First {new Date(aggregate.firstSeenAt).toLocaleTimeString()} | Last {new Date(aggregate.lastSeenAt).toLocaleTimeString()}
-                    </div>
-                  </div>
-                </div>
-              ))}
             </div>
-            <div className="forensic-log">
-              {logs.map((log, i) => (
-                <div key={i} className="term-line" style={{
-                  color: log.includes("ERROR") ? "#EF4444" :
-                    log.includes("FOUND") ? "var(--accent-primary)" :
-                      log.includes("Match found") ? "var(--accent-primary)" :
-                        log.includes("Target") ? "var(--accent-secondary)" :
-                          log.includes("TOR") ? "#a78bfa" :
-                            log.includes("MIRROR") ? "#10B981" :
-                              log.includes("EXPORT") ? "#60A5FA" :
-                                log.includes("⚠") ? "#fbbf24" :
-                                  "var(--text-main)"
-                }}>
-                  <span className="term-prefix">{String(i).padStart(4, '0')}</span>
-                  {log}
+            <div className="dash-card resource-card" data-testid="resource-metrics-card">
+              <div className="dash-icon"><Cpu size={24} /></div>
+              <div className="dash-info">
+                <div className="dash-title">PROCESS + SYSTEM</div>
+                <div className="dash-value" data-testid="resource-process-cpu">
+                  CPU {resourceMetrics.processCpuPercent.toFixed(1)}%
                 </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="panel" style={{ flex: 1.5, position: 'relative' }}>
-          <div className="panel-header">
-            <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <ListTree size={14} /> Virtual File System
-            </span>
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              {vfsStats.totalNodes > 0 && (
-                <span style={{
-                  fontSize: "0.75rem",
-                  color: "var(--text-muted)",
-                  fontFamily: "JetBrains Mono",
-                }}>
-                  {vfsStats.folders} dirs · {vfsStats.files} files · {totalSizeStr}
-                </span>
-              )}
-              <span style={{ fontSize: "0.8rem", color: "var(--accent-secondary)", background: "rgba(0, 229, 255, 0.1)", padding: "2px 8px", borderRadius: "12px", border: "1px solid rgba(0, 229, 255, 0.3)" }}>
-                {vfsStats.totalNodes.toLocaleString()} Nodes
-              </span>
-              {vfsStats.totalNodes > 0 && !isCrawling && (
-                <>
-                  <button
-                    className="action-btn popup-hover"
-                    data-testid="btn-mass-extract-all"
-                    onClick={handleDownloadAll}
-                    style={{ padding: '2px 12px', fontSize: '0.75rem', height: '28px', minWidth: 'auto', background: 'transparent', border: '1px solid var(--border-hud)', color: 'var(--accent-secondary)', display: 'flex', gap: '6px', alignItems: 'center' }}
-                    title="Safely Scaffold All Indexed Entries via Multi-Threading"
-                  >
-                    <Download size={12} /> Mass Extract All
-                  </button>
-                  {selectedFiles.length > 0 && (
-                    <button
-                      className="action-btn popup-hover"
-                      data-testid="btn-download-selected"
-                      onClick={handleDownloadSelected}
-                      style={{ padding: '2px 12px', fontSize: '0.75rem', height: '28px', minWidth: 'auto', background: 'rgba(0, 229, 255, 0.1)', border: '1px solid var(--border-hud)', color: 'var(--accent-secondary)', display: 'flex', gap: '6px', alignItems: 'center' }}
-                      title="Download selected items."
-                    >
-                      <Download size={12} /> Download Selected ({selectedFiles.length})
-                    </button>
+                <div className="dash-sub" data-testid="resource-process-memory" style={{ fontFamily: 'JetBrains Mono' }}>
+                  RSS {(resourceMetrics.processMemoryBytes / 1048576).toFixed(1)} MB | Threads {resourceMetrics.processThreads}
+                </div>
+                <div className="dash-sub" data-testid="resource-worker-metrics" style={{ fontFamily: 'JetBrains Mono' }}>
+                  {crawlStatus.vanguard ? (
+                    <span style={{ color: 'var(--accent-primary)' }}>Vanguard: {crawlStatus.vanguard.status} | Circuits {resourceMetrics.activeCircuits}/{resourceMetrics.peakActiveCircuits}</span>
+                  ) : (
+                    <span>Workers {resourceMetrics.activeWorkers}/{resourceMetrics.workerTarget} | Circuits {resourceMetrics.activeCircuits}/{resourceMetrics.peakActiveCircuits}</span>
                   )}
-                </>
-              )}
-            </div>
-          </div>
-          <div className="panel-content" style={{ padding: 0 }}>
-            <VFSExplorer
-              triggerRefresh={vfsRefreshTrigger}
-              onDownload={handleDownload}
-              onSelectionChange={setSelectedFiles}
-              downloadProgress={downloadProgress}
-            />
-          </div>
-        </div>
-      </div>
-
-      <div className="network-monitor">
-        {activeDaemons > 6 ? (
-          <div className="daemon-box" style={{ flex: 1, justifyContent: "center" }}>
-            <div className="daemon-icon">
-              {isCrawling ? <VibeLoader size={18} variant="secondary" /> : <Zap size={18} />}
-            </div>
-            <div className="daemon-info" style={{ flex: "none" }}>
-              <div className="daemon-header">ARTI SWARM ({activeDaemons} NODES)</div>
-              <div className="daemon-body">
-                <span style={{ fontSize: '0.85rem', color: 'var(--accent-secondary)', fontFamily: 'JetBrains Mono', wordBreak: 'break-all' }}>
-                  MODE: NATIVE MEMORY
-                </span>
-              </div>
-            </div>
-          </div>
-        ) : (
-          Array.from({ length: activeDaemons }).map((_, idx) => (
-            <div key={idx} className="daemon-box">
-              <div className="daemon-icon">
-                {isCrawling ? <VibeLoader size={18} variant="secondary" /> : <Zap size={18} />}
-              </div>
-              <div className="daemon-info">
-                <div className="daemon-header">ARTI NODE {idx + 1}</div>
-                <div className="daemon-body">
-                  <span style={{ color: isCrawling ? 'var(--accent-primary)' : 'var(--text-muted)' }}>
-                    {isCrawling ? 'ACTIVE' : 'STANDBY'}
-                  </span>
-                  <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', fontFamily: 'JetBrains Mono' }}>
-                    {isCrawling ? Math.floor(Math.random() * 50 + 150) + 'ms' : '---'}
-                  </span>
+                </div>
+                <div className="dash-sub" data-testid="resource-node-metrics" style={{ fontFamily: 'JetBrains Mono' }}>
+                  Node {resourceMetrics.currentNodeHost || "unresolved"} | Multi-Client Rotations {resourceMetrics.multiClientRotations || 0} (Pool: {resourceMetrics.multiClientCount || 0}) | 429/503 {resourceMetrics.throttleCount} | Timeouts {resourceMetrics.timeoutCount}
                 </div>
               </div>
             </div>
-          ))
-        )}
-      </div >
+          </div>
+
+          <div className="main-workspace">
+            <div className="panel" style={{ flex: 1 }}>
+              <div className="panel-header">
+                <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <Terminal size={14} /> Forensic Log
+                </span>
+              </div>
+              <div className="panel-content">
+                <div className="forensic-log">
+                  {previewLogs.map((log, i) => (
+                    <div key={i} className="term-line">
+                      <span className="term-prefix">{String(i).padStart(4, '0')}</span>
+                      {log}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="panel" style={{ flex: 1.5, position: 'relative' }}>
+              <div className="panel-header">
+                <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <ListTree size={14} /> Virtual File System
+                </span>
+                <span style={{ fontSize: "0.8rem", color: "var(--accent-secondary)", background: "rgba(0, 229, 255, 0.1)", padding: "2px 8px", borderRadius: "12px", border: "1px solid rgba(0, 229, 255, 0.3)" }}>
+                  {vfsStats.totalNodes.toLocaleString()} Nodes
+                </span>
+              </div>
+              <div className="panel-content" style={{ padding: 0 }}>
+                <div className="vfs-container" style={{ height: '100%', overflow: 'auto' }}>
+                  {VFS_FIXTURE_STATS.totalNodes === 0 ? (
+                    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)' }}>
+                      No files detected in virtual file system.
+                    </div>
+                  ) : (
+                    VFS_FIXTURE_ENTRIES.map((entry) => (
+                      <div
+                        key={entry.path}
+                        className="vfs-row"
+                        data-testid={`vfs-row-${encodeURIComponent(entry.path)}`}
+                        style={{ minHeight: '36px', paddingLeft: `${entry.path.split('/').length * 18}px` }}
+                      >
+                        <div className="vfs-icon" style={{ marginLeft: '12px' }}>
+                          <ListTree size={14} color={entry.entry_type === "Folder" ? "var(--accent-primary)" : "var(--text-muted)"} />
+                        </div>
+                        <span className="vfs-name">{entry.path.split('/').pop() || entry.path}</span>
+                        <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-end', paddingRight: '12px' }}>
+                          <span className="vfs-size">
+                            {entry.size_bytes == null ? '--' : entry.size_bytes.toLocaleString()}
+                          </span>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="network-monitor">
+            {Array.from({ length: Math.max(activeDaemons, 1) }).map((_, idx) => (
+              <div key={idx} className="daemon-box">
+                <div className="daemon-icon">
+                  <Zap size={18} />
+                </div>
+                <div className="daemon-info">
+                  <div className="daemon-header">ARTI NODE {idx + 1}</div>
+                  <div className="daemon-body">
+                    <span style={{ color: 'var(--text-muted)' }}>STANDBY</span>
+                    <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', fontFamily: 'JetBrains Mono' }}>---</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          <Dashboard
+            isCrawling={isCrawling}
+            torStatus={torStatus}
+            activeAdapter={activeAdapter}
+            crawlStatus={crawlStatus}
+            downloadBatchStatus={downloadBatchStatus}
+            logs={logs}
+            vfsCount={vfsStats.totalNodes}
+            vfsRefreshTrigger={vfsRefreshTrigger}
+            downloadProgress={downloadProgress}
+            elapsed={crawlElapsed}
+            downloadElapsed={downloadElapsed}
+            resourceMetrics={resourceMetrics}
+            efficiencyHistory={efficiencyHistory}
+            crawlRunStatus={lastCrawlResult}
+            downloadResumePlan={downloadResumePlan}
+            ceilingStatus={ceilingStatus}
+            onAzureClick={() => setShowAzureModal(true)}
+          />
+
+          <div className="main-workspace">
+            <div className="panel" style={{ flex: 1 }}>
+              <div className="panel-header">
+                <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <Terminal size={14} /> Forensic Log
+                </span>
+              </div>
+              <div className="panel-content">
+                <div style={{
+                  display: 'grid',
+                  gap: '6px',
+                  maxHeight: '180px',
+                  overflow: 'auto',
+                  padding: '8px 10px',
+                  borderBottom: '1px solid rgba(255,255,255,0.06)',
+                  background: 'rgba(255,255,255,0.02)'
+                }}>
+                  <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                    Unique Message Summary
+                  </div>
+                  {aggregateRows.length === 0 ? (
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                      Waiting for crawl and downloader logs...
+                    </div>
+                  ) : aggregateRows.map((aggregate) => (
+                    <div
+                      key={aggregate.key}
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '56px 1fr',
+                        gap: '8px',
+                        padding: '6px 8px',
+                        border: '1px solid rgba(255,255,255,0.06)',
+                        borderRadius: '6px',
+                        background: 'rgba(10, 14, 20, 0.55)'
+                      }}
+                    >
+                      <div style={{ fontFamily: 'JetBrains Mono', color: 'var(--accent-primary)', fontSize: '0.78rem' }}>
+                        ×{aggregate.count}
+                      </div>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: '0.8rem', color: 'var(--text-main)', wordBreak: 'break-word' }}>
+                          {aggregate.sample}
+                        </div>
+                        <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontFamily: 'JetBrains Mono' }}>
+                          First {new Date(aggregate.firstSeenAt).toLocaleTimeString()} | Last {new Date(aggregate.lastSeenAt).toLocaleTimeString()}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="forensic-log">
+                  {logs.map((log, i) => (
+                    <div key={i} className="term-line" style={{
+                      color: log.includes("ERROR") ? "#EF4444" :
+                        log.includes("FOUND") ? "var(--accent-primary)" :
+                          log.includes("Match found") ? "var(--accent-primary)" :
+                            log.includes("Target") ? "var(--accent-secondary)" :
+                              log.includes("TOR") ? "#a78bfa" :
+                                log.includes("MIRROR") ? "#10B981" :
+                                  log.includes("EXPORT") ? "#60A5FA" :
+                                    log.includes("⚠") ? "#fbbf24" :
+                                      "var(--text-main)"
+                    }}>
+                      <span className="term-prefix">{String(i).padStart(4, '0')}</span>
+                      {log}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="panel" style={{ flex: 1.5, position: 'relative' }}>
+              <div className="panel-header">
+                <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <ListTree size={14} /> Virtual File System
+                </span>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  {vfsStats.totalNodes > 0 && (
+                    <span style={{
+                      fontSize: "0.75rem",
+                      color: "var(--text-muted)",
+                      fontFamily: "JetBrains Mono",
+                    }}>
+                      {vfsStats.folders} dirs · {vfsStats.files} files · {totalSizeStr}
+                    </span>
+                  )}
+                  <span style={{ fontSize: "0.8rem", color: "var(--accent-secondary)", background: "rgba(0, 229, 255, 0.1)", padding: "2px 8px", borderRadius: "12px", border: "1px solid rgba(0, 229, 255, 0.3)" }}>
+                    {vfsStats.totalNodes.toLocaleString()} Nodes
+                  </span>
+                  {vfsStats.totalNodes > 0 && !isCrawling && (
+                    <>
+                      <button
+                        className="action-btn popup-hover"
+                        data-testid="btn-mass-extract-all"
+                        onClick={handleDownloadAll}
+                        style={{ padding: '2px 12px', fontSize: '0.75rem', height: '28px', minWidth: 'auto', background: 'transparent', border: '1px solid var(--border-hud)', color: 'var(--accent-secondary)', display: 'flex', gap: '6px', alignItems: 'center' }}
+                        title="Safely Scaffold All Indexed Entries via Multi-Threading"
+                      >
+                        <Download size={12} /> Mass Extract All
+                      </button>
+                      {selectedFiles.length > 0 && (
+                        <button
+                          className="action-btn popup-hover"
+                          data-testid="btn-download-selected"
+                          onClick={handleDownloadSelected}
+                          style={{ padding: '2px 12px', fontSize: '0.75rem', height: '28px', minWidth: 'auto', background: 'rgba(0, 229, 255, 0.1)', border: '1px solid var(--border-hud)', color: 'var(--accent-secondary)', display: 'flex', gap: '6px', alignItems: 'center' }}
+                          title="Download selected items."
+                        >
+                          <Download size={12} /> Download Selected ({selectedFiles.length})
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+              <div className="panel-content" style={{ padding: 0 }}>
+                <VFSExplorer
+                  triggerRefresh={vfsRefreshTrigger}
+                  onDownload={handleDownload}
+                  onSelectionChange={setSelectedFiles}
+                  downloadProgress={downloadProgress}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="network-monitor">
+            {activeDaemons > 6 ? (
+              <div className="daemon-box" style={{ flex: 1, justifyContent: "center" }}>
+                <div className="daemon-icon">
+                  {isCrawling ? <VibeLoader size={18} variant="secondary" /> : <Zap size={18} />}
+                </div>
+                <div className="daemon-info" style={{ flex: "none" }}>
+                  <div className="daemon-header">ARTI SWARM ({activeDaemons} NODES)</div>
+                  <div className="daemon-body">
+                    <span style={{ fontSize: '0.85rem', color: 'var(--accent-secondary)', fontFamily: 'JetBrains Mono', wordBreak: 'break-all' }}>
+                      MODE: NATIVE MEMORY
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              Array.from({ length: activeDaemons }).map((_, idx) => (
+                <div key={idx} className="daemon-box">
+                  <div className="daemon-icon">
+                    {isCrawling ? <VibeLoader size={18} variant="secondary" /> : <Zap size={18} />}
+                  </div>
+                  <div className="daemon-info">
+                    <div className="daemon-header">ARTI NODE {idx + 1}</div>
+                    <div className="daemon-body">
+                      <span style={{ color: isCrawling ? 'var(--accent-primary)' : 'var(--text-muted)' }}>
+                        {isCrawling ? 'ACTIVE' : 'STANDBY'}
+                      </span>
+                      <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', fontFamily: 'JetBrains Mono' }}>
+                        {isCrawling ? Math.floor(Math.random() * 50 + 150) + 'ms' : '---'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div >
+        </>
+      )}
 
       {/* Phase 53: Azure Connectivity Modal */}
       <AzureConnectivityModal isOpen={showAzureModal} onClose={() => setShowAzureModal(false)} />

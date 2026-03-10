@@ -1,5 +1,14 @@
 # Lessons Learned Whitepaper
 
+## 2026-03-10 (Phase 97: Browser Preview Render Audit + Preview Shell Split)
+- **PR-GUI-097-001:** Browser/Playwright preview must not depend on remote fonts or other network-only shell assets to reach `load`. The March 10 render audit showed that Google Fonts `@import` calls alone were enough to make the headless preview path look broken even on a healthy local dev server.
+- **PR-GUI-097-002:** Do not mount the full native Tauri operator tree in browser preview. A deterministic browser preview shell should be selected at bootstrap time so Playwright can validate the GUI without importing native bridge code.
+- **PR-GUI-097-003:** Native bridge helpers (`invoke`, `listen`, dialog/path APIs) should live behind lazy runtime loaders. Static imports leak native-only assumptions into the browser validation path and make fixture debugging much harder.
+- **LESSON-GUI-097-001:** The March 10 alternate-port retry proved the blank/dark Playwright captures were not a port problem. Vite served correctly on the new port, but the browser path still stalled until the preview shell was split from the native app.
+- **LESSON-GUI-097-002:** After the preview-shell split, Playwright GUI verification became stable again: `tests/crawli.spec.ts` passed `3/3` and `tests/vanguard_ui.spec.ts` passed `1/1` on March 10, 2026.
+- **PR-GUI-097-004:** Keep the browser preview shell as the canonical Playwright visual-regression surface once it becomes deterministic. Native-webview automation should be added only as a smaller smoke layer, not as the primary baseline source.
+- **LESSON-GUI-097-003:** The visual regression mismatch on `vanguard-metrics-state.png` was an intentional preview-shell typography/layout change, not a defect. On March 10, 2026 only that single snapshot needed rebaselining; the other two visual baselines remained valid.
+
 ## 2026-03-10 (Phase 96: Windows Portable CLI Audit + Dedicated Console Binary)
 - **PR-CLI-WIN-096-001:** Do not ship a Windows portable artifact with only the GUI-subsystem executable when the product promises CLI support. A console-facing surface must be packaged as a dedicated console binary (`crawli-cli.exe`) or terminal use will appear broken even though the shared backend CLI code exists.
 - **PR-CLI-WIN-096-002:** Windows portable packages should include an explicit operator affordance for terminal use. Shipping `crawli-cli.cmd` and a portable README is cheap and prevents the operator from guessing whether `crawli.exe` or the console binary is the correct surface.

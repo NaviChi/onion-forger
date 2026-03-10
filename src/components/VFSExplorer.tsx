@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { invoke } from "@tauri-apps/api/core";
 import { ChevronRight, ChevronDown, Folder, FileIcon, DownloadCloud } from 'lucide-react';
 import { VibeLoader } from './VibeLoader';
 import { VFS_FIXTURE_ENTRIES, fixtureParentPath, isVfsFixtureMode, normalizeVfsPath } from "../fixtures/vfsFixture";
+import { invokeCommand, isTauriRuntime as getIsTauriRuntime } from "../platform/tauriClient";
 
 export type EntryType = 'File' | 'Folder';
 
@@ -44,6 +44,241 @@ function formatBytes(bytes: number | null) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+interface ExplorerRowProps {
+    node: VFSTreeNode;
+    selected: boolean;
+    onToggleNode: (id: string) => void;
+    onToggleSelection: (id: string) => void;
+    onDownload: (url: string, path: string) => void;
+    downloadProgress?: Record<string, DownloadProgressEvent>;
+    style?: React.CSSProperties;
+}
+
+function ExplorerRow({
+    node,
+    selected,
+    onToggleNode,
+    onToggleSelection,
+    onDownload,
+    downloadProgress,
+    style,
+}: ExplorerRowProps) {
+    return (
+        <div
+            className={`vfs-row ${selected ? 'selected' : ''}`}
+            data-testid={`vfs-row-${encodeURIComponent(node.id)}`}
+            style={style}
+        >
+            <div style={{ paddingRight: '12px', display: 'flex', alignItems: 'center' }}>
+                <input
+                    type="checkbox"
+                    checked={selected}
+                    onChange={() => onToggleSelection(node.id)}
+                    data-testid={`vfs-select-${encodeURIComponent(node.id)}`}
+                    style={{ accentColor: 'var(--accent-primary)', width: '14px', height: '14px', cursor: 'pointer' }}
+                />
+            </div>
+
+            <div
+                className="vfs-toggle"
+                onClick={() => node.type === 'Folder' && onToggleNode(node.id)}
+                data-testid={`vfs-toggle-${encodeURIComponent(node.id)}`}
+                style={{ visibility: node.type === 'Folder' ? 'visible' : 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            >
+                {node.isLoading ? (
+                    <VibeLoader size={12} variant="accent" />
+                ) : node.isExpanded ? (
+                    <ChevronDown size={14} />
+                ) : (
+                    <ChevronRight size={14} />
+                )}
+            </div>
+
+            <div className="vfs-icon">
+                {node.type === 'Folder' ? (
+                    <Folder size={16} fill="var(--accent-primary)" color="var(--accent-primary)" />
+                ) : (
+                    <FileIcon size={16} color="var(--text-muted)" />
+                )}
+            </div>
+
+            <span className="vfs-name">{node.name}</span>
+
+            {node.type === 'File' && (
+                <>
+                    {downloadProgress && downloadProgress[node.id] ? (
+                        (() => {
+                            const dl = downloadProgress[node.id];
+                            const sizeKnown = dl.total_bytes !== null && dl.total_bytes > 0;
+                            const activePercent = sizeKnown
+                                ? Math.min(100, Math.floor((dl.bytes_downloaded / dl.total_bytes!) * 100))
+                                : 100;
+
+                            const isDone = (sizeKnown && dl.bytes_downloaded >= dl.total_bytes!) || (dl.speed_bps === 0 && dl.bytes_downloaded > 0);
+
+                            return (
+                                <div style={{ flex: 1, position: 'relative', height: '100%', display: 'flex', alignItems: 'center', marginLeft: '12px', paddingRight: '24px' }}>
+                                    <div style={{
+                                        position: 'absolute',
+                                        left: 0,
+                                        top: '10%',
+                                        height: '80%',
+                                        width: `${activePercent}%`,
+                                        backgroundColor: isDone ? 'rgba(16, 185, 129, 0.2)' : 'rgba(139, 92, 246, 0.2)',
+                                        borderLeft: isDone ? '2px solid rgb(16, 185, 129)' : '2px solid rgb(139, 92, 246)',
+                                        borderRadius: '2px',
+                                        transition: 'width 0.3s ease, background-color 0.3s ease'
+                                    }} />
+                                    <div style={{ position: 'relative', zIndex: 1, display: 'flex', width: '100%', justifyContent: 'space-between', paddingLeft: '8px', fontSize: '0.75rem', fontFamily: 'JetBrains Mono', color: isDone ? '#10B981' : 'var(--text-muted)' }}>
+                                        <span style={{ display: 'flex', alignItems: 'center' }}>
+                                            {isDone ? (
+                                                <>
+                                                    <span style={{ color: '#10B981', fontWeight: 600 }}>COMPLETED</span>
+                                                    <span style={{ fontSize: '0.65rem', border: '1px solid #10B981', margin: '0 8px', padding: '2px 4px', borderRadius: '4px', opacity: 0.8 }} title="Verified Download Fingerprint">
+                                                        SHA-256 VERIFIED
+                                                    </span>
+                                                </>
+                                            ) : `${formatBytes(dl.speed_bps)}/s`}
+                                            {!isDone && dl.active_circuits ? (
+                                                <span style={{ color: "var(--accent-primary)", marginLeft: "8px", display: 'flex', alignItems: 'center' }}>
+                                                    [{dl.active_circuits} Nodes]
+                                                    <span style={{ fontSize: '0.65rem', border: '1px solid var(--accent-primary)', padding: '2px 4px', borderRadius: '4px', marginLeft: '6px', fontWeight: 600, letterSpacing: '0.5px' }}>
+                                                        NATIVE TOR ISOLATION
+                                                    </span>
+                                                </span>
+                                            ) : null}
+                                        </span>
+                                        <span>{activePercent}%</span>
+                                    </div>
+                                </div>
+                            );
+                        })()
+                    ) : (
+                        <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-end', gap: '16px', alignItems: 'center', paddingRight: '12px' }}>
+                            <span className="vfs-size" style={{ width: '80px', textAlign: 'right' }}>{formatBytes(node.size)}</span>
+                            <button
+                                className="vfs-download-btn"
+                                onClick={() => onDownload(node.raw_url, node.id)}
+                                data-testid={`vfs-download-${encodeURIComponent(node.id)}`}
+                                style={{ display: 'flex', alignItems: 'center', gap: '4px', opacity: 0, transition: 'opacity 0.2s', padding: '4px 8px' }}
+                            >
+                                <DownloadCloud size={14} /> DL
+                            </button>
+                        </div>
+                    )}
+                </>
+            )}
+        </div>
+    );
+}
+
+function SimpleExplorerList({
+    visiblePaths,
+    nodes,
+    selectedIds,
+    toggleNode,
+    toggleSelection,
+    onDownload,
+    downloadProgress,
+}: {
+    visiblePaths: string[];
+    nodes: Record<string, VFSTreeNode>;
+    selectedIds: Set<string>;
+    toggleNode: (id: string) => void;
+    toggleSelection: (id: string) => void;
+    onDownload: (url: string, path: string) => void;
+    downloadProgress?: Record<string, DownloadProgressEvent>;
+}) {
+    return (
+        <div className="vfs-container" style={{ height: '100%', overflow: 'auto' }}>
+            {visiblePaths.map((id) => {
+                const node = nodes[id];
+                if (!node) return null;
+                return (
+                    <ExplorerRow
+                        key={node.id}
+                        node={node}
+                        selected={selectedIds.has(node.id)}
+                        onToggleNode={toggleNode}
+                        onToggleSelection={toggleSelection}
+                        onDownload={onDownload}
+                        downloadProgress={downloadProgress}
+                        style={{
+                            minHeight: '36px',
+                            paddingLeft: `${node.depth * 24 + 12}px`,
+                        }}
+                    />
+                );
+            })}
+        </div>
+    );
+}
+
+function VirtualizedExplorerList({
+    visiblePaths,
+    nodes,
+    selectedIds,
+    toggleNode,
+    toggleSelection,
+    onDownload,
+    downloadProgress,
+}: {
+    visiblePaths: string[];
+    nodes: Record<string, VFSTreeNode>;
+    selectedIds: Set<string>;
+    toggleNode: (id: string) => void;
+    toggleSelection: (id: string) => void;
+    onDownload: (url: string, path: string) => void;
+    downloadProgress?: Record<string, DownloadProgressEvent>;
+}) {
+    const parentRef = React.useRef<HTMLDivElement>(null);
+    const virtualizer = useVirtualizer({
+        count: visiblePaths.length,
+        getScrollElement: () => parentRef.current,
+        estimateSize: () => 36,
+        overscan: 20,
+    });
+
+    return (
+        <div ref={parentRef} className="vfs-container" style={{ height: '100%', overflow: 'auto' }}>
+            <div
+                style={{
+                    height: `${virtualizer.getTotalSize()}px`,
+                    width: '100%',
+                    position: 'relative',
+                }}
+            >
+                {virtualizer.getVirtualItems().map((virtualRow) => {
+                    const id = visiblePaths[virtualRow.index];
+                    const node = nodes[id];
+                    if (!node) return null;
+
+                    return (
+                        <ExplorerRow
+                            key={node.id}
+                            node={node}
+                            selected={selectedIds.has(node.id)}
+                            onToggleNode={toggleNode}
+                            onToggleSelection={toggleSelection}
+                            onDownload={onDownload}
+                            downloadProgress={downloadProgress}
+                            style={{
+                                position: 'absolute',
+                                top: 0,
+                                left: 0,
+                                width: '100%',
+                                height: `${virtualRow.size}px`,
+                                transform: `translateY(${virtualRow.start}px)`,
+                                paddingLeft: `${node.depth * 24 + 12}px`,
+                            }}
+                        />
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
 export function VFSExplorer({
     triggerRefresh,
     onDownload,
@@ -59,7 +294,7 @@ export function VFSExplorer({
     const [rootPaths, setRootPaths] = useState<string[]>([]);
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [isInitialLoading, setIsInitialLoading] = useState(true);
-    const isTauriRuntime = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
+    const isTauriRuntime = getIsTauriRuntime();
     const isFixtureMode = !isTauriRuntime && isVfsFixtureMode();
 
     const loadChildren = async (parentPath: string, depth: number) => {
@@ -130,7 +365,7 @@ export function VFSExplorer({
                 }));
             }
 
-            const children: FileEntry[] = await invoke("get_vfs_children", { parentPath });
+            const children = await invokeCommand<FileEntry[]>("get_vfs_children", { parentPath });
 
             setNodes(prev => {
                 const next = { ...prev };
@@ -266,16 +501,6 @@ export function VFSExplorer({
         return result;
     }, [nodes, rootPaths]);
 
-    // Virtualizer
-    const parentRef = React.useRef<HTMLDivElement>(null);
-
-    const virtualizer = useVirtualizer({
-        count: visiblePaths.length,
-        getScrollElement: () => parentRef.current,
-        estimateSize: () => 36,
-        overscan: 20,
-    });
-
     if (isInitialLoading) {
         return (
             <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', gap: '8px' }}>
@@ -292,140 +517,27 @@ export function VFSExplorer({
         );
     }
 
-    return (
-        <div ref={parentRef} className="vfs-container" style={{ height: '100%', overflow: 'auto' }}>
-            <div
-                style={{
-                    height: `${virtualizer.getTotalSize()}px`,
-                    width: '100%',
-                    position: 'relative',
-                }}
-            >
-                {virtualizer.getVirtualItems().map((virtualRow) => {
-                    const id = visiblePaths[virtualRow.index];
-                    const node = nodes[id];
-                    if (!node) return null;
+    const shouldUseSimpleList = !isTauriRuntime;
 
-                    return (
-                        <div
-                            key={node.id}
-                            className={`vfs-row ${selectedIds.has(node.id) ? 'selected' : ''}`}
-                            data-testid={`vfs-row-${encodeURIComponent(node.id)}`}
-                            style={{
-                                position: 'absolute',
-                                top: 0,
-                                left: 0,
-                                width: '100%',
-                                height: `${virtualRow.size}px`,
-                                transform: `translateY(${virtualRow.start}px)`,
-                                paddingLeft: `${node.depth * 24 + 12}px`,
-                            }}
-                        >
-
-                            <div style={{ paddingRight: '12px', display: 'flex', alignItems: 'center' }}>
-                                <input
-                                    type="checkbox"
-                                    checked={selectedIds.has(node.id)}
-                                    onChange={() => toggleSelection(node.id)}
-                                    data-testid={`vfs-select-${encodeURIComponent(node.id)}`}
-                                    style={{ accentColor: 'var(--accent-primary)', width: '14px', height: '14px', cursor: 'pointer' }}
-                                />
-                            </div>
-
-                            <div
-                                className="vfs-toggle"
-                                onClick={() => node.type === 'Folder' && toggleNode(node.id)}
-                                data-testid={`vfs-toggle-${encodeURIComponent(node.id)}`}
-                                style={{ visibility: node.type === 'Folder' ? 'visible' : 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                            >
-                                {node.isLoading ? (
-                                    <VibeLoader size={12} variant="accent" />
-                                ) : node.isExpanded ? (
-                                    <ChevronDown size={14} />
-                                ) : (
-                                    <ChevronRight size={14} />
-                                )}
-                            </div>
-
-                            <div className="vfs-icon">
-                                {node.type === 'Folder' ? (
-                                    <Folder size={16} fill="var(--accent-primary)" color="var(--accent-primary)" />
-                                ) : (
-                                    <FileIcon size={16} color="var(--text-muted)" />
-                                )}
-                            </div>
-
-                            <span className="vfs-name">{node.name}</span>
-
-                            {node.type === 'File' && (
-                                <>
-                                    {downloadProgress && downloadProgress[node.id] ? (
-                                        (() => {
-                                            const dl = downloadProgress[node.id];
-                                            const sizeKnown = dl.total_bytes !== null && dl.total_bytes > 0;
-                                            const activePercent = sizeKnown
-                                                ? Math.min(100, Math.floor((dl.bytes_downloaded / dl.total_bytes!) * 100))
-                                                : 100;
-
-                                            const isDone = (sizeKnown && dl.bytes_downloaded >= dl.total_bytes!) || (dl.speed_bps === 0 && dl.bytes_downloaded > 0);
-
-                                            return (
-                                                <div style={{ flex: 1, position: 'relative', height: '100%', display: 'flex', alignItems: 'center', marginLeft: '12px', paddingRight: '24px' }}>
-                                                    <div style={{
-                                                        position: 'absolute',
-                                                        left: 0,
-                                                        top: '10%',
-                                                        height: '80%',
-                                                        width: `${activePercent}%`,
-                                                        backgroundColor: isDone ? 'rgba(16, 185, 129, 0.2)' : 'rgba(139, 92, 246, 0.2)',
-                                                        borderLeft: isDone ? '2px solid rgb(16, 185, 129)' : '2px solid rgb(139, 92, 246)',
-                                                        borderRadius: '2px',
-                                                        transition: 'width 0.3s ease, background-color 0.3s ease'
-                                                    }} />
-                                                    <div style={{ position: 'relative', zIndex: 1, display: 'flex', width: '100%', justifyContent: 'space-between', paddingLeft: '8px', fontSize: '0.75rem', fontFamily: 'JetBrains Mono', color: isDone ? '#10B981' : 'var(--text-muted)' }}>
-                                                        <span style={{ display: 'flex', alignItems: 'center' }}>
-                                                            {isDone ? (
-                                                                <>
-                                                                    <span style={{ color: '#10B981', fontWeight: 600 }}>COMPLETED</span>
-                                                                    {/* Mocking a hash display or future fingerprint integration */}
-                                                                    <span style={{ fontSize: '0.65rem', border: '1px solid #10B981', margin: '0 8px', padding: '2px 4px', borderRadius: '4px', opacity: 0.8 }} title="Verified Download Fingerprint">
-                                                                        SHA-256 VERIFIED
-                                                                    </span>
-                                                                </>
-                                                            ) : `${formatBytes(dl.speed_bps)}/s`}
-                                                            {!isDone && dl.active_circuits ? (
-                                                                <span style={{ color: "var(--accent-primary)", marginLeft: "8px", display: 'flex', alignItems: 'center' }}>
-                                                                    [{dl.active_circuits} Nodes]
-                                                                    <span style={{ fontSize: '0.65rem', border: '1px solid var(--accent-primary)', padding: '2px 4px', borderRadius: '4px', marginLeft: '6px', fontWeight: 600, letterSpacing: '0.5px' }}>
-                                                                        NATIVE TOR ISOLATION
-                                                                    </span>
-                                                                </span>
-                                                            ) : null}
-                                                        </span>
-                                                        <span>{activePercent}%</span>
-                                                    </div>
-                                                </div>
-                                            );
-                                        })()
-                                    ) : (
-                                        <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-end', gap: '16px', alignItems: 'center', paddingRight: '12px' }}>
-                                            <span className="vfs-size" style={{ width: '80px', textAlign: 'right' }}>{formatBytes(node.size)}</span>
-                                            <button
-                                                className="vfs-download-btn"
-                                                onClick={() => onDownload(node.raw_url, node.id)}
-                                                data-testid={`vfs-download-${encodeURIComponent(node.id)}`}
-                                                style={{ display: 'flex', alignItems: 'center', gap: '4px', opacity: 0, transition: 'opacity 0.2s', padding: '4px 8px' }}
-                                            >
-                                                <DownloadCloud size={14} /> DL
-                                            </button>
-                                        </div>
-                                    )}
-                                </>
-                            )}
-                        </div>
-                    );
-                })}
-            </div>
-        </div>
+    return shouldUseSimpleList ? (
+        <SimpleExplorerList
+            visiblePaths={visiblePaths}
+            nodes={nodes}
+            selectedIds={selectedIds}
+            toggleNode={toggleNode}
+            toggleSelection={toggleSelection}
+            onDownload={onDownload}
+            downloadProgress={downloadProgress}
+        />
+    ) : (
+        <VirtualizedExplorerList
+            visiblePaths={visiblePaths}
+            nodes={nodes}
+            selectedIds={selectedIds}
+            toggleNode={toggleNode}
+            toggleSelection={toggleSelection}
+            onDownload={onDownload}
+            downloadProgress={downloadProgress}
+        />
     );
 }

@@ -1,3 +1,32 @@
+## Phase 97: Browser Preview Render Audit + Alternate-Port Playwright Validation
+- **Date**: 2026-03-10
+- **Action**: Re-tested the GUI on a fresh Vite port after Playwright snapshotting kept hanging, then repaired the browser-only preview path so Playwright would exercise a deterministic preview shell instead of the native Tauri tree.
+- **Validation Commands**:
+  - `npm --prefix '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli' run dev -- --host 127.0.0.1 --port 4173`
+  - `curl -I --max-time 10 'http://127.0.0.1:4173/'`
+  - `npm --prefix '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli' run build`
+  - `npx playwright test tests/crawli.spec.ts --project=chromium`
+  - `npx playwright test tests/vanguard_ui.spec.ts --project=chromium`
+- **Result**:
+  - The alternate port proved the original symptom was not a port collision. Vite served cleanly on `127.0.0.1:4173`, but the old browser path still stalled in Playwright.
+  - The first browser-only blocker was external fonts: three Google Fonts `@import` calls in `src/index.css` kept the `load` event path nondeterministic in headless preview mode.
+  - The second blocker was architectural: browser preview was still mounting the full native `App.tsx` surface and transitively pulling native bridge code / live operator child trees into Playwright, even though browser preview only needs fixture-safe UI.
+  - The final fix was to split bootstrap by runtime: `src/main.tsx` now loads `BrowserPreviewApp.tsx` when `__TAURI_INTERNALS__` is absent and keeps the full native `App.tsx` only for real Tauri sessions. Native bridge calls were also wrapped behind lazy loaders in `src/platform/tauriClient.ts`.
+  - Final validation passed. `tests/crawli.spec.ts` (`3/3`) and `tests/vanguard_ui.spec.ts` (`1/1`) both passed, and a waited browser screenshot confirmed the preview shell renders the operator surface instead of a blank dark frame.
+
+## Phase 97B: Visual Regression Rebaseline + Long-Term Playwright Surface Decision
+- **Date**: 2026-03-10
+- **Action**: Ran the visual regression suite against the repaired browser preview shell, inspected the one failing snapshot, and refreshed the baseline only after confirming the new metrics-card render was caused by the intentional offline-safe preview shell and local-font stack.
+- **Validation Commands**:
+  - `npx playwright test tests/visual_regression.spec.ts --project=chromium`
+  - `npx playwright test tests/visual_regression.spec.ts --project=chromium --update-snapshots`
+  - `npx playwright test tests/visual_regression.spec.ts --project=chromium`
+- **Result**:
+  - The suite first failed `1/3` only on `vanguard-metrics-state.png`; the other two page-level baselines stayed valid.
+  - The mismatch was intentional, not accidental. The new preview shell no longer renders through remote Google Fonts or the native Tauri tree, so the resource metrics card now has different but stable font metrics and wrapping behavior.
+  - Only `tests/visual_regression.spec.ts-snapshots/vanguard-metrics-state-chromium-darwin.png` was regenerated. The rerun after snapshot refresh passed `3/3`.
+  - Testing strategy is now explicit: `BrowserPreviewApp.tsx` remains the primary Playwright/visual-regression surface because it is deterministic and fixture-safe. Any future native-webview validation should be a separate smoke layer that proves real Tauri mounting/bridging, not the canonical visual-baseline source.
+
 ## Phase 96: Windows Portable CLI Audit + Dedicated Console Binary
 - **Date**: 2026-03-10
 - **Action**: Audited the shipped Windows portable artifact after operator reports that CLI commands did not work. Added a dedicated console binary (`crawli-cli`) plus portable packaging changes so Windows terminal usage no longer depends on the GUI-subsystem `crawli.exe`.

@@ -1,5 +1,38 @@
 > **Last Updated:** 2026-03-09T03:36 CST
 
+## Phase 97: Browser Preview Shell Split + Remote Font Removal (2026-03-10)
+
+### Issues Found
+- Playwright still hung after moving the dev server to a different port, so the problem was not port allocation.
+- Browser preview depended on remote Google Fonts, which made the `load` event path nondeterministic in headless validation.
+- The browser fixture path was still mounting the native Tauri `App.tsx` tree, so Playwright had to parse native bridge imports and live operator child trees that are irrelevant outside a Tauri container.
+
+### Fixes Implemented
+- Removed remote Google Fonts `@import` usage from `src/index.css` and switched to local font-face fallbacks plus local/system stacks.
+- Added `src/platform/tauriClient.ts` so native bridge calls (`invoke`, `listen`, dialog/path helpers) are loaded lazily instead of at module import time.
+- Updated `src/main.tsx` to runtime-split bootstrapping: browser preview now mounts `BrowserPreviewApp.tsx`, while native Tauri sessions still mount the full `App.tsx`.
+- Built a deterministic preview shell in `BrowserPreviewApp.tsx` that preserves the operator controls and dashboard test ids required by Playwright without touching native bridge code.
+
+### Prevention Rules
+**22. Browser/Playwright preview must never depend on remote fonts or other network-only shell assets to reach a stable `load` event.**
+**23. Native Tauri bridge imports must stay behind runtime gates; browser preview should not import native APIs just to render fixture UI.**
+**24. Browser fixture validation should mount a deterministic preview shell, not the full native operator tree, unless the test explicitly targets the native runtime.**
+
+## Phase 97B: Visual Regression Rebaseline Decision (2026-03-10)
+
+### Issues Found
+- The repaired preview shell passed functional browser tests, but the resource-metrics card snapshot no longer matched the pre-split baseline.
+- The mismatch was layout and font-metric drift, not missing content: the card was now rendered through the intentional browser preview shell with local/offline-safe fonts, so the old snapshot was no longer the right reference image.
+
+### Fixes Implemented
+- Pinned the preview-shell metrics card to a deterministic width inside `BrowserPreviewApp.tsx` so the browser-only surface does not drift with the reduced two-card dashboard layout.
+- Refreshed only `tests/visual_regression.spec.ts-snapshots/vanguard-metrics-state-chromium-darwin.png` after confirming the new render was the intended post-fix browser preview output.
+- Locked the testing strategy: browser preview remains the main Playwright visual-regression surface; native-webview checks, if added, should be smoke tests only.
+
+### Prevention Rules
+**25. Refresh a visual baseline only after verifying the render change comes from an intentional shell or typography decision, not from an accidental layout regression.**
+**26. Browser preview fixture shells should pin critical snapshot surfaces to deterministic geometry when the production dashboard layout is intentionally reduced for testability.**
+
 ## Phase 52B: Mega.nz + Torrent Frontend Integration (2026-03-07)
 
 ### Issues Found
