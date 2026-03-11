@@ -283,30 +283,6 @@ pub fn display_path(path: &Path) -> String {
     normalize_windows_device_path(&path.to_string_lossy())
 }
 
-/// Returns true when the selected output root sits directly under a Windows
-/// drive/share root. In that layout, the sibling support root would land at the
-/// volume/share root itself, so support artifacts should stay inside the output
-/// directory instead.
-pub fn windows_output_root_has_volume_or_share_parent(raw_output_root: &str) -> bool {
-    let normalized = normalize_windows_device_path(raw_output_root).replace('/', "\\");
-    let trimmed = normalized.trim_end_matches('\\');
-    let bytes = trimmed.as_bytes();
-
-    if bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
-        return !trimmed[3..].is_empty() && !trimmed[3..].contains('\\');
-    }
-
-    if let Some(rest) = trimmed.strip_prefix("\\\\") {
-        let components = rest
-            .split('\\')
-            .filter(|component| !component.is_empty())
-            .collect::<Vec<_>>();
-        return components.len() == 3;
-    }
-
-    false
-}
-
 pub fn resolve_path_within_root(
     output_root: &Path,
     raw_path: &str,
@@ -518,25 +494,5 @@ mod tests {
             normalize_windows_device_path(r"X:\Exports\Case1"),
             r"X:\Exports\Case1"
         );
-    }
-
-    #[test]
-    fn test_windows_output_root_has_volume_or_share_parent() {
-        assert!(windows_output_root_has_volume_or_share_parent(
-            r"\\?\X:\Exports"
-        ));
-        assert!(windows_output_root_has_volume_or_share_parent(
-            r"X:\Exports"
-        ));
-        assert!(windows_output_root_has_volume_or_share_parent(
-            r"\\?\UNC\server\share\Exports"
-        ));
-        assert!(!windows_output_root_has_volume_or_share_parent(
-            r"\\?\X:\Exports\Case1"
-        ));
-        assert!(!windows_output_root_has_volume_or_share_parent(r"X:\"));
-        assert!(!windows_output_root_has_volume_or_share_parent(
-            r"\\server\share"
-        ));
     }
 }

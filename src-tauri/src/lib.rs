@@ -347,15 +347,6 @@ fn support_key_for_path(path: &str) -> String {
 pub(crate) fn support_artifact_dir_for_output_root(
     output_root: &std::path::Path,
 ) -> std::path::PathBuf {
-    let anchor = output_root.parent().unwrap_or(output_root);
-    anchor
-        .join(".onionforge_support")
-        .join(support_key_for_path(&path_utils::display_path(output_root)))
-}
-
-pub(crate) fn fallback_support_artifact_dir_for_output_root(
-    output_root: &std::path::Path,
-) -> std::path::PathBuf {
     output_root
         .join(".onionforge_support")
         .join(support_key_for_path(&path_utils::display_path(output_root)))
@@ -371,47 +362,23 @@ pub(crate) struct SupportArtifactDirResolution {
 pub(crate) fn ensure_support_artifact_dir_for_output_root(
     output_root: &std::path::Path,
 ) -> std::io::Result<SupportArtifactDirResolution> {
-    if path_utils::windows_output_root_has_volume_or_share_parent(&output_root.to_string_lossy()) {
-        let in_output = fallback_support_artifact_dir_for_output_root(output_root);
-        std::fs::create_dir_all(&in_output)?;
-        return Ok(SupportArtifactDirResolution {
-            path: in_output,
-            used_fallback: false,
-            fallback_reason: None,
-            note: Some(
-                "Preferred sibling support root skipped because the selected output directory sits directly under a Windows volume/share root.".to_string(),
+    let support_dir = support_artifact_dir_for_output_root(output_root);
+    std::fs::create_dir_all(&support_dir).map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed to create support dir '{}' ({err})",
+                path_utils::display_path(&support_dir)
             ),
-        });
-    }
+        )
+    })?;
 
-    let preferred = support_artifact_dir_for_output_root(output_root);
-    match std::fs::create_dir_all(&preferred) {
-        Ok(()) => Ok(SupportArtifactDirResolution {
-            path: preferred,
-            used_fallback: false,
-            fallback_reason: None,
-            note: None,
-        }),
-        Err(preferred_err) => {
-            let fallback = fallback_support_artifact_dir_for_output_root(output_root);
-            match std::fs::create_dir_all(&fallback) {
-                Ok(()) => Ok(SupportArtifactDirResolution {
-                    path: fallback,
-                    used_fallback: true,
-                    fallback_reason: Some(preferred_err.to_string()),
-                    note: None,
-                }),
-                Err(fallback_err) => Err(std::io::Error::new(
-                    fallback_err.kind(),
-                    format!(
-                        "failed to create preferred support dir '{}' ({preferred_err}); fallback '{}' also failed ({fallback_err})",
-                        path_utils::display_path(&preferred),
-                        path_utils::display_path(&fallback)
-                    ),
-                )),
-            }
-        }
-    }
+    Ok(SupportArtifactDirResolution {
+        path: support_dir,
+        used_fallback: false,
+        fallback_reason: None,
+        note: None,
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -2758,15 +2725,14 @@ mod tests {
     }
 
     #[test]
-    fn support_artifact_dir_moves_outside_payload_root() {
+    fn support_artifact_dir_stays_inside_selected_output_root() {
         let output_root = std::path::Path::new("/tmp/onionforge/output");
         let support_dir = support_artifact_dir_for_output_root(output_root);
-        assert!(support_dir.starts_with("/tmp/onionforge/.onionforge_support"));
-        assert!(!support_dir.starts_with(output_root));
+        assert!(support_dir.starts_with(output_root.join(".onionforge_support")));
     }
 
     #[test]
-    fn support_artifact_dir_falls_back_inside_output_root_when_sibling_anchor_is_blocked() {
+    fn support_artifact_dir_ignores_blocked_sibling_anchor_and_uses_output_root() {
         let unique = format!(
             "onionforge-support-fallback-{}-{}",
             std::process::id(),
@@ -2783,12 +2749,12 @@ mod tests {
         std::fs::write(&blocked_anchor, b"blocked").unwrap();
 
         let resolution = super::ensure_support_artifact_dir_for_output_root(&output_root).unwrap();
-        assert!(resolution.used_fallback);
+        assert!(!resolution.used_fallback);
         assert!(resolution
             .path
             .starts_with(output_root.join(".onionforge_support")));
         assert!(resolution.path.is_dir());
-        assert!(resolution.fallback_reason.is_some());
+        assert!(resolution.fallback_reason.is_none());
         assert!(resolution.note.is_none());
 
         let _ = std::fs::remove_file(&blocked_anchor);
