@@ -169,7 +169,7 @@ pub fn derive_target_identity(url: &str) -> TargetIdentity {
 
 pub fn target_paths(output_root: &Path, target_url: &str) -> Result<TargetPaths> {
     let identity = derive_target_identity(target_url);
-    let support_root = crate::support_artifact_dir_for_output_root(output_root);
+    let support_root = crate::ensure_support_artifact_dir_for_output_root(output_root)?.path;
     let target_dir = output_root.join("targets").join(&identity.target_key);
     let current_dir = target_dir.join("current");
     let best_dir = target_dir.join("best");

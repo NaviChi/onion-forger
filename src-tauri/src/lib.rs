@@ -339,6 +339,51 @@ pub(crate) fn support_artifact_dir_for_output_root(
         .join(support_key_for_path(&output_root.to_string_lossy()))
 }
 
+pub(crate) fn fallback_support_artifact_dir_for_output_root(
+    output_root: &std::path::Path,
+) -> std::path::PathBuf {
+    output_root
+        .join(".onionforge_support")
+        .join(support_key_for_path(&output_root.to_string_lossy()))
+}
+
+pub(crate) struct SupportArtifactDirResolution {
+    pub path: std::path::PathBuf,
+    pub used_fallback: bool,
+    pub fallback_reason: Option<String>,
+}
+
+pub(crate) fn ensure_support_artifact_dir_for_output_root(
+    output_root: &std::path::Path,
+) -> std::io::Result<SupportArtifactDirResolution> {
+    let preferred = support_artifact_dir_for_output_root(output_root);
+    match std::fs::create_dir_all(&preferred) {
+        Ok(()) => Ok(SupportArtifactDirResolution {
+            path: preferred,
+            used_fallback: false,
+            fallback_reason: None,
+        }),
+        Err(preferred_err) => {
+            let fallback = fallback_support_artifact_dir_for_output_root(output_root);
+            match std::fs::create_dir_all(&fallback) {
+                Ok(()) => Ok(SupportArtifactDirResolution {
+                    path: fallback,
+                    used_fallback: true,
+                    fallback_reason: Some(preferred_err.to_string()),
+                }),
+                Err(fallback_err) => Err(std::io::Error::new(
+                    fallback_err.kind(),
+                    format!(
+                        "failed to create preferred support dir '{}' ({preferred_err}); fallback '{}' also failed ({fallback_err})",
+                        preferred.display(),
+                        fallback.display()
+                    ),
+                )),
+            }
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadSupportIndexEntry {
@@ -610,10 +655,20 @@ async fn execute_crawl_attempt(
     timer.emit_log(&format!("[System] Bootstrapping Target: {}", url));
 
     let is_onion = url_targets_onion(url);
-    let support_dir = support_artifact_dir_for_output_root(output_root);
-    tokio::fs::create_dir_all(&support_dir)
-        .await
+    let support_resolution = ensure_support_artifact_dir_for_output_root(output_root)
         .map_err(|e| format!("Failed to create support directory: {e}"))?;
+    let support_dir = support_resolution.path;
+    if support_resolution.used_fallback {
+        timer.emit_log(&format!(
+            "[PATH] Support artifact root fallback engaged: {}",
+            support_dir.display()
+        ));
+        if let Some(reason) = support_resolution.fallback_reason.as_deref() {
+            timer.emit_log(&format!(
+                "[PATH] Preferred sibling support root was unavailable: {reason}"
+            ));
+        }
+    }
 
     let app_state = app.state::<AppState>();
     let mut arti_clients = Vec::new();
@@ -1118,8 +1173,17 @@ async fn scaffold_download_from_entries_with_plan(
 
     let base = output_root.to_path_buf();
     tokio::fs::create_dir_all(&base).await?;
-    let support_dir = support_artifact_dir_for_output_root(&base);
-    tokio::fs::create_dir_all(&support_dir).await?;
+    let support_resolution = ensure_support_artifact_dir_for_output_root(&base)?;
+    let support_dir = support_resolution.path;
+    if support_resolution.used_fallback {
+        let _ = app.emit(
+            "crawl_log",
+            format!(
+                "[PATH] Support artifacts fell back under output root: {}",
+                support_dir.display()
+            ),
+        );
+    }
     let ranked_hosts = ranked_qilin_download_hosts(entries);
 
     let mut written_final: u32 = 0;
@@ -1906,8 +1970,17 @@ async fn scaffold_download(
 
     let base = output_root.to_path_buf();
     tokio::fs::create_dir_all(&base).await?;
-    let support_dir = support_artifact_dir_for_output_root(&base);
-    tokio::fs::create_dir_all(&support_dir).await?;
+    let support_resolution = ensure_support_artifact_dir_for_output_root(&base)?;
+    let support_dir = support_resolution.path;
+    if support_resolution.used_fallback {
+        let _ = app.emit(
+            "crawl_log",
+            format!(
+                "[PATH] Support artifacts fell back under output root: {}",
+                support_dir.display()
+            ),
+        );
+    }
     let ranked_hosts = ranked_qilin_download_hosts(entries);
 
     let mut written_final: u32 = 0;
@@ -2234,12 +2307,21 @@ async fn run_single_download_blocking(
         format!("[PATH] Output root: {}", output_root.display()),
     )
     .ok();
-    let support_dir = support_artifact_dir_for_output_root(&output_root);
+    let support_resolution = ensure_support_artifact_dir_for_output_root(&output_root)
+        .map_err(|e| format!("Failed to create support directory: {e}"))?;
+    let support_dir = support_resolution.path;
     app.emit(
         "log",
         format!("[PATH] Support artifact dir: {}", support_dir.display()),
     )
     .ok();
+    if support_resolution.used_fallback {
+        app.emit(
+            "log",
+            "[PATH] Preferred sibling support root was unavailable; using in-output hidden support directory.".to_string(),
+        )
+        .ok();
+    }
     app.emit(
         "log",
         format!("[PATH] Resolved target path: {}", safe_target_str),
@@ -2631,6 +2713,33 @@ mod tests {
         let support_dir = support_artifact_dir_for_output_root(output_root);
         assert!(support_dir.starts_with("/tmp/onionforge/.onionforge_support"));
         assert!(!support_dir.starts_with(output_root));
+    }
+
+    #[test]
+    fn support_artifact_dir_falls_back_inside_output_root_when_sibling_anchor_is_blocked() {
+        let unique = format!(
+            "onionforge-support-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(unique);
+        let output_root = base.join("output");
+        std::fs::create_dir_all(&output_root).unwrap();
+
+        let blocked_anchor = base.join(".onionforge_support");
+        std::fs::write(&blocked_anchor, b"blocked").unwrap();
+
+        let resolution = super::ensure_support_artifact_dir_for_output_root(&output_root).unwrap();
+        assert!(resolution.used_fallback);
+        assert!(resolution.path.starts_with(output_root.join(".onionforge_support")));
+        assert!(resolution.path.is_dir());
+        assert!(resolution.fallback_reason.is_some());
+
+        let _ = std::fs::remove_file(&blocked_anchor);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
