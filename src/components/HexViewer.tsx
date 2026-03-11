@@ -15,6 +15,12 @@ const BYTES_PER_ROW = 16;
 const ROWS_PER_BLOCK = BLOCK_SIZE / BYTES_PER_ROW; // 256 rows
 
 export function HexViewer({ url, isOpen, onClose }: HexViewerProps) {
+    if (!isOpen) return null;
+
+    return <HexViewerDialog url={url} onClose={onClose} />;
+}
+
+function HexViewerDialog({ url, onClose }: Omit<HexViewerProps, "isOpen">) {
     const [blocks, setBlocks] = useState<Record<number, Uint8Array>>({});
     const [error, setError] = useState<string | null>(null);
     const [activeLba, setActiveLba] = useState<number>(0);
@@ -55,7 +61,6 @@ export function HexViewer({ url, isOpen, onClose }: HexViewerProps) {
     const virtualItems = rowVirtualizer.getVirtualItems();
 
     useEffect(() => {
-        if (!isOpen) return;
         // Check which blocks are visible and fetch them
         if (virtualItems.length > 0) {
             const firstRow = virtualItems[0].index;
@@ -70,9 +75,7 @@ export function HexViewer({ url, isOpen, onClose }: HexViewerProps) {
                 fetchBlock(b);
             }
         }
-    }, [isOpen, virtualItems, fetchBlock]);
-
-    if (!isOpen) return null;
+    }, [virtualItems, fetchBlock]);
 
     return (
         <div className="hex-viewer-overlay">
@@ -86,12 +89,13 @@ export function HexViewer({ url, isOpen, onClose }: HexViewerProps) {
                     <div className="hex-viewer-actions">
                         <button
                             className={`dumb-mode-toggle ${isDumbMode ? "active" : ""}`}
+                            data-testid="btn-hex-turbo-bypass"
                             onClick={() => setIsDumbMode(!isDumbMode)}
                             title="Toggle CRAWLI_DUMB_MODE Fast-Path Logic for synthentic benchmark saturation"
                         >
                             <RefreshCcw size={14} /> Turbo Bypass
                         </button>
-                        <button className="close-button" onClick={onClose}>&times;</button>
+                        <button className="close-button" data-testid="btn-hex-close" onClick={onClose}>&times;</button>
                     </div>
                 </div>
 

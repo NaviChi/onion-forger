@@ -7,6 +7,7 @@ import { HexViewer } from "./components/HexViewer";
 import { Zap, Play, Activity, FolderSearch, Globe, ListTree, Terminal, CheckCircle, AlertCircle, Save, Download, FileJson, Clock, XCircle, CircleHelp, Cloud, Magnet, ShieldAlert, HardDrive, Database, Cpu } from "lucide-react";
 import { FIXTURE_RESOURCE_METRICS, VFS_FIXTURE_ENTRIES, VFS_FIXTURE_STATS, isVfsFixtureMode } from "./fixtures/vfsFixture";
 import { getDownloadDir, invokeCommand, isTauriRuntime as getIsTauriRuntime, joinPath, listenEvent, openDialog, saveDialog } from "./platform/tauriClient";
+import { NATIVE_WEBVIEW_SMOKE_TEST_IDS } from "./test/selectors";
 
 import "./App.css";
 
@@ -196,6 +197,25 @@ interface AdapterSupportInfo {
   sampleUrls: string[];
   testedFor: string[];
   notes: string;
+}
+
+interface NativeWebviewSmokeConfig {
+  enabled: boolean;
+  reportPath: string | null;
+  autoExit: boolean;
+  waitMs: number;
+  expectedTestIds: string[];
+}
+
+interface NativeWebviewSmokeResult {
+  mounted: boolean;
+  title: string;
+  href: string;
+  isTauriRuntime: boolean;
+  expectedTestIds: string[];
+  foundTestIds: string[];
+  missingTestIds: string[];
+  reportedAtEpochMs: number;
 }
 
 const FALLBACK_SUPPORT_CATALOG: AdapterSupportInfo[] = [
@@ -693,6 +713,10 @@ export function classifyTargetInputMode(input: string): "onion" | "direct" | "me
   return "direct";
 }
 
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 function App() {
   const isTauriRuntime = getIsTauriRuntime();
   const isFixtureMode = !isTauriRuntime && isVfsFixtureMode();
@@ -767,6 +791,63 @@ function App() {
     resumeIndex: undefined as string | undefined,
     stealthRamp: true
   });
+
+  useEffect(() => {
+    if (!isTauriRuntime) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const runNativeSmokeProbe = async () => {
+      try {
+        const config = await invokeCommand<NativeWebviewSmokeConfig>("get_native_smoke_config");
+        if (!config.enabled) {
+          return;
+        }
+
+        const expectedTestIds = config.expectedTestIds.length > 0
+          ? config.expectedTestIds
+          : [...NATIVE_WEBVIEW_SMOKE_TEST_IDS];
+        const deadline = Date.now() + Math.max(config.waitMs, 1_000);
+        let foundTestIds: string[] = [];
+        let missingTestIds = [...expectedTestIds];
+
+        while (!cancelled && Date.now() <= deadline) {
+          foundTestIds = expectedTestIds.filter((testId) => document.querySelector(`[data-testid="${testId}"]`));
+          missingTestIds = expectedTestIds.filter((testId) => !foundTestIds.includes(testId));
+          if (missingTestIds.length === 0) {
+            break;
+          }
+          await wait(120);
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        const result: NativeWebviewSmokeResult = {
+          mounted: missingTestIds.length === 0,
+          title: document.title,
+          href: window.location.href,
+          isTauriRuntime,
+          expectedTestIds,
+          foundTestIds,
+          missingTestIds,
+          reportedAtEpochMs: Date.now(),
+        };
+
+        await invokeCommand("report_native_smoke_result", { result });
+      } catch (error) {
+        console.error("[native-smoke] failed to report Tauri smoke state", error);
+      }
+    };
+
+    void runNativeSmokeProbe();
+    return () => {
+      cancelled = true;
+    };
+  }, [isTauriRuntime]);
   const [systemProfile, setSystemProfile] = useState<{
     preset: string; circuits: number; workers: number;
     cpuCores: number; totalRamGb: number; availableRamGb: number;
@@ -2134,13 +2215,13 @@ function App() {
         </button>
       </div>
 
-      <div className="options-bar" style={{ display: 'flex', gap: '32px', padding: '0 24px 16px', borderBottom: 'var(--panel-border)' }}>
+      <div className="options-bar" style={{ display: 'flex', flexWrap: 'wrap', gap: '32px', padding: '0 24px 16px', borderBottom: 'var(--panel-border)' }}>
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
           <input
             data-testid="chk-listing"
             type="checkbox"
             checked={crawlOptions.listing}
-            onChange={(e) => setCrawlOptions({ ...crawlOptions, listing: e.target.checked })}
+            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, listing: e.target.checked }))}
             style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
             disabled={isCrawling}
           />
@@ -2152,7 +2233,7 @@ function App() {
             data-testid="chk-sizes"
             type="checkbox"
             checked={crawlOptions.sizes}
-            onChange={(e) => setCrawlOptions({ ...crawlOptions, sizes: e.target.checked })}
+            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, sizes: e.target.checked }))}
             style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
             disabled={isCrawling}
           />
@@ -2164,7 +2245,7 @@ function App() {
             data-testid="chk-auto-download"
             type="checkbox"
             checked={crawlOptions.download}
-            onChange={(e) => setCrawlOptions({ ...crawlOptions, download: e.target.checked })}
+            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, download: e.target.checked }))}
             style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
             disabled={isCrawling}
           />
@@ -2176,7 +2257,7 @@ function App() {
             data-testid="chk-agnostic-state"
             type="checkbox"
             checked={crawlOptions.agnosticState}
-            onChange={(e) => setCrawlOptions({ ...crawlOptions, agnosticState: e.target.checked })}
+            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, agnosticState: e.target.checked }))}
             style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
             disabled={isCrawling}
           />
@@ -2188,7 +2269,7 @@ function App() {
             data-testid="chk-stealth-ramp"
             type="checkbox"
             checked={crawlOptions.stealthRamp}
-            onChange={(e) => setCrawlOptions({ ...crawlOptions, stealthRamp: e.target.checked })}
+            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, stealthRamp: e.target.checked }))}
             style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
             disabled={isCrawling}
           />
@@ -2233,7 +2314,7 @@ function App() {
             value={`${crawlOptions.daemons}`}
             onChange={(e) => {
               const daemons = Number(e.target.value);
-              setCrawlOptions({ ...crawlOptions, daemons });
+              setCrawlOptions((prev) => ({ ...prev, daemons }));
             }}
             disabled={isCrawling}
             style={{
@@ -2258,7 +2339,7 @@ function App() {
             value={`${crawlOptions.circuits}`}
             onChange={(e) => {
               const circuits = Number(e.target.value);
-              setCrawlOptions({ ...crawlOptions, circuits });
+              setCrawlOptions((prev) => ({ ...prev, circuits }));
             }}
             disabled={isCrawling}
             style={{
