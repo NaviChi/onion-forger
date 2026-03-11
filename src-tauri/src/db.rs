@@ -6,6 +6,107 @@ use std::mem;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+fn normalize_vfs_path(raw: &str) -> String {
+    raw.replace('\\', "/")
+        .split('/')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn canonical_vfs_path(raw: &str) -> Option<String> {
+    let normalized = normalize_vfs_path(raw);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(format!("/{normalized}"))
+    }
+}
+
+fn normalize_vfs_entry(entry: &FileEntry) -> Option<FileEntry> {
+    let canonical_path = canonical_vfs_path(&entry.path)?;
+    let mut normalized = entry.clone();
+    normalized.path = canonical_path;
+    Some(normalized)
+}
+
+fn vfs_parent_scan_prefixes(parent_prefix: &str) -> Vec<String> {
+    let normalized = normalize_vfs_path(parent_prefix);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let backslash = normalized.replace('/', "\\");
+    let mut prefixes = Vec::<String>::new();
+    for candidate in [
+        format!("/{normalized}/"),
+        format!("{normalized}/"),
+        format!("/{backslash}\\"),
+        format!("{backslash}\\"),
+        format!("\\{backslash}\\"),
+    ] {
+        if !prefixes.contains(&candidate) {
+            prefixes.push(candidate);
+        }
+    }
+    prefixes
+}
+
+fn collect_child_entry(
+    entries: &mut Vec<FileEntry>,
+    seen_paths: &mut std::collections::HashSet<String>,
+    parent_prefix: &str,
+    entry: &FileEntry,
+) {
+    let Some(normalized_entry) = normalize_vfs_entry(entry) else {
+        return;
+    };
+    let normalized_parent = normalize_vfs_path(parent_prefix);
+    let normalized_entry_path = normalize_vfs_path(&normalized_entry.path);
+
+    let relative_path = if normalized_parent.is_empty() {
+        normalized_entry_path
+    } else if normalized_entry_path == normalized_parent {
+        return;
+    } else if let Some(rest) = normalized_entry_path.strip_prefix(&format!("{normalized_parent}/"))
+    {
+        rest.to_string()
+    } else {
+        return;
+    };
+
+    let parts = relative_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return;
+    }
+
+    if parts.len() == 1 {
+        if seen_paths.insert(normalized_entry.path.clone()) {
+            entries.push(normalized_entry);
+        }
+        return;
+    }
+
+    let directory_path = if normalized_parent.is_empty() {
+        format!("/{}", parts[0])
+    } else {
+        format!("/{normalized_parent}/{}", parts[0])
+    };
+    if seen_paths.insert(directory_path.clone()) {
+        entries.push(FileEntry {
+            jwt_exp: None,
+            path: directory_path,
+            size_bytes: None,
+            entry_type: crate::adapters::EntryType::Folder,
+            raw_url: String::new(),
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct SledVfs {
     db: Arc<Mutex<Option<sled::Db>>>,
@@ -58,8 +159,11 @@ impl SledVfs {
         if let Some(db) = guard.as_ref() {
             let mut batch = sled::Batch::default();
             for entry in entries {
-                let bytes = serde_json::to_vec(entry)?;
-                batch.insert(entry.path.as_bytes(), bytes);
+                let Some(normalized_entry) = normalize_vfs_entry(entry) else {
+                    continue;
+                };
+                let bytes = serde_json::to_vec(&normalized_entry)?;
+                batch.insert(normalized_entry.path.as_bytes(), bytes);
             }
             db.apply_batch(batch)?;
             db.flush_async().await?;
@@ -70,9 +174,26 @@ impl SledVfs {
     pub async fn get_entry(&self, path: &str) -> Result<Option<FileEntry>> {
         let guard = self.db.lock().await;
         if let Some(db) = guard.as_ref() {
-            if let Some(bytes) = db.get(path.as_bytes())? {
-                let entry: FileEntry = serde_json::from_slice(&bytes)?;
-                return Ok(Some(entry));
+            let mut lookup_paths = Vec::<String>::new();
+            if let Some(canonical_path) = canonical_vfs_path(path) {
+                lookup_paths.push(canonical_path);
+            }
+            let normalized = normalize_vfs_path(path);
+            for candidate in [
+                normalized.clone(),
+                normalized.replace('/', "\\"),
+                path.to_string(),
+            ] {
+                if !candidate.is_empty() && !lookup_paths.contains(&candidate) {
+                    lookup_paths.push(candidate);
+                }
+            }
+
+            for lookup in lookup_paths {
+                if let Some(bytes) = db.get(lookup.as_bytes())? {
+                    let entry: FileEntry = serde_json::from_slice(&bytes)?;
+                    return Ok(normalize_vfs_entry(&entry));
+                }
             }
         }
         Ok(None)
@@ -80,31 +201,42 @@ impl SledVfs {
 
     pub async fn iter_entries(&self) -> Result<Vec<FileEntry>> {
         let db = { self.db.lock().await.clone() };
-        let mut entries = Vec::new();
+        let mut entries = std::collections::BTreeMap::<String, FileEntry>::new();
         if let Some(db) = db.as_ref() {
             for (_, value) in db.iter().flatten() {
                 if let Ok(entry) = serde_json::from_slice::<FileEntry>(&value) {
-                    entries.push(entry);
+                    if let Some(normalized_entry) = normalize_vfs_entry(&entry) {
+                        entries
+                            .entry(normalized_entry.path.clone())
+                            .or_insert(normalized_entry);
+                    }
                 }
             }
         }
-        Ok(entries)
+        Ok(entries.into_values().collect())
     }
 
     pub async fn summarize_entries(&self) -> Result<VfsSummary> {
         let db = { self.db.lock().await.clone() };
         let mut summary = VfsSummary::default();
+        let mut seen_paths = std::collections::HashSet::<String>::new();
 
         if let Some(db) = db.as_ref() {
             for (_, value) in db.iter().flatten() {
                 if let Ok(entry) = serde_json::from_slice::<FileEntry>(&value) {
+                    let Some(normalized_entry) = normalize_vfs_entry(&entry) else {
+                        continue;
+                    };
+                    if !seen_paths.insert(normalized_entry.path.clone()) {
+                        continue;
+                    }
                     summary.discovered_count += 1;
-                    match entry.entry_type {
+                    match normalized_entry.entry_type {
                         crate::adapters::EntryType::File => {
                             summary.file_count += 1;
                             summary.total_size_bytes = summary
                                 .total_size_bytes
-                                .saturating_add(entry.size_bytes.unwrap_or(0));
+                                .saturating_add(normalized_entry.size_bytes.unwrap_or(0));
                         }
                         crate::adapters::EntryType::Folder => {
                             summary.folder_count += 1;
@@ -127,9 +259,16 @@ impl SledVfs {
         };
 
         let mut batch = Vec::with_capacity(batch_size.max(1));
+        let mut seen_paths = std::collections::HashSet::<String>::new();
         for (_, value) in db.iter().flatten() {
             if let Ok(entry) = serde_json::from_slice::<FileEntry>(&value) {
-                batch.push(entry);
+                let Some(normalized_entry) = normalize_vfs_entry(&entry) else {
+                    continue;
+                };
+                if !seen_paths.insert(normalized_entry.path.clone()) {
+                    continue;
+                }
+                batch.push(normalized_entry);
                 if batch.len() >= batch_size.max(1) {
                     visitor(mem::take(&mut batch))?;
                 }
@@ -147,56 +286,39 @@ impl SledVfs {
         let guard = self.db.lock().await;
         let mut entries = Vec::new();
         if let Some(db) = guard.as_ref() {
-            // Ensure prefix ends with a slash for accurate scoping, except root which is empty
-            let mut prefix = parent_prefix.to_string();
-            if !prefix.is_empty() && !prefix.ends_with('/') {
-                prefix.push('/');
-            }
+            let mut seen_paths = std::collections::HashSet::<String>::new();
 
-            let mut seen_dirs = std::collections::HashSet::new();
-
-            for (_k, v) in db.scan_prefix(prefix.as_bytes()).flatten() {
-                if let Ok(entry) = serde_json::from_slice::<FileEntry>(&v) {
-                    // Extract relative part after prefix
-                    let relative_path = if prefix.is_empty() {
-                        entry.path.clone()
-                    } else if entry.path.starts_with(&prefix) {
-                        entry.path[prefix.len()..].to_string()
-                    } else {
-                        continue;
-                    };
-
-                    let relative_path = relative_path.trim_start_matches('/');
-                    let parts: Vec<&str> = relative_path.split('/').collect();
-
-                    if parts.is_empty() || parts[0].is_empty() {
-                        continue;
+            if parent_prefix.is_empty() {
+                for (_k, v) in db.iter().flatten() {
+                    if let Ok(entry) = serde_json::from_slice::<FileEntry>(&v) {
+                        collect_child_entry(&mut entries, &mut seen_paths, parent_prefix, &entry);
                     }
-
-                    if parts.len() == 1 {
-                        // Direct child file or empty dir
-                        if entry.entry_type == crate::adapters::EntryType::Folder {
-                            let dir_name = parts[0].to_string();
-                            if !seen_dirs.contains(&dir_name) {
-                                seen_dirs.insert(dir_name);
-                                entries.push(entry);
-                            }
-                        } else {
-                            entries.push(entry);
+                }
+            } else {
+                let mut found_prefixed_match = false;
+                for prefix in vfs_parent_scan_prefixes(parent_prefix) {
+                    for (_k, v) in db.scan_prefix(prefix.as_bytes()).flatten() {
+                        found_prefixed_match = true;
+                        if let Ok(entry) = serde_json::from_slice::<FileEntry>(&v) {
+                            collect_child_entry(
+                                &mut entries,
+                                &mut seen_paths,
+                                parent_prefix,
+                                &entry,
+                            );
                         }
-                    } else {
-                        // It's a subdirectory, construct a virtual Folder entry if not seen
-                        let dir_name = parts[0].to_string();
-                        if !seen_dirs.contains(&dir_name) {
-                            seen_dirs.insert(dir_name.clone());
-                            let virtual_dir_path = format!("{}{}", prefix, dir_name);
-                            entries.push(FileEntry {
-                                jwt_exp: None,
-                                path: virtual_dir_path,
-                                size_bytes: None,
-                                entry_type: crate::adapters::EntryType::Folder,
-                                raw_url: "".to_string(), // Virtual folders don't have direct raw URLs
-                            });
+                    }
+                }
+
+                if !found_prefixed_match {
+                    for (_k, v) in db.iter().flatten() {
+                        if let Ok(entry) = serde_json::from_slice::<FileEntry>(&v) {
+                            collect_child_entry(
+                                &mut entries,
+                                &mut seen_paths,
+                                parent_prefix,
+                                &entry,
+                            );
                         }
                     }
                 }
@@ -321,5 +443,98 @@ impl SledVfs {
         } else {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SledVfs;
+    use crate::adapters::{EntryType, FileEntry};
+
+    fn file_entry(path: &str, entry_type: EntryType) -> FileEntry {
+        FileEntry {
+            jwt_exp: None,
+            path: path.to_string(),
+            size_bytes: Some(1),
+            entry_type,
+            raw_url: "http://fixture".to_string(),
+        }
+    }
+
+    fn temp_vfs_path(label: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "crawli-vfs-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    #[tokio::test]
+    async fn insert_entries_normalizes_windows_separators() {
+        let vfs = SledVfs::default();
+        let db_path = temp_vfs_path("insert-normalize");
+        vfs.initialize(&db_path.to_string_lossy()).await.unwrap();
+
+        vfs.insert_entries(&[file_entry(
+            r"evidence\screenshots\screen01.png",
+            EntryType::File,
+        )])
+        .await
+        .unwrap();
+
+        let stored = vfs
+            .get_entry("/evidence/screenshots/screen01.png")
+            .await
+            .unwrap()
+            .expect("normalized entry should exist");
+        assert_eq!(stored.path, "/evidence/screenshots/screen01.png");
+
+        let _ = std::fs::remove_dir_all(db_path);
+    }
+
+    #[tokio::test]
+    async fn get_children_keeps_legacy_windows_paths_nested() {
+        let vfs = SledVfs::default();
+        let db_path = temp_vfs_path("legacy-children");
+        vfs.initialize(&db_path.to_string_lossy()).await.unwrap();
+
+        {
+            let guard = vfs.db.lock().await;
+            let db = guard.as_ref().expect("db should be initialized");
+            let mut batch = sled::Batch::default();
+            let file = file_entry(r"evidence\screenshots\screen01.png", EntryType::File);
+            batch.insert(file.path.as_bytes(), serde_json::to_vec(&file).unwrap());
+            let sibling = file_entry("/evidence/report.pdf", EntryType::File);
+            batch.insert(
+                sibling.path.as_bytes(),
+                serde_json::to_vec(&sibling).unwrap(),
+            );
+            db.apply_batch(batch).unwrap();
+            db.flush_async().await.unwrap();
+        }
+
+        let root = vfs.get_children("").await.unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].path, "/evidence");
+        assert_eq!(root[0].entry_type, EntryType::Folder);
+
+        let evidence = vfs.get_children("/evidence").await.unwrap();
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/evidence/screenshots", "/evidence/report.pdf"]
+        );
+
+        let screenshots = vfs.get_children("/evidence/screenshots").await.unwrap();
+        assert_eq!(screenshots.len(), 1);
+        assert_eq!(screenshots[0].path, "/evidence/screenshots/screen01.png");
+
+        let _ = std::fs::remove_dir_all(db_path);
     }
 }
