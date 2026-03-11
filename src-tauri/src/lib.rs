@@ -311,14 +311,28 @@ fn support_key_for_path(path: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
+    let normalized_path = path_utils::normalize_windows_device_path(path);
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    normalized_path.hash(&mut hasher);
     let hash = hasher.finish();
 
-    let mut base = path
-        .trim_start_matches('/')
-        .replace(['/', '\\'], "_")
-        .replace(':', "_");
+    let mut base = String::with_capacity(normalized_path.len());
+    let mut pending_separator = false;
+    for ch in normalized_path.trim_start_matches(['/', '\\']).chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => {
+                base.push(ch);
+                pending_separator = false;
+            }
+            _ => {
+                if !pending_separator {
+                    base.push('_');
+                    pending_separator = true;
+                }
+            }
+        }
+    }
+    base = base.trim_matches('_').to_string();
     if base.is_empty() {
         base = "root".to_string();
     }
@@ -336,7 +350,7 @@ pub(crate) fn support_artifact_dir_for_output_root(
     let anchor = output_root.parent().unwrap_or(output_root);
     anchor
         .join(".onionforge_support")
-        .join(support_key_for_path(&output_root.to_string_lossy()))
+        .join(support_key_for_path(&path_utils::display_path(output_root)))
 }
 
 pub(crate) fn fallback_support_artifact_dir_for_output_root(
@@ -344,24 +358,39 @@ pub(crate) fn fallback_support_artifact_dir_for_output_root(
 ) -> std::path::PathBuf {
     output_root
         .join(".onionforge_support")
-        .join(support_key_for_path(&output_root.to_string_lossy()))
+        .join(support_key_for_path(&path_utils::display_path(output_root)))
 }
 
 pub(crate) struct SupportArtifactDirResolution {
     pub path: std::path::PathBuf,
     pub used_fallback: bool,
     pub fallback_reason: Option<String>,
+    pub note: Option<String>,
 }
 
 pub(crate) fn ensure_support_artifact_dir_for_output_root(
     output_root: &std::path::Path,
 ) -> std::io::Result<SupportArtifactDirResolution> {
+    if path_utils::windows_output_root_has_volume_or_share_parent(&output_root.to_string_lossy()) {
+        let in_output = fallback_support_artifact_dir_for_output_root(output_root);
+        std::fs::create_dir_all(&in_output)?;
+        return Ok(SupportArtifactDirResolution {
+            path: in_output,
+            used_fallback: false,
+            fallback_reason: None,
+            note: Some(
+                "Preferred sibling support root skipped because the selected output directory sits directly under a Windows volume/share root.".to_string(),
+            ),
+        });
+    }
+
     let preferred = support_artifact_dir_for_output_root(output_root);
     match std::fs::create_dir_all(&preferred) {
         Ok(()) => Ok(SupportArtifactDirResolution {
             path: preferred,
             used_fallback: false,
             fallback_reason: None,
+            note: None,
         }),
         Err(preferred_err) => {
             let fallback = fallback_support_artifact_dir_for_output_root(output_root);
@@ -370,13 +399,14 @@ pub(crate) fn ensure_support_artifact_dir_for_output_root(
                     path: fallback,
                     used_fallback: true,
                     fallback_reason: Some(preferred_err.to_string()),
+                    note: None,
                 }),
                 Err(fallback_err) => Err(std::io::Error::new(
                     fallback_err.kind(),
                     format!(
                         "failed to create preferred support dir '{}' ({preferred_err}); fallback '{}' also failed ({fallback_err})",
-                        preferred.display(),
-                        fallback.display()
+                        path_utils::display_path(&preferred),
+                        path_utils::display_path(&fallback)
                     ),
                 )),
             }
@@ -658,10 +688,13 @@ async fn execute_crawl_attempt(
     let support_resolution = ensure_support_artifact_dir_for_output_root(output_root)
         .map_err(|e| format!("Failed to create support directory: {e}"))?;
     let support_dir = support_resolution.path;
+    if let Some(note) = support_resolution.note.as_deref() {
+        timer.emit_log(&format!("[PATH] {note}"));
+    }
     if support_resolution.used_fallback {
         timer.emit_log(&format!(
             "[PATH] Support artifact root fallback engaged: {}",
-            support_dir.display()
+            path_utils::display_path(&support_dir)
         ));
         if let Some(reason) = support_resolution.fallback_reason.as_deref() {
             timer.emit_log(&format!(
@@ -1175,12 +1208,15 @@ async fn scaffold_download_from_entries_with_plan(
     tokio::fs::create_dir_all(&base).await?;
     let support_resolution = ensure_support_artifact_dir_for_output_root(&base)?;
     let support_dir = support_resolution.path;
+    if let Some(note) = support_resolution.note.as_deref() {
+        let _ = app.emit("crawl_log", format!("[PATH] {note}"));
+    }
     if support_resolution.used_fallback {
         let _ = app.emit(
             "crawl_log",
             format!(
                 "[PATH] Support artifacts fell back under output root: {}",
-                support_dir.display()
+                path_utils::display_path(&support_dir)
             ),
         );
     }
@@ -1972,12 +2008,15 @@ async fn scaffold_download(
     tokio::fs::create_dir_all(&base).await?;
     let support_resolution = ensure_support_artifact_dir_for_output_root(&base)?;
     let support_dir = support_resolution.path;
+    if let Some(note) = support_resolution.note.as_deref() {
+        let _ = app.emit("crawl_log", format!("[PATH] {note}"));
+    }
     if support_resolution.used_fallback {
         let _ = app.emit(
             "crawl_log",
             format!(
                 "[PATH] Support artifacts fell back under output root: {}",
-                support_dir.display()
+                path_utils::display_path(&support_dir)
             ),
         );
     }
@@ -2299,20 +2338,30 @@ async fn run_single_download_blocking(
     let safe_target = path_utils::resolve_download_target_within_root(&output_root, &path)
         .map_err(|e| format!("Unsafe target path rejected: {e}"))?;
     let safe_target_str = safe_target.to_string_lossy().to_string();
+    let safe_target_display = path_utils::display_path(&safe_target);
 
     app.emit("log", format!("Initiating extraction for: {url}"))
         .ok();
     app.emit(
         "log",
-        format!("[PATH] Output root: {}", output_root.display()),
+        format!(
+            "[PATH] Output root: {}",
+            path_utils::display_path(&output_root)
+        ),
     )
     .ok();
     let support_resolution = ensure_support_artifact_dir_for_output_root(&output_root)
         .map_err(|e| format!("Failed to create support directory: {e}"))?;
     let support_dir = support_resolution.path;
+    if let Some(note) = support_resolution.note.as_deref() {
+        app.emit("log", format!("[PATH] {note}")).ok();
+    }
     app.emit(
         "log",
-        format!("[PATH] Support artifact dir: {}", support_dir.display()),
+        format!(
+            "[PATH] Support artifact dir: {}",
+            path_utils::display_path(&support_dir)
+        ),
     )
     .ok();
     if support_resolution.used_fallback {
@@ -2324,7 +2373,7 @@ async fn run_single_download_blocking(
     }
     app.emit(
         "log",
-        format!("[PATH] Resolved target path: {}", safe_target_str),
+        format!("[PATH] Resolved target path: {}", safe_target_display),
     )
     .ok();
 
@@ -2618,7 +2667,8 @@ mod tests {
         build_qilin_alternate_urls, preferred_qilin_download_host_for_subtree,
         preferred_qilin_host_for_subtree, rewrite_qilin_seed_host,
         split_qilin_download_seed_and_relative_path, subtree_key_for_qilin_download,
-        support_artifact_dir_for_output_root, url_targets_onion, PersistedQilinSubtreeRouteEntry,
+        support_artifact_dir_for_output_root, support_key_for_path, url_targets_onion,
+        PersistedQilinSubtreeRouteEntry,
     };
     use std::collections::HashMap;
 
@@ -2734,12 +2784,26 @@ mod tests {
 
         let resolution = super::ensure_support_artifact_dir_for_output_root(&output_root).unwrap();
         assert!(resolution.used_fallback);
-        assert!(resolution.path.starts_with(output_root.join(".onionforge_support")));
+        assert!(resolution
+            .path
+            .starts_with(output_root.join(".onionforge_support")));
         assert!(resolution.path.is_dir());
         assert!(resolution.fallback_reason.is_some());
+        assert!(resolution.note.is_none());
 
         let _ = std::fs::remove_file(&blocked_anchor);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn support_key_for_windows_device_path_removes_reserved_chars() {
+        let key = support_key_for_path(r"\\?\X:\Exports\Case 1");
+        assert!(key.starts_with("X_Exports_Case_1_"));
+        assert!(!key.contains('?'));
+        assert!(!key.contains(':'));
+        assert!(!key.contains('\\'));
+        assert!(!key.contains('/'));
+        assert!(!key.contains('*'));
     }
 
     #[test]
