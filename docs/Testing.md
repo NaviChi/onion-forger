@@ -1,3 +1,150 @@
+## Phase 130: Main Consolidation + Version 0.6.5 Validation
+- **Date**: 2026-03-12
+- **Action**: Merged `origin/main` with `codex/windows-portable-release`, resolved the lone `src-tauri/src/lib.rs` test-import conflict, and bumped the consolidated tree to `0.6.5`.
+- **Validation Commands**:
+  - `npm run build`
+  - `cargo check --manifest-path src-tauri/Cargo.toml`
+- **Result**:
+  - Frontend production build passed on the consolidated `0.6.5` tree.
+  - Backend compile validation passed on the merged tree after the conflict resolution, confirming the unified `main` branch state is buildable before push.
+
+## Phase 129D: Batch Progress Speed Telemetry Validation
+- **Date**: 2026-03-12
+- **Action**: Restored `speed_mbps` to the batch-progress protobuf frame, wired it through the Rust telemetry bridge, and regenerated the tracked frontend protobuf bindings.
+- **Validation Commands**:
+  - `./node_modules/.bin/pbjs -t static-module -w es6 -o src/telemetry.js src/telemetry.proto`
+  - `./node_modules/.bin/pbts -o src/telemetry.d.ts src/telemetry.js`
+  - `npm run build`
+  - `CARGO_TARGET_DIR=/tmp/crawli-telemetry-check cargo check --manifest-path src-tauri/Cargo.toml`
+- **Result**:
+  - The tracked frontend bindings `src/telemetry.js` and `src/telemetry.d.ts` were regenerated successfully from the updated schema.
+  - Frontend production build passed after the schema/binding update; Vite only emitted the pre-existing `@protobufjs/inquire` eval warning.
+  - Clean Rust compile validation passed in `3m29s`, confirming the backend telemetry structs and bridge remain in sync with the regenerated frontend decoder.
+
+## Phase 129C: Windows Portable Reliability + Windows-Only Release Validation
+- **Date**: 2026-03-12
+- **Action**: Validated the Windows-portable fixes for unbuffered file I/O and privileged NT preallocation, then prepared a Windows-only `0.6.2` release path that pins automatic tag creation to the requested ref.
+- **Validation Commands**:
+  - `npm run build`
+  - `CARGO_TARGET_DIR=/tmp/crawli-release-check-062 cargo check --manifest-path src-tauri/Cargo.toml`
+  - `ruby -e 'require "yaml"; YAML.safe_load(File.read(".github/workflows/release-windows-portable.yml"), aliases: true); puts "workflow yaml parse ok"'`
+- **Result**:
+  - Frontend production build passed on the `0.6.2` metadata set. Vite completed successfully and only emitted the existing `@protobufjs/inquire` eval warning.
+  - Clean Rust compile validation passed in `4m26s` against a fresh target directory, confirming the Windows I/O fixes in `src-tauri/src/io_vanguard.rs` and `src-tauri/src/aria_downloader.rs` compile cleanly with the `0.6.2` release metadata.
+  - The Windows-only workflow YAML parses cleanly after adding `gh release create --target "${{ github.event.inputs.ref }}"`, which prevents a new Windows-only release from being tagged off the default branch by mistake.
+
+## Phase 129: Parallel Download + IDM-Style Acceleration Release Validation
+- **Date**: 2026-03-12
+- **Action**: Validated the Phase 128/129 crawl/download pipeline changes and bumped all release metadata to `0.6.1` before the GitHub Windows portable release cut.
+- **Validation Commands**:
+  - `npm run build`
+  - `CARGO_TARGET_DIR=/tmp/crawli-release-check-061 cargo check --manifest-path src-tauri/Cargo.toml`
+- **Result**:
+  - Frontend production build passed on the `0.6.1` metadata set. Vite completed successfully and only emitted the existing `@protobufjs/inquire` eval warning.
+  - Clean Rust compile validation passed in `4m12s` against a fresh target directory, which confirms the `src-tauri/src/lib.rs` parallel-download changes and the `src-tauri/src/aria_downloader.rs` mirror-striping/dynamic-bisection changes compile cleanly together.
+
+## Phase 127: GitHub Release Workflow + Portable Packaging Validation
+- **Date**: 2026-03-12
+- **Action**: Added a shared Windows portable packaging script and updated both release workflows to call the same script.
+- **Validation Commands**:
+  - `ruby -e 'require "yaml"; [".github/workflows/release.yml", ".github/workflows/release-windows-portable.yml"].each { |p| YAML.safe_load(File.read(p), aliases: true); }; puts "workflow yaml parse ok"'`
+  - `pwsh -NoLogo -NoProfile -File packaging/windows/package-portable.ps1 -Tag v0.6.2`
+- **Result**:
+  - Workflow YAML files parse successfully after the release edits.
+  - `pwsh` is not installed in this macOS environment (`command not found`), so executable-level validation of `package-portable.ps1` must run on `windows-latest` CI or a Windows host.
+
+## Phase 113: VFS Path Canonicalization + Direct-Child Guard
+- **Date**: 2026-03-11
+- **Action**: Repaired the virtual file system tree so nested files remain under their proper folders even when crawled entries arrive with Windows-style `\` separators or mixed logical path formatting. The backend now canonicalizes logical VFS entry paths during insert/read/query, and the frontend tree loaders normalize and filter returned children so a malformed entry cannot flatten the visible tree layer.
+- **Validation Commands**:
+  - `node ./node_modules/vitest/vitest.mjs run src/components/VFSExplorer.test.tsx`
+  - `node ./node_modules/typescript/bin/tsc --noEmit`
+  - `cargo test --manifest-path src-tauri/Cargo.toml db::tests:: -- --nocapture`
+  - `cargo test --manifest-path src-tauri/Cargo.toml support_ -- --nocapture`
+  - `cargo test --manifest-path src-tauri/Cargo.toml normalize_windows_device_path -- --nocapture`
+- **Result**:
+  - `VFSExplorer.test.tsx` passed `5/5`, including a new regression that feeds a root-layer response with `\\folder1\\file1.txt` and verifies the file stays hidden until `folder1` is expanded.
+  - `db::tests::insert_entries_normalizes_windows_separators` and `db::tests::get_children_keeps_legacy_windows_paths_nested` both passed, proving new inserts are canonicalized and legacy malformed entries still hydrate into the correct nested tree.
+  - The Windows support-path regression suite remained green after the VFS patch, which confirms the new logical-path normalization is isolated from real filesystem/output-root handling.
+
+## Phase 112: In-Output Support Root Simplification
+- **Date**: 2026-03-11
+- **Action**: Simplified support-artifact resolution so the backend always writes hidden support data under the operator-selected output root instead of preferring a sibling hidden root first. This removes the remaining Windows-specific `Start Queue` failure mode where the runtime still tried to reason about a second anchor outside the chosen export folder.
+- **Validation Commands**:
+  - `cargo test --manifest-path src-tauri/Cargo.toml --lib support_ -- --nocapture`
+  - `cargo test --manifest-path src-tauri/Cargo.toml --lib normalize_windows_device_path -- --nocapture`
+- **Result**:
+  - Targeted Rust validation passed `3/3` support-path tests and `1/1` Windows display-path tests.
+  - The support-root invariant is now explicit: for any selected output root, support artifacts resolve under `<output_root>/.onionforge_support/<support_key>/`.
+  - A regression test now creates a blocked sibling `.onionforge_support` file next to the selected output folder and verifies that crawl/download startup still succeeds because the resolver no longer touches that sibling location at all.
+  - User-facing failures are also cleaner. If support-directory creation now fails, the backend reports only the actual in-output support path instead of a preferred/fallback pair.
+
+## Phase 111: Windows Support-Path Hardening
+- **Date**: 2026-03-11
+- **Action**: Hardened Windows output/support path handling so GUI download/start-queue flows no longer fail when the selected export directory is directly under a drive/share root and the backend is operating on extended-length paths. The backend now normalizes `\\?\` / `\\?\UNC\` prefixes for display, strips reserved characters from the generated support key, and proactively keeps `.onionforge_support` inside the selected output folder when the sibling layout would otherwise land at `X:\` or `\\server\share\`.
+- **Validation Commands**:
+  - `cargo test --manifest-path src-tauri/Cargo.toml --lib support_ -- --nocapture`
+  - `cargo test --manifest-path src-tauri/Cargo.toml --lib windows_ -- --nocapture`
+- **Result**:
+  - Targeted Rust validation passed `3/3` support-path tests and `3/3` Windows-path tests.
+  - The new tests prove three specific fixes: `support_key_for_path(r"\\\\?\\X:\\Exports\\Case 1")` no longer contains `?`, `:`, or separator characters; operator-facing path strings now display `X:\...` / `\\server\share\...` instead of raw device syntax; and output roots like `X:\Exports` or `\\server\share\Exports` are treated as “root-parent” layouts that must use the in-output hidden support root.
+  - Expected behavior changed on Windows only for that root-parent case: selecting `X:\Exports` now resolves support artifacts under `X:\Exports\.onionforge_support\<support_key>\` instead of trying to create `X:\.onionforge_support\<support_key>\`.
+
+## Phase 110: Support Directory Fallback Hardening
+- **Date**: 2026-03-11
+- **Action**: Hardened support-artifact directory resolution so the backend no longer aborts when the preferred hidden sibling support root cannot be created. The runtime now falls back to `output_root/.onionforge_support/<support_key>/` after a preferred-root creation failure, and `target_state.rs` now uses the same resolver so crawl/download state stays path-consistent.
+- **Validation Commands**:
+  - `cargo test --manifest-path src-tauri/Cargo.toml --lib support_artifact_dir_ -- --nocapture`
+- **Result**:
+  - The preferred behavior is unchanged when the parent-side hidden root is writable: support artifacts still live outside the payload tree under the sibling `.onionforge_support` directory.
+  - The new regression test simulates a blocked sibling anchor by placing a file at `<output_parent>/.onionforge_support`, which deterministically forces the fallback path.
+  - The targeted Rust validation passed with `2/2` support-directory tests, covering both the normal sibling-root case and the blocked-sibling fallback case.
+
+## Phase 109: Renderer Stability + Hidden Hex Virtualizer Fix
+- **Date**: 2026-03-11
+- **Action**: Repaired the remaining full-app renderer instability by moving the hidden Hex viewer virtualizer behind an open-only mount boundary, preserving click-through behavior on toast overlays, and hardening the remaining crawl-option state writes.
+- **Validation Commands**:
+  - `node node_modules/vitest/vitest.mjs run src/App.interaction.test.tsx --maxWorkers=1 --reporter=verbose`
+  - `node node_modules/typescript/bin/tsc --noEmit`
+  - `npm run build`
+  - `node - <<'EOF' ... chromium.launch() ... page.goto('http://127.0.0.1:1420/?fixture=vfs&surface=app') ... click checkboxes/start queue ... EOF`
+- **Result**:
+  - The previous jsdom heap blowup is gone. `src/App.interaction.test.tsx` now passed `2/2` in about one second instead of exhausting the worker heap near `4 GB`.
+  - Frontend compilation and production bundling stayed green after the fix. `tsc --noEmit` passed, and `npm run build` completed successfully; Vite only emitted the pre-existing `@protobufjs/inquire` eval warning.
+  - The full browser-mounted `App.tsx` fixture is now usable for targeted diagnostics. A raw Chromium validation run mounted `?fixture=vfs&surface=app`, toggled the crawl option checkboxes, clicked `Start Queue`, surfaced the expected browser-only environment error toast, and then clicked the same checkbox again successfully with the toast still visible.
+  - Layout integrity held during the interaction path. `.main-workspace` measured `1400x629` before and after the click/toast cycle, and screenshots were captured at `output/ui-fix-validation/full-app-before.png` and `output/ui-fix-validation/full-app-after.png`.
+
+## Phase 108: Overlay Integrity Audit + Full-App Fixture Probe
+- **Date**: 2026-03-11
+- **Action**: Added a browser-only `surface=app` bootstrap override in `src/main.tsx`, added stable modal test ids in `AzureConnectivityModal.tsx` / `HexViewer.tsx`, extended `tests/overlay_integrity_runner.cjs` for modal re-entry and conditional Mega password coverage, then ran the overlay audit on both the stable preview shell and the new full-app browser fixture probe.
+- **Validation Commands**:
+  - `node node_modules/typescript/bin/tsc`
+  - `npm run overlay:integrity`
+  - `node - <<'EOF' ... page.goto('http://127.0.0.1:1420/?fixture=vfs&surface=app') ... EOF`
+- **Result**:
+  - Frontend compilation stayed green after the new browser-fixture/test-id work.
+  - The supported Playwright surface remains healthy. `npm run overlay:integrity` passed `32/32` controls with `0` failures and `0` skips on `http://127.0.0.1:1420/?fixture=vfs`, and all geometry assertions stayed within the `1px` tolerance. Artifacts live under `output/playwright/overlay-integrity/2026-03-11T13-07-38-714Z/`.
+  - The full browser-mounted `App.tsx` surface is still not certifiable. When the same app was forced through `?fixture=vfs&surface=app`, Chromium imported the full dependency graph (`App.tsx`, `VFSExplorer`, `Dashboard`, `AzureConnectivityModal`, `HexViewer`) but the page never reached `.app-container` and the renderer crashed before mount. The failed artifact root is `output/playwright/overlay-integrity/2026-03-11T13-03-42-529Z/`.
+  - Operationally, preview-shell overlay integrity remains the canonical Playwright gate today. The new `surface=app` path is a diagnostic/debug surface until the headless Chromium crash is removed.
+
+## Phase 102: Probe Admission Telemetry + Cooldown Escalation
+- **Date**: 2026-03-11
+- **Action**: Added shared probe-admission counters plus stricter degraded-host productivity decay/cooldown in the downloader, regenerated protobuf bindings, revalidated the Rust library suite, and ran a short exact-target `crawli-cli download-files` replay against the existing Phase 90 reconciliation snapshot.
+- **Validation Commands**:
+  - `cargo fmt --manifest-path 'src-tauri/Cargo.toml'`
+  - `node node_modules/protobufjs-cli/bin/pbjs -t static-module -w es6 -o src/telemetry.js src/telemetry.proto`
+  - `node node_modules/protobufjs-cli/bin/pbts -o src/telemetry.d.ts src/telemetry.js`
+  - `CARGO_NET_OFFLINE=true cargo test --manifest-path 'src-tauri/Cargo.toml' --lib`
+  - `node node_modules/typescript/bin/tsc`
+  - `CARGO_NET_OFFLINE=true cargo build --manifest-path 'src-tauri/Cargo.toml' --bin crawli-cli`
+  - `perl -e 'alarm shift; exec @ARGV' 90 ./src-tauri/target/debug/crawli-cli --progress-summary --progress-summary-interval-ms 5000 download-files --entries-file '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_cli_qilin_afa2a0ea_20260310_phase90_reconciliation_fix/output/targets/ijzn3sicrcy7guixkzjkib4ukbii__afa2a0ea-20ba-3ddf-8c5c-__35770556215d08e/current/listing_canonical.json' --output-dir '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/qilin_cli_quick_probe_20260311_20260311_025128/output' --connections 120`
+- **Result**:
+  - Backend validation remained green after the telemetry/cooldown tranche: the Rust library suite passed `129/129`, including the new downloader and runtime-metrics regressions.
+  - Frontend schema/type drift was checked through protobuf regeneration and `tsc`. A direct `vite build` rerun was started locally but did not complete cleanly before session closure, so no fresh bundle artifact is claimed for this tranche.
+  - The quick exact-target CLI replay proved the new counters are live. The first file logged `GET Range` probe timeouts at `8s`, `12s`, and `16s`, then emitted `Probe candidate exhaustion ... exhausted 3 candidates`; the very next file entered with `quarantined_candidates=3/3` and logged `Probe candidate set fully quarantined`.
+  - The compact summary now exposes the new state directly: `dl_transport=1/0/0 probe_admission=1/1`. That means the operator can now distinguish “transport path active but no productive probe candidate remained” from generic silence.
+  - Useful payload work is still not proven in this short replay. The next blocker is no longer “can we see admission collapse?” but “what does the downloader do after all three known hosts are already degraded?”
+
 ## Phase 97: Browser Preview Render Audit + Alternate-Port Playwright Validation
 - **Date**: 2026-03-10
 - **Action**: Re-tested the GUI on a fresh Vite port after Playwright snapshotting kept hanging, then repaired the browser-only preview path so Playwright would exercise a deterministic preview shell instead of the native Tauri tree.
@@ -216,6 +363,92 @@
   - Child-path routing stayed pinned to the confirmed winner instead of leaking onto standby nodes. Compared to the prior repaired `rootfix` run (`64` child fetches with `9` off-active, `33` child failures with `10` off-active), the subtree-affinity replay logged `64` child fetches with `0` off-active and `0` child failures.
   - No default `--no-stealth-ramp` change was made. It remains a benchmark-only knob until a stable target proves a clear useful-work gain over the repaired default ramp.
 
+## Phase 98: Native-Webview Smoke Fast Path + Direct Benchmark Hardening
+- **Date**: 2026-03-10
+- **Action**: Implemented a native-webview smoke harness centered on real Tauri IPC instead of browser preview assumptions and added a first-class clearnet direct-download regression binary with believable transferred-byte accounting. Also hardened Qilin download repinning so subtree memory must satisfy stronger proof and a balanced host cap before saved URLs are rewritten.
+- **Validation Commands**:
+  - `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' --lib`
+  - `npm run build`
+  - `npx playwright test tests/crawli.spec.ts --project=chromium`
+  - `DIRECT_BENCH_DURATION=15 cargo run --manifest-path 'crawli/src-tauri/Cargo.toml' --bin direct-download-benchmark`
+  - `CRAWLI_NATIVE_SMOKE_TIMEOUT_MS=45000 CRAWLI_NATIVE_SMOKE_WAIT_MS=4000 npm run native:smoke`
+- **Result**:
+  - Core validation passed: Rust unit coverage remained green (`122/122`), the browser preview regression smoke stayed green (`3/3`), and the direct benchmark produced believable throughput after the accounting fix.
+  - The direct benchmark now reports transferred bytes from persisted piece state or allocated-block size instead of logical sparse-file length. The latest March 10, 2026 rerun on `https://proof.ovh.net/files/10Gb.dat` produced `bytes=880099328`, `elapsed_secs=22.18`, and `throughput_mbps=317.45`; an earlier post-fix run on the same path produced about `385.63 Mbps`, so the reliable regression band is now `~317-386 Mbps`.
+  - The native-webview smoke path itself is implemented but not yet fully validated on this local macOS host. After the new startup bootstrap bypass landed, the real debug `crawli` binary still failed to emit `native-webview-report.json` during the local smoke run, while browser preview remained healthy. Treat that as a platform-specific validation gap, not a browser-shell regression.
+  - The Qilin download admission-bias change is currently unit-validated through `strong_subtree_route_is_required_before_download_repin`, `balanced_qilin_repin_cap_preserves_host_diversity`, and rotated alternate-host ordering tests. A live exact-target download rerun is still required before claiming a throughput gain on the onion path.
+
+## Phase 98B: Production-Probe Benchmark Parity + Exact Qilin Download Replay
+- **Date**: 2026-03-10
+- **Action**: Switched `direct_download_benchmark.rs` to use `aria_downloader::probe_target(...)` instead of a synthetic `HEAD` probe, then re-ran both the direct clearnet benchmark and the exact-target Qilin timed download against the host-capped repin logic.
+- **Validation Commands**:
+  - `cargo build --manifest-path 'crawli/src-tauri/Cargo.toml' --bin direct-download-benchmark`
+  - `DIRECT_BENCH_DURATION=15 ./crawli/src-tauri/target/debug/direct-download-benchmark`
+  - `cargo test --manifest-path 'crawli/src-tauri/Cargo.toml' --lib strong_subtree_route_is_required_before_download_repin -- --nocapture`
+  - `perl -e 'alarm shift; exec @ARGV' 150 ./crawli/src-tauri/target/debug/crawli --progress-summary --progress-summary-interval-ms 5000 download-files --entries-file '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_cli_qilin_afa2a0ea_20260310_phase90_reconciliation_fix/output/targets/ijzn3sicrcy7guixkzjkib4ukbii__afa2a0ea-20ba-3ddf-8c5c-__35770556215d08e/current/listing_canonical.json' --output-dir '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase98c/full_download' --connections 120 > '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase98c/stdout.log' 2> '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase98c/stderr.log'`
+- **Result**:
+  - The direct benchmark now reflects the exact production probe metadata: `range_mode=true`, `content_length=10737418240`, `resume_validator=etag`, `circuit_cap=32`, `active_start=16`, `tournament_cap=36`.
+  - The latest rebuilt direct benchmark transferred `939671552` bytes in `15.20s`, about `58.95 MiB/s` / `494.51 Mbps`, confirming the direct path remains strong and that the benchmark no longer depends on a fake `HEAD` probe.
+  - The exact-target Qilin rerun still failed before useful admission. The captured `150s` replay produced `0` payload files and `0` payload bytes in `/tmp/live_qilin_download_phase98c/full_download`, and the log showed repeated `GET Range probe timed out after 8s` messages plus one `client error (Connect)` before the batch ever reached meaningful work.
+  - No `[Qilin Download] Repinned ...` line appeared in the captured run, which means the new host-capped repin logic did not materially engage; the bottleneck is still the initial probe stage, not post-probe host concentration.
+
+## Phase 99: Downloader Transport Reuse + Telemetry Hardening
+- **Date**: 2026-03-10
+- **Action**: Implemented the first libcurl-inspired downloader transport tranche: conditional keep-alive policy, probe-to-transfer promotion for micro/small swarm files, shared host-capability cache, and low-speed abort counters across runtime/CLI/protobuf/UI telemetry.
+- **Validation Commands**:
+  - `cargo check --manifest-path '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/src-tauri/Cargo.toml'`
+  - `cargo test --manifest-path '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/src-tauri/Cargo.toml' --lib`
+  - `cd '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli' && npx pbjs -t static-module -w es6 -o src/telemetry.js src/telemetry.proto`
+  - `cd '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli' && npx pbts -o src/telemetry.d.ts src/telemetry.js`
+  - `cd '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli' && npm run build`
+- **Result**:
+  - `cargo check` passed after the transport refactor with no compile errors in `aria_downloader.rs`.
+  - Full Rust library validation passed: `124 passed; 0 failed`.
+  - Protobuf bindings regenerated successfully and `npm run build` passed, proving the new counters do not break the frontend or binary telemetry schema.
+  - No new throughput claim is attached to this phase yet. A follow-up live direct benchmark process was intentionally excluded from the result after it failed to produce a clean datapoint before session closure.
+
+## Phase 101: IDM-Inspired Probe Admission Hardening
+- **Date**: 2026-03-11
+- **Action**: Investigated Internet Download Manager transport behavior from official IDM documentation and implemented the matching Qilin-side ideas that apply safely to hidden-service hosts: probe-stage degraded-host quarantine, health-aware probe candidate ordering, and pre-transfer alternate reseeding so failed probe hosts are demoted before the batch scheduler starts spending worker slots.
+- **Validation Commands**:
+  - `rustc -vV`
+  - `cargo build --manifest-path '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/src-tauri/Cargo.toml' --bin crawli`
+  - `cargo build --manifest-path '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/src-tauri/Cargo.toml' --bin crawli-cli`
+  - `python3 - <<'PY' ... subprocess.run(['.../crawli-cli','detect-input-mode','--input','https://example.com'], timeout=120) ... PY`
+  - `perl -e 'alarm shift; exec @ARGV' 150 ./crawli/src-tauri/target/debug/crawli-cli --progress-summary --progress-summary-interval-ms 5000 download-files --entries-file '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_cli_qilin_afa2a0ea_20260310_phase90_reconciliation_fix/output/targets/ijzn3sicrcy7guixkzjkib4ukbii__afa2a0ea-20ba-3ddf-8c5c-__35770556215d08e/current/listing_canonical.json' --output-dir '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase101c/full_download' --connections 120 > '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase101c/stdout.log' 2> '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase101c/stderr.log'`
+- **Result**:
+  - The local Rust problem was cleared. `rustc -vV` returned immediately, the main debug binary rebuilt in `3m49s`, and `crawli-cli` rebuilt in `10.70s`.
+  - The correct replay surface on macOS is `crawli-cli`, not the GUI `crawli` binary. A small `detect-input-mode` CLI call completed in `11.79s`, which proves the console binary is functional but still pays a noticeable startup tax from the current Tauri-linked dependency graph.
+  - The rebuilt exact-target `150s` replay still produced `0` payload files and `0` payload bytes. The visible output tree contained only `519` `.gitkeep` placeholders.
+  - The new probe logic is active in the live path. `stderr.log` shows probe timeouts at `8s`, `12s`, and `16s`, then `Probe rotation` lines with `quarantined_candidates=2/3` and `3/3`, followed by `Probe routing` fallbacks that arm alternates on `lbln...` and `4xl2hta3...`.
+  - The failure stage is now even narrower: `dl_transport` rose from `0/0/0` to `18/0/0`, but repeated `client error (Connect)` failures still killed first-wave admission before any payload bytes were written. Concurrency remains frozen.
+
+## Phase 100: Active Per-Host Transfer Cap + Clean Direct/Qilin Replay
+- **Date**: 2026-03-10
+- **Action**: Implemented a live downloader-side active per-host permit ledger in `src-tauri/src/aria_downloader.rs`, then re-ran both the clean direct regression harness and the exact-target Qilin timed batch download with the new host-pressure behavior visible in logs and summaries.
+- **Validation Commands**:
+  - `cargo check --manifest-path '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/src-tauri/Cargo.toml'`
+  - `cargo build --manifest-path '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/src-tauri/Cargo.toml' --bin direct-download-benchmark`
+  - `DIRECT_BENCH_DURATION=15 ./crawli/src-tauri/target/debug/direct-download-benchmark`
+  - `cargo build --manifest-path '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/src-tauri/Cargo.toml' --bin crawli`
+  - `perl -e 'alarm shift; exec @ARGV' 150 ./crawli/src-tauri/target/debug/crawli --progress-summary --progress-summary-interval-ms 5000 download-files --entries-file '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_cli_qilin_afa2a0ea_20260310_phase90_reconciliation_fix/output/targets/ijzn3sicrcy7guixkzjkib4ukbii__afa2a0ea-20ba-3ddf-8c5c-__35770556215d08e/current/listing_canonical.json' --output-dir '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase100a/full_download' --connections 120 > '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase100a/stdout.log' 2> '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase100a/stderr.log'`
+- **Result**:
+  - The clean direct regression path stayed healthy after the new host-pressure control landed. The latest March 10, 2026 run reported `host_cap=32`, `bytes=758923264`, `elapsed_secs=15.39`, `throughput_mib_per_sec=47.04`, `throughput_mbps=394.59`, and `transport=0/0/1`.
+  - The exact-target Qilin replay proved the live host cap is active on the onion path: the batch logged `host_cap_ceiling=4` for both `Phase 1 (Small)` and `Phase 0 (Micro)`, while compact summaries moved from `dl_transport=0/0/0` to `18/0/0`.
+  - The onion useful-work result is still zero. The same captured replay produced `0` non-placeholder payload files and `0` payload bytes under `tmp/live_qilin_download_phase100a/full_download`.
+  - The failure stage is now clearer, not worse: the log shows repeated `GET Range probe timed out after 8s`, `...after 12s`, `...after 16s`, plus `client error (Connect)` before any productive first-wave admission. That means the active host cap is working as intended, but the remaining bottleneck is still degraded-host probe admission rather than oversubscription.
+
+## Phase 98C: Probe-Stage Alternate Remap + Graded Onion Probe Budgets
+- **Date**: 2026-03-10
+- **Action**: Moved Qilin download hardening deeper into the probe stage. The probe layer now applies graded onion probe budgets by attempt and keeps alternate-host probing inside transfer-mode selection instead of relying on later remap/requeue behavior alone.
+- **Validation Commands**:
+  - `cargo build --manifest-path 'crawli/src-tauri/Cargo.toml' --bin crawli`
+  - `perl -e 'alarm shift; exec @ARGV' 150 ./crawli/src-tauri/target/debug/crawli --progress-summary --progress-summary-interval-ms 5000 download-files --entries-file '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_cli_qilin_afa2a0ea_20260310_phase90_reconciliation_fix/output/targets/ijzn3sicrcy7guixkzjkib4ukbii__afa2a0ea-20ba-3ddf-8c5c-__35770556215d08e/current/listing_canonical.json' --output-dir '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase98d/full_download' --connections 120 > '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase98d/stdout.log' 2> '/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/live_qilin_download_phase98d/stderr.log'`
+- **Result**:
+  - The captured exact-target replay proves the new graded budgets are active. `stderr.log` now shows `GET Range probe timed out after 8s` followed by `GET Range probe timed out after 12s`, which did not exist in the earlier flat-budget runs.
+  - Even with the wider alternate-probe window, the run still produced `0` payload files and `0` payload bytes in `/tmp/live_qilin_download_phase98d/full_download`.
+  - The batch still collapsed before productive admission: the same log also shows repeated `client error (Connect)` failures during the probe phase, and no probe-stage success/remap line was emitted. The next fix therefore needs to quarantine degraded probe hosts earlier and rotate the alternate-host cursor more aggressively before the file ever reaches transfer scheduling.
+
 ## Phase 86D: Root Durability + Active-Host Affinity Validation
 - **Date**: 2026-03-10
 - **Action**: Implemented durable winner promotion, live-client phantom replenishment, root-retry remap protection, and first-child-retry active-host affinity. Revalidated on the exact live `afa2a0ea-20ba-3ddf-8c5c-2aeea9e5dc43` target, then ran a `--no-stealth-ramp` comparison pass after root durability was restored.
@@ -308,3 +541,7 @@
 - **Action**: Installed `@testing-library/react`, `@testing-library/jest-dom`, and `@testing-library/user-event` to provide isolated component smoke tests via Vitest. Added `src/setupTests.ts` to mock Tauri OS-level APIs in a Node `jsdom` context.
 - **Coverage**: Addressed 0% coverage gaps by wiring `VibeLoader.test.tsx`, `Dashboard.test.tsx`, `VfsTreeView.test.tsx`, `VFSExplorer.test.tsx`, and `AzureConnectivityModal.test.tsx`.
 - **Purpose**: Fast feedback loop without launching Headless Chrome E2E via Playwright. Playwright tests (`tests/*.spec.ts`) continue to reign for integration tests (Port 0 mapping).
+
+
+### Persistent Scale Validation (Phase 107.5)
+Sustained 3+ hour Qilin crawls verified via live 15-second CLI RSS telemetry updates natively asserting no hidden heap bloat. Any future large-scale node collection MUST reside on sled engines instead of Vec instances.

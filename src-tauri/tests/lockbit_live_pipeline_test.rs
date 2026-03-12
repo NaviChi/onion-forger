@@ -200,7 +200,8 @@ fn live_lockbit_pipeline_default_ui_settings() {
             resume: false,
             resume_index: None,
             mega_password: None,
-            stealth_ramp: false,
+            stealth_ramp: false, parallel_download: false,
+            force_clearnet: false,
         };
 
         let daemon_count = active_ports.len().max(1);
@@ -304,6 +305,7 @@ fn live_lockbit_pipeline_default_ui_settings() {
                     {
                         batch_files.push(BatchFileEntry {
                             url: entry.raw_url.clone(),
+                            alternate_urls: Vec::new(),
                             path: full_path.to_string_lossy().to_string(),
                             size_hint: entry.size_bytes,
                             jwt_exp: entry.jwt_exp,

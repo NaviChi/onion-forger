@@ -151,8 +151,8 @@ impl CrawlerAdapter for LockBitAdapter {
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
-        let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let queue = Arc::new(crate::spillover::SpilloverQueue::new());
+        let all_discovered_entries = Arc::new(crate::spillover::SpilloverList::new());
 
         queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
@@ -182,12 +182,12 @@ impl CrawlerAdapter for LockBitAdapter {
             }
         });
 
-        let max_concurrent = frontier.recommended_listing_workers();
+        let max_concurrent = std::cmp::max(frontier.recommended_listing_workers(), 16);
         let mut workers = tokio::task::JoinSet::new();
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        for _ in 0..max_concurrent {
+        for worker_idx in 0..max_concurrent {
             let f = frontier.clone();
             let q_clone = queue.clone();
             let ui_tx_clone = ui_tx.clone();
@@ -196,6 +196,12 @@ impl CrawlerAdapter for LockBitAdapter {
 
             workers.spawn(async move {
                 let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
+                // Phase 126: Per-worker HS health tracking
+                use crate::circuit_health::CircuitHealth;
+                let health = CircuitHealth::new();
+                let mut consecutive_all_dead: u32 = 0;
+                let mut request_count: u32 = 0;
+
                 loop {
                     if f.is_cancelled() {
                         break;
@@ -211,6 +217,19 @@ impl CrawlerAdapter for LockBitAdapter {
                             continue;
                         }
                     };
+
+                    // Phase 126: CUSUM graduated backoff
+                    request_count += 1;
+                    if request_count > 2 && health.cusum_triggered() {
+                        consecutive_all_dead += 1;
+                        let backoff_secs = 2u64.pow(consecutive_all_dead.min(4));
+                        println!(
+                            "[LockBit W{} BACKOFF] CUSUM triggered — sleeping {}s (cycle {})",
+                            worker_idx, backoff_secs, consecutive_all_dead
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        health.reset_cusum();
+                    }
 
                     let _permit = f.politeness_semaphore.acquire().await.ok();
                     let (cid1, client1) = f.get_client();
@@ -228,10 +247,13 @@ impl CrawlerAdapter for LockBitAdapter {
                     // Global Failover: Remap URL to the currently active host seed
                     let effective_url = f.seed_manager.remap_url(&next_url, &f.target_url).await;
 
+                    // Phase 126: Adaptive timeout from EWMA
+                    let race_timeout_ms = if request_count <= 2 { 45_000u64 } else { health.adaptive_ttfb_ms().min(45_000) };
+
                     // Phase 73: Speculative Dual-Circuit Tor GET Racing
                     let req1 = Box::pin(async {
                         let res = tokio::time::timeout(
-                            std::time::Duration::from_secs(45),
+                            std::time::Duration::from_millis(race_timeout_ms),
                             client1.get(&effective_url).send(),
                         )
                         .await;
@@ -240,7 +262,7 @@ impl CrawlerAdapter for LockBitAdapter {
 
                     let req2 = Box::pin(async {
                         let res = tokio::time::timeout(
-                            std::time::Duration::from_secs(45),
+                            std::time::Duration::from_millis(race_timeout_ms),
                             client2.get(&effective_url).send(),
                         )
                         .await;
@@ -260,10 +282,14 @@ impl CrawlerAdapter for LockBitAdapter {
                             }
                             if status.is_success() {
                                 f.seed_manager.report_success().await; // Inform SeedManager of successful contact
-                                if let Ok(body) = resp.text().await {
+                                if let Ok(body_bytes) = resp.bytes().await {
+                                    let body = String::from_utf8_lossy(&body_bytes).into_owned();
                                     bytes_downloaded += body.len() as u64;
                                     html = Some(body);
                                     fetch_success = true;
+                                    health.record_success();
+                                    health.record_latency(start_time.elapsed().as_millis() as f32);
+                                    consecutive_all_dead = 0;
                                 }
                             } else {
                                 // Inform SeedManager to potentially rotate domain on heavy generic failures
@@ -272,19 +298,26 @@ impl CrawlerAdapter for LockBitAdapter {
                                         println!("[Global Failover] Rotated active seed threshold exceeded for {}", f.target_url);
                                     }
                                 }
+                                health.record_failure();
                                 html = Some(build_fallback_html());
                             }
                         }
-                        Ok(Err(_e)) => {
+                        Ok(Err(e)) => {
+                            if e.to_string().contains("TTFB Timeout") {
+                                println!("[Phase 106] Dynamic TTFB Isolation swapping DEAD circuit {} on {}", winner_cid, effective_url);
+                                f.trigger_circuit_isolation(winner_cid).await;
+                            }
                             if f.seed_manager.report_failure(10).await {
                                 println!("[Global Failover] Rotated active seed threshold exceeded for {}", f.target_url);
                             }
+                            health.record_failure();
                             html = Some(build_fallback_html());
                         }
                         Err(_e) => {
                             if f.seed_manager.report_failure(10).await {
                                 println!("[Global Failover] Rotated active seed threshold exceeded for {}", f.target_url);
                             }
+                            health.record_failure();
                             html = Some(build_fallback_html());
                         }
                     }
@@ -318,8 +351,9 @@ impl CrawlerAdapter for LockBitAdapter {
                     }
 
                     if !new_files.is_empty() {
-                        let mut lock = discovered_ref.lock().await;
-                        lock.extend(new_files);
+                        for nf in new_files {
+                            discovered_ref.push(nf);
+                        }
                     }
 
                     pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -330,8 +364,8 @@ impl CrawlerAdapter for LockBitAdapter {
         while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
-        let mut final_results = all_discovered_entries.lock().await;
-        Ok(final_results.drain(..).collect())
+        let final_results = all_discovered_entries.drain_all();
+        Ok(final_results)
     }
 
     fn name(&self) -> &'static str {

@@ -259,12 +259,12 @@ async fn run_case(
         sizes: true,
         download: false,
         circuits: Some(circuits),
-        daemons: Some(circuits),
         agnostic_state: false,
         resume: false,
         resume_index: None,
         mega_password: None,
-        stealth_ramp: true,
+        stealth_ramp: true, parallel_download: false,
+            force_clearnet: false,
     };
 
     let frontier = Arc::new(CrawlerFrontier::new(

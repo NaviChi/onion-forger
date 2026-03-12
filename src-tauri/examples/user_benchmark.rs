@@ -17,12 +17,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sizes: true,
         download: false,
         circuits: Some(96), // Use 96 circuits (8 daemons × 12)
-        daemons: Some(8),   // Use 8 daemons
         agnostic_state: false,
         resume: false,
         resume_index: None,
         mega_password: None,
-        stealth_ramp: true,
+        stealth_ramp: true, parallel_download: false,
+            force_clearnet: false,
     };
 
     println!("Bootstrapping Tor cluster...");

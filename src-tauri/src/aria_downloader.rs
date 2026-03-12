@@ -17,10 +17,23 @@ fn preallocate_windows_nt_blocks(file: &std::fs::File, size: u64) -> std::io::Re
     let handle = file.as_raw_handle() as *mut std::ffi::c_void;
     extern "system" {
         fn SetFileValidData(hFile: *mut std::ffi::c_void, ValidDataLength: i64) -> i32;
+        fn GetLastError() -> u32;
     }
     file.set_len(size)?;
     unsafe {
-        SetFileValidData(handle, size as i64);
+        // Phase 129: Guard against missing SE_MANAGE_VOLUME_NAME privilege.
+        // SetFileValidData requires admin rights. Without it, the call returns 0
+        // and GetLastError() returns ERROR_PRIVILEGE_NOT_HELD (1314).
+        // Fall through gracefully — NT will zero-fill on write (slower but correct).
+        let result = SetFileValidData(handle, size as i64);
+        if result == 0 {
+            let err = GetLastError();
+            if err == 1314 {
+                eprintln!("[IO] SetFileValidData skipped (requires admin). NT will zero-fill.");
+            } else if err != 0 {
+                eprintln!("[IO] SetFileValidData warning: error code {}", err);
+            }
+        }
     }
     Ok(())
 }
@@ -32,7 +45,7 @@ fn preallocate_windows_nt_blocks(file: &std::fs::File, size: u64) -> std::io::Re
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -125,26 +138,37 @@ impl Drop for ActiveCircuitGuard {
 const STREAM_TIMEOUT_SECS: u64 = 15;
 const MAX_STALL_RETRIES: usize = 30;
 const PROBE_SIZE: u64 = 102_400; // 100KB micro-probe (80% signal in 10% of time)
+const PROBE_PROMOTION_SIZE: u64 = 32 * 1024; // 32KB transport seed for micro/small promotion
 const HANDSHAKE_CULL_RATIO: f64 = 0.50; // Kill bottom 50% by handshake latency
 const DEFAULT_DOWNLOAD_TOURNAMENT_CAP: usize = 48;
 const DEFAULT_DOWNLOAD_INITIAL_ACTIVE_CAP_ONION: usize = 16;
 const DEFAULT_DOWNLOAD_INITIAL_ACTIVE_CAP_CLEARNET: usize = 32;
 const DEFAULT_DOWNLOAD_INITIAL_ACTIVE_MIN: usize = 4;
 const DEFAULT_RESUME_COALESCE_PIECES: usize = 4;
+const DEFAULT_BATCH_PROBE_PROMOTION_CACHE_MIB: usize = 64;
+const DEFAULT_DOWNLOAD_MAX_HOST_CONNECTIONS_CLEARNET: usize = 32;
+const DEFAULT_DOWNLOAD_MAX_HOST_CONNECTIONS_ONION: usize = 32;
 
-// Phase 4.1: Adaptive piece sizing bounds
-const MIN_PIECE_SIZE: u64 = 1_048_576; // 1MB minimum — enables parallelism for small files (Phase 67)
+// Phase 114: Forbids bisection algorithms from violating Windows memory-mapping page constraints.
+#[allow(dead_code)]
+const NTFS_PAGE_SIZE: u64 = 4096;
+const ARIA_PIECE_SIZE: u64 = 1048576; // 1MB Bitfield Alignment
+
+const MIN_PIECE_SIZE: u64 = ARIA_PIECE_SIZE; // 1MB minimum
 const MAX_PIECE_SIZE: u64 = 52_428_800; // 50MB maximum
 
-/// Phase 4.1: Compute optimal piece size based on file size and circuit count.
-/// Targets ~8 pieces per circuit to balance granularity vs overhead.
+/// Phase 114: Compute optimal piece size based on file size and circuit count.
+/// Enforces hardware cache-line boundaries (1MB) to prevent NTFS LockFreeMmap thrashing
 fn compute_piece_size(content_length: u64, circuits: usize) -> u64 {
     if content_length == 0 || circuits == 0 {
         return MIN_PIECE_SIZE;
     }
-    let target_pieces_per_circuit = 8u64;
+    let target_pieces_per_circuit = 32u64; // IDM multiplexing subdivision
     let ideal = content_length / (circuits as u64 * target_pieces_per_circuit);
-    ideal.clamp(MIN_PIECE_SIZE, MAX_PIECE_SIZE)
+    
+    // Align tightly to the nearest 1MB boundary to match APFS/NTFS extent hardware logic
+    let aligned_ideal = (ideal / ARIA_PIECE_SIZE).max(1) * ARIA_PIECE_SIZE;
+    aligned_ideal.clamp(MIN_PIECE_SIZE, MAX_PIECE_SIZE)
 }
 
 fn resume_coalesce_piece_limit() -> usize {
@@ -640,6 +664,7 @@ pub struct WriteMsg {
     pub filepath: String,
     pub offset: u64,
     pub data: bytes::Bytes,
+    pub mmap_written: bool,
     pub close_file: bool,
     pub chunk_id: usize,
     pub piece_end: usize,
@@ -650,6 +675,36 @@ pub struct TorStatusEvent {
     pub state: String,
     pub message: String,
     pub daemon_count: usize,
+}
+
+#[derive(Clone)]
+pub struct LockFreeMmap {
+    ptr: usize,
+    len: usize,
+}
+
+unsafe impl Send for LockFreeMmap {}
+unsafe impl Sync for LockFreeMmap {}
+
+impl LockFreeMmap {
+    pub fn new(mmap: &memmap2::MmapMut) -> Self {
+        Self {
+            ptr: mmap.as_ptr() as usize,
+            len: mmap.len(),
+        }
+    }
+
+    pub fn write_slice(&self, offset: usize, data: &[u8]) {
+        if offset + data.len() <= self.len {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (self.ptr as *mut u8).add(offset),
+                    data.len(),
+                );
+            }
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -802,6 +857,26 @@ fn batch_swarm_first_byte_timeout(is_onion: bool) -> Duration {
     )
 }
 
+/// Phase 126: Adaptive first-byte timeout using host capability EWMA.
+/// If the host has recorded `first_byte_ewma_ms > 0`, uses `max(3 × ewma, 3000ms)`
+/// capped at the fixed default. Otherwise falls back to the fixed timeout.
+///
+/// This brings the same adaptive TTFB intelligence from the crawl side
+/// (CircuitHealth::adaptive_ttfb_ms) to the download transport layer.
+/// Typical savings: 200ms EWMA host → 3s timeout vs 18s fixed = 6× faster failure detection.
+fn adaptive_first_byte_timeout(url: &str, is_onion: bool) -> Duration {
+    let fixed = batch_swarm_first_byte_timeout(is_onion);
+    let snapshot = host_capability_snapshot(url, is_onion);
+    if let Some(cap) = snapshot {
+        if cap.first_byte_ewma_ms > 0.0 {
+            let adaptive_ms = (cap.first_byte_ewma_ms * 3.0) as u64;
+            let adaptive = Duration::from_millis(adaptive_ms.clamp(3_000, fixed.as_millis() as u64));
+            return adaptive;
+        }
+    }
+    fixed
+}
+
 fn batch_no_byte_requeue_limit() -> u8 {
     env_usize("CRAWLI_BATCH_NO_BYTE_REQUEUE_LIMIT")
         .unwrap_or(2)
@@ -817,6 +892,537 @@ fn batch_entry_host(url: &str) -> Option<String> {
         .ok()?
         .host_str()
         .map(|host| host.to_ascii_lowercase())
+}
+
+fn batch_probe_promotion_budget_bytes() -> usize {
+    env_usize("CRAWLI_BATCH_PROBE_PROMOTION_CACHE_MIB")
+        .unwrap_or(DEFAULT_BATCH_PROBE_PROMOTION_CACHE_MIB)
+        .clamp(4, 512)
+        * 1_048_576
+}
+
+fn probe_promotion_size_bytes() -> usize {
+    env_usize("CRAWLI_PROBE_PROMOTION_KIB")
+        .unwrap_or((PROBE_PROMOTION_SIZE / 1024) as usize)
+        .clamp(4, 256)
+        * 1024
+}
+
+#[derive(Clone, Debug)]
+struct PrefetchedProbeData {
+    bytes: bytes::Bytes,
+    end_offset: u64,
+    complete_file: bool,
+}
+
+impl PrefetchedProbeData {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn next_offset(&self) -> u64 {
+        self.end_offset.saturating_add(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ResumeValidatorKind {
+    #[default]
+    None,
+    Etag,
+    LastModified,
+}
+
+#[derive(Clone, Debug)]
+struct HostCapabilityState {
+    supports_ranges: Option<bool>,
+    validator_kind: ResumeValidatorKind,
+    recent_successes: u32,
+    recent_failures: u32,
+    low_speed_aborts: u32,
+    consecutive_low_speed_aborts: u32,
+    consecutive_connect_failures: u32,
+    safe_parallelism_cap: usize,
+    connect_rtt_ewma_ms: f64,
+    first_byte_ewma_ms: f64,
+    last_productive_epoch_ms: u64,
+    quarantine_until_epoch_ms: u64,
+}
+
+impl Default for HostCapabilityState {
+    fn default() -> Self {
+        Self {
+            supports_ranges: None,
+            validator_kind: ResumeValidatorKind::None,
+            recent_successes: 0,
+            recent_failures: 0,
+            low_speed_aborts: 0,
+            consecutive_low_speed_aborts: 0,
+            consecutive_connect_failures: 0,
+            safe_parallelism_cap: 32,
+            connect_rtt_ewma_ms: 0.0,
+            first_byte_ewma_ms: 0.0,
+            last_productive_epoch_ms: 0,
+            quarantine_until_epoch_ms: 0,
+        }
+    }
+}
+
+impl HostCapabilityState {
+    fn reuse_allowed(&self, is_onion: bool) -> bool {
+        if !is_onion {
+            return true;
+        }
+        let now_ms = current_epoch_ms();
+        host_is_productive(
+            self.recent_successes,
+            self.recent_failures,
+            self.consecutive_connect_failures,
+            self.last_productive_epoch_ms,
+            is_onion,
+            now_ms,
+        ) && self.recent_successes >= 2
+            && self.consecutive_low_speed_aborts == 0
+            && self.quarantine_until_epoch_ms <= now_ms
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HostFailureKind {
+    Connect,
+    Timeout,
+    LowSpeed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LowSpeedPolicy {
+    min_bytes_per_sec: u64,
+    window: Duration,
+}
+
+impl LowSpeedPolicy {
+    fn enabled(self) -> bool {
+        self.min_bytes_per_sec > 0 && !self.window.is_zero()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LowSpeedTracker {
+    window_started_at: Instant,
+    bytes_in_window: u64,
+}
+
+impl LowSpeedTracker {
+    fn new(now: Instant, initial_bytes: u64) -> Self {
+        Self {
+            window_started_at: now,
+            bytes_in_window: initial_bytes,
+        }
+    }
+
+    fn observe_progress(&mut self, now: Instant, bytes: u64, policy: LowSpeedPolicy) -> bool {
+        if !policy.enabled() {
+            return false;
+        }
+        self.bytes_in_window = self.bytes_in_window.saturating_add(bytes);
+        let elapsed = now.saturating_duration_since(self.window_started_at);
+        if elapsed < policy.window {
+            return false;
+        }
+        let speed = self.bytes_in_window as f64 / elapsed.as_secs_f64().max(0.001);
+        if speed < policy.min_bytes_per_sec as f64 {
+            return true;
+        }
+        self.window_started_at = now;
+        self.bytes_in_window = 0;
+        false
+    }
+
+    fn should_abort_on_idle(&self, now: Instant, policy: LowSpeedPolicy) -> bool {
+        if !policy.enabled() {
+            return false;
+        }
+        let elapsed = now.saturating_duration_since(self.window_started_at);
+        if elapsed < policy.window {
+            return false;
+        }
+        let speed = self.bytes_in_window as f64 / elapsed.as_secs_f64().max(0.001);
+        speed < policy.min_bytes_per_sec as f64
+    }
+}
+
+static DOWNLOAD_HOST_CAPABILITIES: OnceLock<StdRwLock<HashMap<String, HostCapabilityState>>> =
+    OnceLock::new();
+static DOWNLOAD_ACTIVE_HOST_CONNECTIONS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+fn download_host_capabilities() -> &'static StdRwLock<HashMap<String, HostCapabilityState>> {
+    DOWNLOAD_HOST_CAPABILITIES.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+fn download_active_host_connections() -> &'static Mutex<HashMap<String, usize>> {
+    DOWNLOAD_ACTIVE_HOST_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn host_capability_key(url: &str, is_onion: bool) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port_or_known_default().unwrap_or(0);
+    Some(format!(
+        "{}|{}|{}|{}",
+        if is_onion { "onion" } else { "direct" },
+        parsed.scheme(),
+        host,
+        port
+    ))
+}
+
+fn current_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn productive_host_freshness_secs(is_onion: bool) -> u64 {
+    if is_onion {
+        env_usize("CRAWLI_DOWNLOAD_PRODUCTIVE_HOST_MEMORY_SECS_ONION")
+            .unwrap_or(120)
+            .clamp(30, 600) as u64
+    } else {
+        env_usize("CRAWLI_DOWNLOAD_PRODUCTIVE_HOST_MEMORY_SECS_CLEARNET")
+            .unwrap_or(300)
+            .clamp(30, 1_800) as u64
+    }
+}
+
+fn host_is_productive(
+    recent_successes: u32,
+    recent_failures: u32,
+    consecutive_connect_failures: u32,
+    last_productive_epoch_ms: u64,
+    is_onion: bool,
+    now_ms: u64,
+) -> bool {
+    if recent_successes == 0 || last_productive_epoch_ms == 0 {
+        return false;
+    }
+
+    let freshness_window_ms = productive_host_freshness_secs(is_onion) * 1_000;
+    let fresh = now_ms.saturating_sub(last_productive_epoch_ms) <= freshness_window_ms;
+    fresh
+        && recent_failures <= recent_successes.saturating_add(1)
+        && consecutive_connect_failures < 2
+}
+
+fn update_ewma(target: &mut f64, sample_ms: u64) {
+    let sample = sample_ms as f64;
+    if *target <= 0.0 {
+        *target = sample;
+    } else {
+        *target = (*target * 0.7) + (sample * 0.3);
+    }
+}
+
+fn probe_quarantine_base_secs(is_onion: bool) -> u64 {
+    if is_onion {
+        env_usize("CRAWLI_DOWNLOAD_PROBE_QUARANTINE_SECS_ONION")
+            .unwrap_or(18)
+            .clamp(8, 120) as u64
+    } else {
+        env_usize("CRAWLI_DOWNLOAD_PROBE_QUARANTINE_SECS_CLEARNET")
+            .unwrap_or(0)
+            .clamp(0, 30) as u64
+    }
+}
+
+fn host_capability_snapshot(url: &str, is_onion: bool) -> Option<HostCapabilityState> {
+    let key = host_capability_key(url, is_onion)?;
+    let guard = download_host_capabilities().read().ok()?;
+    guard.get(&key).cloned()
+}
+
+fn record_probe_host_capability(url: &str, is_onion: bool, probe: &ProbeResult, connect_ms: u64) {
+    let Some(key) = host_capability_key(url, is_onion) else {
+        return;
+    };
+    let Ok(mut guard) = download_host_capabilities().write() else {
+        return;
+    };
+    let state = guard.entry(key).or_default();
+    state.supports_ranges = Some(probe.supports_ranges);
+    state.validator_kind = if probe.etag.is_some() {
+        ResumeValidatorKind::Etag
+    } else if probe.last_modified.is_some() {
+        ResumeValidatorKind::LastModified
+    } else {
+        ResumeValidatorKind::None
+    };
+    update_ewma(&mut state.connect_rtt_ewma_ms, connect_ms);
+    if probe.content_length > 0 {
+        state.recent_successes = state.recent_successes.saturating_add(1);
+        state.recent_failures = 0;
+        state.consecutive_connect_failures = 0;
+        state.quarantine_until_epoch_ms = 0;
+        state.last_productive_epoch_ms = current_epoch_ms();
+    }
+}
+
+fn record_host_success(
+    url: &str,
+    is_onion: bool,
+    bytes_transferred: u64,
+    first_byte_ms: Option<u64>,
+) {
+    let Some(key) = host_capability_key(url, is_onion) else {
+        return;
+    };
+    let Ok(mut guard) = download_host_capabilities().write() else {
+        return;
+    };
+    let state = guard.entry(key).or_default();
+    state.recent_successes = state.recent_successes.saturating_add(1);
+    state.recent_failures = 0;
+    state.consecutive_low_speed_aborts = 0;
+    state.consecutive_connect_failures = 0;
+    state.quarantine_until_epoch_ms = 0;
+    if let Some(first_byte_ms) = first_byte_ms {
+        update_ewma(&mut state.first_byte_ewma_ms, first_byte_ms);
+    }
+    if bytes_transferred >= 32 * 1024 {
+        state.last_productive_epoch_ms = current_epoch_ms();
+        state.safe_parallelism_cap = state
+            .safe_parallelism_cap
+            .saturating_add(1)
+            .min(if is_onion { 16 } else { 32 });
+    }
+}
+
+fn record_host_failure(url: &str, is_onion: bool, kind: HostFailureKind) {
+    let Some(key) = host_capability_key(url, is_onion) else {
+        return;
+    };
+    let Ok(mut guard) = download_host_capabilities().write() else {
+        return;
+    };
+    let state = guard.entry(key).or_default();
+    state.recent_failures = state.recent_failures.saturating_add(1);
+    let now_ms = current_epoch_ms();
+    let recently_productive = host_is_productive(
+        state.recent_successes,
+        state.recent_failures.saturating_sub(1),
+        state.consecutive_connect_failures,
+        state.last_productive_epoch_ms,
+        is_onion,
+        now_ms,
+    );
+    match kind {
+        HostFailureKind::LowSpeed => {
+            state.low_speed_aborts = state.low_speed_aborts.saturating_add(1);
+            state.consecutive_low_speed_aborts =
+                state.consecutive_low_speed_aborts.saturating_add(1);
+            state.safe_parallelism_cap = state.safe_parallelism_cap.saturating_sub(1).max(1);
+            if is_onion && state.consecutive_low_speed_aborts >= 2 {
+                let quarantine_secs = probe_quarantine_base_secs(true).max(12);
+                state.quarantine_until_epoch_ms = state
+                    .quarantine_until_epoch_ms
+                    .max(now_ms + quarantine_secs * 1_000);
+            }
+        }
+        HostFailureKind::Connect | HostFailureKind::Timeout => {
+            state.consecutive_low_speed_aborts = 0;
+            state.consecutive_connect_failures =
+                state.consecutive_connect_failures.saturating_add(1);
+            state.recent_successes = state.recent_successes.saturating_sub(1);
+            state.safe_parallelism_cap = state.safe_parallelism_cap.saturating_sub(1).max(1);
+            if is_onion {
+                if !recently_productive || state.consecutive_connect_failures >= 2 {
+                    state.last_productive_epoch_ms = 0;
+                }
+                if !recently_productive || state.consecutive_connect_failures >= 1 {
+                    let streak = state.consecutive_connect_failures.clamp(1, 5) as u64;
+                    let base_secs = probe_quarantine_base_secs(true);
+                    let multiplier = if recently_productive {
+                        streak.saturating_add(1)
+                    } else {
+                        streak.saturating_add(2)
+                    }
+                    .clamp(2, 6);
+                    let quarantine_secs = base_secs.saturating_mul(multiplier.max(1));
+                    state.quarantine_until_epoch_ms = state
+                        .quarantine_until_epoch_ms
+                        .max(now_ms + quarantine_secs * 1_000);
+                }
+            }
+        }
+    }
+}
+
+fn onion_reuse_allowed_for_host(
+    url: &str,
+    telemetry: Option<&crate::runtime_metrics::RuntimeTelemetry>,
+) -> bool {
+    let Some(key) = host_capability_key(url, true) else {
+        return false;
+    };
+    let Ok(guard) = download_host_capabilities().read() else {
+        return false;
+    };
+    let Some(state) = guard.get(&key) else {
+        return false;
+    };
+    if let Some(telemetry) = telemetry {
+        telemetry.record_download_host_cache_hit();
+    }
+    state.reuse_allowed(true)
+}
+
+fn configured_download_host_connection_cap(is_onion: bool) -> usize {
+    if is_onion {
+        env_usize("CRAWLI_DOWNLOAD_MAX_HOST_CONNECTIONS_ONION")
+            .unwrap_or(DEFAULT_DOWNLOAD_MAX_HOST_CONNECTIONS_ONION)
+            .clamp(1, 32)
+    } else {
+        env_usize("CRAWLI_DOWNLOAD_MAX_HOST_CONNECTIONS_CLEARNET")
+            .unwrap_or(DEFAULT_DOWNLOAD_MAX_HOST_CONNECTIONS_CLEARNET)
+            .clamp(1, 64)
+    }
+}
+
+pub fn download_host_connection_cap_for_url(url: &str, is_onion: bool) -> usize {
+    let configured_cap = configured_download_host_connection_cap(is_onion);
+    let Some(key) = host_capability_key(url, is_onion) else {
+        return configured_cap;
+    };
+    let Ok(guard) = download_host_capabilities().read() else {
+        return configured_cap;
+    };
+    guard
+        .get(&key)
+        .map(|state| state.safe_parallelism_cap.max(1).min(configured_cap))
+        .unwrap_or(configured_cap)
+}
+
+struct DownloadHostPermit {
+    key: Option<String>,
+}
+
+impl Drop for DownloadHostPermit {
+    fn drop(&mut self) {
+        let Some(key) = self.key.as_ref() else {
+            return;
+        };
+        let Ok(mut guard) = download_active_host_connections().lock() else {
+            return;
+        };
+        if let Some(active) = guard.get_mut(key) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                guard.remove(key);
+            }
+        }
+    }
+}
+
+fn try_acquire_download_host_permit(url: &str, is_onion: bool) -> Option<DownloadHostPermit> {
+    let Some(key) = host_capability_key(url, is_onion) else {
+        return Some(DownloadHostPermit { key: None });
+    };
+    let cap = download_host_connection_cap_for_url(url, is_onion).max(1);
+    let Ok(mut guard) = download_active_host_connections().lock() else {
+        return None;
+    };
+    let active = guard.get(&key).copied().unwrap_or(0);
+    if active >= cap {
+        return None;
+    }
+    guard.insert(key.clone(), active + 1);
+    Some(DownloadHostPermit { key: Some(key) })
+}
+
+async fn acquire_download_host_permit(
+    url: &str,
+    is_onion: bool,
+    control: Option<&DownloadControl>,
+) -> Option<DownloadHostPermit> {
+    loop {
+        if let Some(permit) = try_acquire_download_host_permit(url, is_onion) {
+            return Some(permit);
+        }
+        if let Some(control) = control {
+            if control.interruption_reason().is_some() {
+                return None;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+enum QueueDispatchResult {
+    Ready(QueuedBatchFile, DownloadHostPermit),
+    Saturated,
+    Empty,
+}
+
+fn take_next_dispatchable_file(
+    queue: &mut VecDeque<QueuedBatchFile>,
+    is_onion: bool,
+) -> QueueDispatchResult {
+    if queue.is_empty() {
+        return QueueDispatchResult::Empty;
+    }
+
+    let scan_len = queue.len();
+    for _ in 0..scan_len {
+        let Some(file) = queue.pop_front() else {
+            break;
+        };
+        if let Some(permit) = try_acquire_download_host_permit(&file.entry.url, is_onion) {
+            return QueueDispatchResult::Ready(file, permit);
+        }
+        queue.push_back(file);
+    }
+
+    QueueDispatchResult::Saturated
+}
+
+fn apply_download_connection_policy(
+    req: crate::arti_client::ArtiRequestBuilder,
+    url: &str,
+    is_onion: bool,
+    telemetry: Option<&crate::runtime_metrics::RuntimeTelemetry>,
+) -> crate::arti_client::ArtiRequestBuilder {
+    if !is_onion {
+        return req;
+    }
+    if onion_reuse_allowed_for_host(url, telemetry) {
+        req
+    } else {
+        req.header("Connection", "close")
+    }
+}
+
+fn download_low_speed_policy(is_onion: bool) -> LowSpeedPolicy {
+    if is_onion {
+        LowSpeedPolicy {
+            min_bytes_per_sec: env_usize("CRAWLI_DOWNLOAD_LOW_SPEED_BPS_ONION").unwrap_or(8 * 1024)
+                as u64,
+            window: Duration::from_secs(
+                env_usize("CRAWLI_DOWNLOAD_LOW_SPEED_WINDOW_SECS_ONION")
+                    .unwrap_or(12)
+                    .clamp(4, 60) as u64,
+            ),
+        }
+    } else {
+        LowSpeedPolicy {
+            min_bytes_per_sec: env_usize("CRAWLI_DOWNLOAD_LOW_SPEED_BPS_CLEARNET")
+                .unwrap_or(64 * 1024) as u64,
+            window: Duration::from_secs(
+                env_usize("CRAWLI_DOWNLOAD_LOW_SPEED_WINDOW_SECS_CLEARNET")
+                    .unwrap_or(8)
+                    .clamp(3, 30) as u64,
+            ),
+        }
+    }
 }
 
 fn remap_queued_file_to_next_alternate(
@@ -839,10 +1445,134 @@ fn remap_queued_file_to_next_alternate(
     Some((old_host, new_host))
 }
 
+fn stable_probe_rotation_index(key: &str, len: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+
+    if len <= 1 {
+        return 0;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % len
+}
+
+#[derive(Clone, Debug)]
+struct ProbeCandidate {
+    url: String,
+    host: String,
+    rotation_rank: usize,
+    recent_successes: u32,
+    recent_failures: u32,
+    consecutive_connect_failures: u32,
+    last_productive_epoch_ms: u64,
+    quarantine_until_epoch_ms: u64,
+}
+
+impl ProbeCandidate {
+    fn quarantined(&self, now_ms: u64) -> bool {
+        self.quarantine_until_epoch_ms > now_ms
+    }
+
+    fn productive(&self, is_onion: bool, now_ms: u64) -> bool {
+        host_is_productive(
+            self.recent_successes,
+            self.recent_failures,
+            self.consecutive_connect_failures,
+            self.last_productive_epoch_ms,
+            is_onion,
+            now_ms,
+        )
+    }
+}
+
+fn ordered_probe_candidates(entry: &BatchFileEntry, is_onion: bool) -> Vec<ProbeCandidate> {
+    let mut urls = Vec::with_capacity(entry.alternate_urls.len().saturating_add(1));
+    urls.push(entry.url.clone());
+    urls.extend(entry.alternate_urls.iter().cloned());
+
+    let mut seen = HashSet::new();
+    urls.retain(|url| seen.insert(url.clone()));
+
+    if urls.len() > 1 {
+        let rotation = stable_probe_rotation_index(&entry.path, urls.len());
+        urls.rotate_left(rotation);
+    }
+
+    let mut candidates = urls
+        .into_iter()
+        .enumerate()
+        .map(|(rotation_rank, url)| {
+            let host = batch_entry_host(&url).unwrap_or_else(|| "-".to_string());
+            let snapshot = host_capability_snapshot(&url, is_onion).unwrap_or_default();
+            ProbeCandidate {
+                url,
+                host,
+                rotation_rank,
+                recent_successes: snapshot.recent_successes,
+                recent_failures: snapshot.recent_failures,
+                consecutive_connect_failures: snapshot.consecutive_connect_failures,
+                last_productive_epoch_ms: snapshot.last_productive_epoch_ms,
+                quarantine_until_epoch_ms: snapshot.quarantine_until_epoch_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let now_ms = current_epoch_ms();
+    let has_productive_active = candidates
+        .iter()
+        .any(|candidate| !candidate.quarantined(now_ms) && candidate.productive(is_onion, now_ms));
+
+    candidates.sort_by(|left, right| {
+        left.quarantined(now_ms)
+            .cmp(&right.quarantined(now_ms))
+            .then_with(|| {
+                if has_productive_active {
+                    right
+                        .productive(is_onion, now_ms)
+                        .cmp(&left.productive(is_onion, now_ms))
+                        .then_with(|| right.recent_successes.cmp(&left.recent_successes))
+                        .then_with(|| {
+                            right
+                                .last_productive_epoch_ms
+                                .cmp(&left.last_productive_epoch_ms)
+                        })
+                        .then_with(|| left.recent_failures.cmp(&right.recent_failures))
+                } else {
+                    let left_is_snapshot = left.url == entry.url;
+                    let right_is_snapshot = right.url == entry.url;
+                    right_is_snapshot
+                        .cmp(&left_is_snapshot)
+                        .then_with(|| left.rotation_rank.cmp(&right.rotation_rank))
+                        .then_with(|| left.recent_failures.cmp(&right.recent_failures))
+                }
+            })
+            .then_with(|| left.host.cmp(&right.host))
+    });
+
+    candidates
+}
+
+fn reseed_probe_alternates(
+    entry: &mut BatchFileEntry,
+    ordered: &[ProbeCandidate],
+    selected_url: &str,
+) {
+    let mut next = Vec::with_capacity(ordered.len().saturating_sub(1));
+    let mut seen = HashSet::new();
+    for candidate in ordered {
+        if candidate.url == selected_url || !seen.insert(candidate.url.clone()) {
+            continue;
+        }
+        next.push(candidate.url.clone());
+    }
+    entry.alternate_urls = next;
+}
+
 fn diversify_first_wave_by_host(
-    files: Vec<BatchFileEntry>,
+    files: Vec<ScheduledBatchFile>,
     wave_width: usize,
-) -> Vec<BatchFileEntry> {
+) -> Vec<ScheduledBatchFile> {
     if files.len() <= 1 || wave_width <= 1 {
         return files;
     }
@@ -853,7 +1583,7 @@ fn diversify_first_wave_by_host(
     let mut unknown_indices = VecDeque::new();
 
     for (idx, file) in original.iter().enumerate() {
-        if let Some(host) = batch_entry_host(&file.url) {
+        if let Some(host) = batch_entry_host(&file.entry.url) {
             let bucket = host_buckets.entry(host.clone()).or_insert_with(|| {
                 host_order.push(host.clone());
                 VecDeque::new()
@@ -914,16 +1644,24 @@ fn diversify_first_wave_by_host(
 enum BatchBodyReadFailure {
     FirstByteTimeout,
     BodyTimeout,
+    LowSpeed,
     Stream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchBodyReadStats {
+    first_byte_ms: u64,
 }
 
 async fn read_batch_response_body(
     resp: crate::arti_client::ArtiResponse,
     first_byte_timeout: Duration,
     body_timeout: Duration,
-) -> std::result::Result<Vec<u8>, BatchBodyReadFailure> {
+    low_speed_policy: LowSpeedPolicy,
+) -> std::result::Result<(Vec<u8>, BatchBodyReadStats), BatchBodyReadFailure> {
     use futures::StreamExt;
 
+    let started_at = Instant::now();
     let mut stream = resp.bytes_stream();
     let mut body = Vec::new();
 
@@ -933,15 +1671,31 @@ async fn read_batch_response_body(
         Ok(Some(Err(_))) | Ok(None) => return Err(BatchBodyReadFailure::Stream),
         Err(_) => return Err(BatchBodyReadFailure::FirstByteTimeout),
     };
+    let first_byte_ms = started_at.elapsed().as_millis() as u64;
     body.extend_from_slice(&first_chunk);
+    let mut low_speed_tracker = LowSpeedTracker::new(Instant::now(), first_chunk.len() as u64);
 
     let deadline = tokio::time::Instant::now() + body_timeout;
     loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(Ok(chunk))) => body.extend_from_slice(&chunk),
+            Ok(Some(Ok(chunk))) => {
+                if !chunk.is_empty() {
+                    let now = Instant::now();
+                    if low_speed_tracker.observe_progress(now, chunk.len() as u64, low_speed_policy)
+                    {
+                        return Err(BatchBodyReadFailure::LowSpeed);
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+            }
             Ok(Some(Err(_))) => return Err(BatchBodyReadFailure::Stream),
-            Ok(None) => return Ok(body),
-            Err(_) => return Err(BatchBodyReadFailure::BodyTimeout),
+            Ok(None) => return Ok((body, BatchBodyReadStats { first_byte_ms })),
+            Err(_) => {
+                if low_speed_tracker.should_abort_on_idle(Instant::now(), low_speed_policy) {
+                    return Err(BatchBodyReadFailure::LowSpeed);
+                }
+                return Err(BatchBodyReadFailure::BodyTimeout);
+            }
         }
     }
 }
@@ -961,11 +1715,21 @@ enum TaskOutcome {
     Failed(String),
 }
 
-struct ProbeResult {
-    content_length: u64,
-    supports_ranges: bool,
-    etag: Option<String>,
-    last_modified: Option<String>,
+#[derive(Clone, Debug, Serialize)]
+pub struct ProbeResult {
+    pub content_length: u64,
+    pub supports_ranges: bool,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    prefetched_probe: Option<PrefetchedProbeData>,
+}
+
+#[derive(Clone, Debug)]
+struct ProbeAttemptResult {
+    probe: ProbeResult,
+    timed_out: bool,
+    request_failed: bool,
 }
 
 fn extract_resume_validators(
@@ -1093,26 +1857,110 @@ fn open_file_with_adaptive_io(
 // Phase 44: Legacy terminate_pid/cleanup_tor_data_dir/cleanup_stale_tor_daemons
 // removed — arti manages Tor in-process, no child processes to clean.
 
-async fn probe_target(
+fn onion_probe_timeout_for_attempt(attempt: usize, has_alternates: bool) -> Duration {
+    let base_secs = env_usize("CRAWLI_BATCH_PROBE_TIMEOUT_SECS")
+        .unwrap_or(8)
+        .clamp(5, 30) as u64;
+    if !has_alternates {
+        return Duration::from_secs(base_secs.max(10));
+    }
+
+    let graded_secs = base_secs
+        .saturating_add((attempt as u64).saturating_mul(4))
+        .clamp(base_secs, 24);
+    Duration::from_secs(graded_secs)
+}
+
+fn probe_timeout_for_attempt(url: &str, attempt: usize, has_alternates: bool) -> Duration {
+    if crate::url_targets_onion(url) {
+        onion_probe_timeout_for_attempt(attempt, has_alternates)
+    } else {
+        Duration::from_secs(8)
+    }
+}
+
+async fn collect_prefetched_probe_data(
+    resp: crate::arti_client::ArtiResponse,
+    promotion_cap: usize,
+    read_timeout: Duration,
+    content_length: u64,
+) -> Option<PrefetchedProbeData> {
+    if promotion_cap == 0 {
+        return None;
+    }
+
+    use futures::StreamExt;
+
+    let mut stream = resp.bytes_stream();
+    let mut collected = Vec::with_capacity(promotion_cap.min(PROBE_SIZE as usize));
+    let deadline = tokio::time::Instant::now() + read_timeout;
+    loop {
+        if collected.len() >= promotion_cap {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let remaining = promotion_cap.saturating_sub(collected.len());
+                if remaining == 0 {
+                    break;
+                }
+                let take = chunk.len().min(remaining);
+                collected.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break;
+                }
+            }
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        }
+    }
+
+    if collected.is_empty() {
+        return None;
+    }
+
+    let end_offset = collected.len().saturating_sub(1) as u64;
+    Some(PrefetchedProbeData {
+        complete_file: content_length > 0 && collected.len() as u64 >= content_length,
+        end_offset,
+        bytes: bytes::Bytes::from(collected),
+    })
+}
+
+async fn probe_target_with_timeout(
     client: &crate::arti_client::ArtiClient,
     url: &str,
     app: &AppHandle,
-) -> Result<ProbeResult> {
+    timeout: Duration,
+    promotion_cap: usize,
+) -> Result<ProbeAttemptResult> {
+    let is_onion = crate::url_targets_onion(url);
     let mut content_length = 0u64;
     let mut supports_ranges = false;
     let mut etag = None;
     let mut last_modified = None;
+    let mut timed_out = false;
+    let mut request_failed = false;
+    let mut prefetched_probe = None;
+    let request_started = Instant::now();
+    let promotion_end = promotion_cap.saturating_sub(1).max(0);
+    let range_header_value = format!("bytes=0-{promotion_end}");
 
-    // Apply strict 8-second timeout to HEAD to prevent infinite proxy stalls
-    // Apply strict 8-second timeout to GET Range proxy probe
-    match tokio::time::timeout(
-        Duration::from_secs(8),
-        client.get(url).header("Range", "bytes=0-0").send(),
-    )
-    .await
-    {
+    let telemetry = telemetry_handle(app);
+    let request = apply_download_connection_policy(
+        client.get(url).header("Range", &range_header_value),
+        url,
+        is_onion,
+        telemetry.as_ref(),
+    );
+    let _host_permit = acquire_download_host_permit(url, is_onion, None).await;
+
+    match tokio::time::timeout(timeout, request.send()).await {
         Ok(Ok(resp)) => {
-            if resp.status() == StatusCode::PARTIAL_CONTENT {
+            let status = resp.status();
+            if status == StatusCode::PARTIAL_CONTENT {
                 supports_ranges = true;
             }
             if etag.is_none() && last_modified.is_none() {
@@ -1132,61 +1980,226 @@ async fn probe_target(
             if content_length == 0 {
                 content_length = resp.content_length().unwrap_or(0);
             }
+
+            let connect_ms = request_started.elapsed().as_millis() as u64;
+            let read_timeout = if is_onion {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_secs(3)
+            };
+            if matches!(status, StatusCode::PARTIAL_CONTENT | StatusCode::OK) {
+                prefetched_probe = collect_prefetched_probe_data(
+                    resp,
+                    promotion_cap,
+                    read_timeout,
+                    content_length,
+                )
+                .await;
+            }
+            let probe = ProbeResult {
+                content_length,
+                supports_ranges: supports_ranges && content_length > 0,
+                etag,
+                last_modified,
+                prefetched_probe,
+            };
+            record_probe_host_capability(url, is_onion, &probe, connect_ms);
+            return Ok(ProbeAttemptResult {
+                probe,
+                timed_out,
+                request_failed,
+            });
         }
         Ok(Err(err)) => {
+            request_failed = true;
             let _ = app.emit("log", format!("[!] GET Range probe failed: {err}"));
             supports_ranges = false;
             content_length = 0;
+            record_host_failure(url, is_onion, HostFailureKind::Connect);
         }
         Err(_) => {
+            timed_out = true;
             let _ = app.emit(
                 "log",
-                "[!] GET Range probe timed out after 8s. Forcing fallback stream mode..."
-                    .to_string(),
+                format!(
+                    "[!] GET Range probe timed out after {}s. Forcing fallback stream mode...",
+                    timeout.as_secs()
+                ),
             );
             supports_ranges = false;
             content_length = 0;
+            record_host_failure(url, is_onion, HostFailureKind::Timeout);
         }
     }
 
-    // Always succeed. If content_length remains 0, the caller falls back to 1-circuit stream mode.
-    Ok(ProbeResult {
-        content_length,
-        supports_ranges: supports_ranges && content_length > 0,
-        etag,
-        last_modified,
+    Ok(ProbeAttemptResult {
+        probe: ProbeResult {
+            content_length,
+            supports_ranges: supports_ranges && content_length > 0,
+            etag,
+            last_modified,
+            prefetched_probe,
+        },
+        timed_out,
+        request_failed,
     })
 }
 
-async fn probe_target_with_alternates(
+pub async fn probe_target(
+    client: &crate::arti_client::ArtiClient,
+    url: &str,
+    app: &AppHandle,
+) -> Result<ProbeResult> {
+    Ok(probe_target_with_timeout(
+        client,
+        url,
+        app,
+        probe_timeout_for_attempt(url, 0, false),
+        probe_promotion_size_bytes(),
+    )
+    .await?
+    .probe)
+}
+
+pub async fn probe_target_with_alternates(
     client: &crate::arti_client::ArtiClient,
     entry: &mut BatchFileEntry,
     app: &AppHandle,
 ) -> Result<ProbeResult> {
-    let primary_probe = probe_target(client, &entry.url, app).await?;
-    if primary_probe.content_length > 0 || entry.alternate_urls.is_empty() {
-        return Ok(primary_probe);
+    let is_onion = crate::url_targets_onion(&entry.url);
+    let telemetry = telemetry_handle(app);
+    let ordered_candidates = ordered_probe_candidates(entry, is_onion);
+    if ordered_candidates.is_empty() {
+        return probe_target(client, &entry.url, app).await;
     }
 
     let current_host = batch_entry_host(&entry.url).unwrap_or_else(|| "-".to_string());
-    for alternate_url in entry.alternate_urls.clone() {
-        let alternate_probe = probe_target(client, &alternate_url, app).await?;
-        if alternate_probe.content_length == 0 {
-            continue;
+    let now_ms = current_epoch_ms();
+    let quarantined_count = ordered_candidates
+        .iter()
+        .filter(|candidate| candidate.quarantined(now_ms))
+        .count();
+    let quarantine_hit = ordered_candidates
+        .first()
+        .map(|candidate| candidate.url != entry.url && quarantined_count > 0)
+        .unwrap_or(false)
+        || quarantined_count == ordered_candidates.len();
+    if quarantine_hit {
+        if let Some(telemetry) = telemetry.as_ref() {
+            telemetry.record_download_probe_quarantine_hit();
         }
-        let alternate_host = batch_entry_host(&alternate_url).unwrap_or_else(|| "-".to_string());
+    }
+    if let Some(first_candidate) = ordered_candidates.first() {
+        if first_candidate.url != entry.url {
+            let _ = app.emit(
+                "log",
+                format!(
+                    "[*] Probe rotation: {} starting {} instead of {} before transfer (quarantined_candidates={}/{})",
+                    entry.path,
+                    first_candidate.host,
+                    current_host,
+                    quarantined_count,
+                    ordered_candidates.len()
+                ),
+            );
+        }
+    }
+    if quarantined_count == ordered_candidates.len() {
         let _ = app.emit(
             "log",
             format!(
-                "[*] Probe remap: {} switched {} -> {} before transfer",
-                entry.path, current_host, alternate_host
+                "[!] Probe candidate set fully quarantined for {} ({}/{} candidates).",
+                entry.path,
+                quarantined_count,
+                ordered_candidates.len()
             ),
         );
-        entry.url = alternate_url;
-        return Ok(alternate_probe);
     }
 
-    Ok(primary_probe)
+    let has_alternates = ordered_candidates.len() > 1;
+    let mut first_attempt: Option<ProbeAttemptResult> = None;
+
+    for (idx, candidate) in ordered_candidates.iter().enumerate() {
+        let attempt = probe_target_with_timeout(
+            client,
+            &candidate.url,
+            app,
+            probe_timeout_for_attempt(&candidate.url, idx, has_alternates),
+            probe_promotion_size_bytes(),
+        )
+        .await?;
+        if first_attempt.is_none() {
+            first_attempt = Some(attempt.clone());
+        }
+        if attempt.probe.content_length == 0 {
+            continue;
+        }
+
+        if candidate.url != entry.url {
+            let first_attempt_ref = first_attempt.as_ref().expect("first attempt recorded");
+            let _ = app.emit(
+                "log",
+                format!(
+                    "[*] Probe remap: {} switched {} -> {} before transfer (first_probe_timeout={} first_probe_connect_fail={} selected_probe_timeout={} selected_probe_connect_fail={})",
+                    entry.path,
+                    current_host,
+                    candidate.host,
+                    first_attempt_ref.timed_out,
+                    first_attempt_ref.request_failed,
+                    attempt.timed_out,
+                    attempt.request_failed
+                ),
+            );
+        }
+
+        let selected_url = candidate.url.clone();
+        entry.url = selected_url.clone();
+        reseed_probe_alternates(entry, &ordered_candidates, &selected_url);
+        return Ok(attempt.probe);
+    }
+
+    let selected_url = ordered_candidates
+        .iter()
+        .find(|candidate| !candidate.quarantined(now_ms))
+        .map(|candidate| candidate.url.clone())
+        .unwrap_or_else(|| ordered_candidates[0].url.clone());
+    if let Some(telemetry) = telemetry.as_ref() {
+        telemetry.record_download_probe_candidate_exhaustion();
+    }
+    let exhausted_hosts = ordered_candidates
+        .iter()
+        .map(|candidate| candidate.host.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = app.emit(
+        "log",
+        format!(
+            "[!] Probe candidate exhaustion: {} exhausted {} candidates (quarantined={}/{} hosts=[{}]).",
+            entry.path,
+            ordered_candidates.len(),
+            quarantined_count,
+            ordered_candidates.len(),
+            exhausted_hosts
+        ),
+    );
+    if selected_url != entry.url {
+        let selected_host = batch_entry_host(&selected_url).unwrap_or_else(|| "-".to_string());
+        let _ = app.emit(
+            "log",
+            format!(
+                "[*] Probe routing: {} arming {} instead of {} for transfer fallback after exhausted probe candidates.",
+                entry.path,
+                selected_host,
+                current_host
+            ),
+        );
+    }
+    entry.url = selected_url.clone();
+    reseed_probe_alternates(entry, &ordered_candidates, &selected_url);
+
+    Ok(first_attempt
+        .expect("probe candidates should not be empty")
+        .probe)
 }
 
 fn get_arti_client(
@@ -1249,13 +2262,16 @@ struct ScheduledBatchFile {
     entry: BatchFileEntry,
     estimated_size: u64,
     enqueue_order: usize,
+    prefetched_probe: Option<PrefetchedProbeData>,
 }
 
 #[derive(Clone)]
 struct QueuedBatchFile {
     entry: BatchFileEntry,
+    estimated_size: u64,
     requeue_count: u8,
     alternate_url_cursor: usize,
+    prefetched_probe: Option<PrefetchedProbeData>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1306,7 +2322,7 @@ fn plan_batch_lanes(
         .max(2);
     let micro_parallelism = budget
         .micro_swarm_circuits
-        .min((residual_parallelism + 1) / 2)
+        .min(residual_parallelism.div_ceil(2))
         .max(1);
     let small_parallelism = budget
         .small_file_parallelism
@@ -1374,10 +2390,10 @@ fn batch_large_threshold_bytes(
         .max(micro_threshold.saturating_add(1_048_576))
 }
 
-fn schedule_srpt_with_starvation(mut files: Vec<ScheduledBatchFile>) -> Vec<BatchFileEntry> {
+fn schedule_srpt_with_starvation(mut files: Vec<ScheduledBatchFile>) -> Vec<ScheduledBatchFile> {
     if files.len() <= 1 || !srpt_scheduler_enabled() {
         files.sort_by_key(|file| file.enqueue_order);
-        return files.into_iter().map(|file| file.entry).collect();
+        return files;
     }
 
     let starvation_interval = srpt_starvation_interval();
@@ -1402,7 +2418,7 @@ fn schedule_srpt_with_starvation(mut files: Vec<ScheduledBatchFile>) -> Vec<Batc
                 .unwrap_or(0)
         };
         let selected = files.swap_remove(selected_idx);
-        dispatch_order.push(selected.entry);
+        dispatch_order.push(selected);
         dispatched += 1;
     }
 
@@ -1412,7 +2428,7 @@ fn schedule_srpt_with_starvation(mut files: Vec<ScheduledBatchFile>) -> Vec<Batc
 async fn process_swarm(
     phase_name: &str,
     app: AppHandle,
-    files: Vec<BatchFileEntry>,
+    files: Vec<ScheduledBatchFile>,
     parallelism: usize,
     active_ports: Vec<u16>,
     daemon_count: usize,
@@ -1435,10 +2451,12 @@ async fn process_swarm(
     let queue = Arc::new(tokio::sync::Mutex::new(
         files
             .into_iter()
-            .map(|entry| QueuedBatchFile {
-                entry,
+            .map(|scheduled| QueuedBatchFile {
+                entry: scheduled.entry,
+                estimated_size: scheduled.estimated_size,
                 requeue_count: 0,
                 alternate_url_cursor: 0,
+                prefetched_probe: scheduled.prefetched_probe,
             })
             .collect::<VecDeque<_>>(),
     ));
@@ -1449,18 +2467,21 @@ async fn process_swarm(
     let first_byte_timeout = batch_swarm_first_byte_timeout(is_onion);
     let body_timeout = batch_swarm_body_timeout(is_onion);
     let no_byte_requeue_limit = batch_no_byte_requeue_limit();
+    let low_speed_policy = download_low_speed_policy(is_onion);
+    let host_cap_ceiling = configured_download_host_connection_cap(is_onion);
 
     let _ = app.emit(
         "log",
         format!(
-            "[*] {}: {} files across {} circuits (send_timeout={}s first_byte_timeout={}s body_timeout={}s requeue_limit={})",
+            "[*] {}: {} files across {} circuits (send_timeout={}s first_byte_timeout={}s body_timeout={}s requeue_limit={} host_cap_ceiling={})",
             phase_name,
             total_sub,
             parallelism,
             send_timeout.as_secs(),
             first_byte_timeout.as_secs(),
             body_timeout.as_secs(),
-            no_byte_requeue_limit
+            no_byte_requeue_limit,
+            host_cap_ceiling
         ),
     );
 
@@ -1485,11 +2506,12 @@ async fn process_swarm(
         let task_bbr = Arc::clone(&phase_bbr);
         let task_telemetry = batch_telemetry.clone();
         let task_send_timeout = send_timeout;
-        let task_first_byte_timeout = first_byte_timeout;
+        let _task_first_byte_timeout = first_byte_timeout;
         let task_body_timeout = body_timeout;
         let task_is_onion = is_onion;
         let task_no_byte_requeue_limit = no_byte_requeue_limit;
         let task_phase_name = phase_name.to_string();
+        let task_low_speed_policy = low_speed_policy;
 
         tasks.spawn(async move {
             let mut client = client;
@@ -1498,11 +2520,17 @@ async fn process_swarm(
                     break;
                 }
 
-                let Some(mut queued_file) = ({
+                let res = {
                     let mut queue = task_queue.lock().await;
-                    queue.pop_front()
-                }) else {
-                    break;
+                    take_next_dispatchable_file(&mut queue, task_is_onion)
+                };
+                let (mut queued_file, _host_permit) = match res {
+                    QueueDispatchResult::Ready(file, permit) => (file, permit),
+                    QueueDispatchResult::Saturated => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    QueueDispatchResult::Empty => break,
                 };
                 let entry = queued_file.entry.clone();
 
@@ -1515,13 +2543,49 @@ async fn process_swarm(
                 let mut success = false;
                 let mut downloaded_len = 0u64;
                 let mut should_requeue = false;
-                while retries < 5 && !success {
-                    let resp = match tokio::time::timeout(
-                        task_send_timeout,
-                        client.get(&entry.url).header("Connection", "close").send(),
-                    )
-                    .await
+                if let Some(prefetched) = queued_file.prefetched_probe.take() {
+                    let expected_size = queued_file.estimated_size.max(prefetched.len() as u64);
+                    if prefetched.complete_file
+                        || expected_size > 0 && prefetched.len() as u64 >= expected_size
                     {
+                        if fs::write(&entry.path, &prefetched.bytes).is_ok() {
+                            downloaded_len = prefetched.len() as u64;
+                            success = true;
+                            if let Some(telemetry) = &task_telemetry {
+                                telemetry.record_download_probe_promotion_hit();
+                            }
+                            record_host_success(
+                                &entry.url,
+                                task_is_onion,
+                                downloaded_len,
+                                Some(0),
+                            );
+                        }
+                    } else {
+                        queued_file.prefetched_probe = Some(prefetched);
+                    }
+                }
+                while retries < 5 && !success {
+                    let prefetched_probe = queued_file.prefetched_probe.clone();
+                    let followup_start = prefetched_probe
+                        .as_ref()
+                        .map(|probe| probe.next_offset())
+                        .filter(|offset| *offset < queued_file.estimated_size);
+                    let request_started = Instant::now();
+                    let mut req = client.get(&entry.url);
+                    if let Some(start) = followup_start {
+                        req = req.header(
+                            "Range",
+                            &format!("bytes={start}-{}", queued_file.estimated_size.saturating_sub(1)),
+                        );
+                    }
+                    req = apply_download_connection_policy(
+                        req,
+                        &entry.url,
+                        task_is_onion,
+                        task_telemetry.as_ref(),
+                    );
+                    let resp = match tokio::time::timeout(task_send_timeout, req.send()).await {
                         Ok(Ok(r)) if r.status().is_success() => r,
                         Ok(Ok(r)) => {
                             let status = r.status();
@@ -1541,6 +2605,7 @@ async fn process_swarm(
                             if task_is_onion && retries >= 2 {
                                 client = client.new_isolated();
                             }
+                            record_host_failure(&entry.url, task_is_onion, HostFailureKind::Timeout);
                             let active = task_bbr.current_active();
                             let base = backoff_duration(retries);
                             let bbr_pause = if circuit_id >= active {
@@ -1564,7 +2629,7 @@ async fn process_swarm(
                                     format!(
                                         "[~] {}: requeueing {} after connection stall on circuit {} ({}){}",
                                         task_phase_name,
-                                        entry.path,
+                                        crate::path_utils::normalize_windows_device_path(&entry.path),
                                         circuit_id,
                                         err,
                                         remap_note
@@ -1573,6 +2638,7 @@ async fn process_swarm(
                                 if task_is_onion {
                                     client = client.new_isolated();
                                 }
+                                record_host_failure(&entry.url, task_is_onion, HostFailureKind::Connect);
                                 should_requeue = true;
                                 break;
                             }
@@ -1585,6 +2651,7 @@ async fn process_swarm(
                             if task_is_onion && retries >= 2 {
                                 client = client.new_isolated();
                             }
+                            record_host_failure(&entry.url, task_is_onion, HostFailureKind::Connect);
                             let active = task_bbr.current_active();
                             let base = backoff_duration(retries);
                             let bbr_pause = if circuit_id >= active {
@@ -1608,7 +2675,7 @@ async fn process_swarm(
                                     format!(
                                         "[~] {}: requeueing {} after send timeout on circuit {}{}",
                                         task_phase_name,
-                                        entry.path,
+                                        crate::path_utils::normalize_windows_device_path(&entry.path),
                                         circuit_id,
                                         remap_note
                                     ),
@@ -1616,6 +2683,7 @@ async fn process_swarm(
                                 if task_is_onion {
                                     client = client.new_isolated();
                                 }
+                                record_host_failure(&entry.url, task_is_onion, HostFailureKind::Timeout);
                                 should_requeue = true;
                                 break;
                             }
@@ -1623,24 +2691,64 @@ async fn process_swarm(
                             if task_is_onion {
                                 client = client.new_isolated();
                             }
+                            record_host_failure(&entry.url, task_is_onion, HostFailureKind::Timeout);
                             tokio::time::sleep(backoff_duration(retries)).await;
                             continue;
                         }
                     };
+                    let response_status = resp.status();
+                    let header_latency_ms = request_started.elapsed().as_millis() as u64;
+
+                    // Phase 126: Per-URL adaptive first-byte timeout from host EWMA.
+                    // If the host has recorded first_byte_ewma_ms, we use max(3×ewma, 3s)
+                    // capped at the fixed default. Otherwise, use the fixed timeout.
+                    let effective_first_byte_timeout = adaptive_first_byte_timeout(
+                        &entry.url, task_is_onion,
+                    );
 
                     match read_batch_response_body(
                         resp,
-                        task_first_byte_timeout,
+                        effective_first_byte_timeout,
                         task_body_timeout,
+                        task_low_speed_policy,
                     )
                     .await
                     {
-                        Ok(bytes) => {
-                            let len = bytes.len() as u64;
-                            if fs::write(&entry.path, &bytes).is_ok() {
+                        Ok((bytes, read_stats)) => {
+                            let had_prefetched = prefetched_probe.is_some();
+                            let prefetched_len = prefetched_probe
+                                .as_ref()
+                                .map(|probe| probe.len() as u64)
+                                .unwrap_or(0);
+                            let final_bytes = if let Some(prefetched) = prefetched_probe.as_ref() {
+                                if response_status == StatusCode::PARTIAL_CONTENT {
+                                    let mut combined =
+                                        Vec::with_capacity(prefetched.len() + bytes.len());
+                                    combined.extend_from_slice(&prefetched.bytes);
+                                    combined.extend_from_slice(&bytes);
+                                    combined
+                                } else {
+                                    bytes
+                                }
+                            } else {
+                                bytes
+                            };
+                            let len = final_bytes.len() as u64;
+                            if fs::write(&entry.path, &final_bytes).is_ok() {
                                 downloaded_len = len;
                                 success = true;
                                 task_bbr.on_success(len, 1000);
+                                if had_prefetched {
+                                    if let Some(telemetry) = &task_telemetry {
+                                        telemetry.record_download_probe_promotion_hit();
+                                    }
+                                }
+                                record_host_success(
+                                    &entry.url,
+                                    task_is_onion,
+                                    len.max(prefetched_len),
+                                    Some(read_stats.first_byte_ms.max(header_latency_ms)),
+                                );
                             }
                         }
                         Err(BatchBodyReadFailure::FirstByteTimeout) => {
@@ -1658,7 +2766,7 @@ async fn process_swarm(
                                     format!(
                                         "[~] {}: requeueing no-byte stall for {} on host {} (circuit {}, pass {}/{}){}",
                                         task_phase_name,
-                                        entry.path,
+                                        crate::path_utils::normalize_windows_device_path(&entry.path),
                                         host,
                                         circuit_id,
                                         queued_file.requeue_count + 1,
@@ -1669,9 +2777,22 @@ async fn process_swarm(
                                 if task_is_onion {
                                     client = client.new_isolated();
                                 }
+                                record_host_failure(&entry.url, task_is_onion, HostFailureKind::Timeout);
                                 should_requeue = true;
                                 break;
                             }
+                            retries += 1;
+                            if task_is_onion {
+                                client = client.new_isolated();
+                            }
+                            tokio::time::sleep(backoff_duration(retries)).await;
+                        }
+                        Err(BatchBodyReadFailure::LowSpeed) => {
+                            task_bbr.on_timeout();
+                            if let Some(telemetry) = &task_telemetry {
+                                telemetry.record_download_low_speed_abort();
+                            }
+                            record_host_failure(&entry.url, task_is_onion, HostFailureKind::LowSpeed);
                             retries += 1;
                             if task_is_onion {
                                 client = client.new_isolated();
@@ -1683,6 +2804,7 @@ async fn process_swarm(
                             if task_is_onion {
                                 client = client.new_isolated();
                             }
+                            record_host_failure(&entry.url, task_is_onion, HostFailureKind::Timeout);
                             tokio::time::sleep(backoff_duration(retries)).await;
                         }
                     }
@@ -2124,6 +3246,7 @@ pub async fn start_batch_download(
     let mut small_candidates: Vec<ScheduledBatchFile> = Vec::new();
     let mut large_candidates: Vec<ScheduledBatchFile> = Vec::new();
     let mut enqueue_order = 0usize;
+    let mut promotion_budget_remaining = batch_probe_promotion_budget_bytes();
 
     let _ = app.emit(
         "log",
@@ -2148,18 +3271,21 @@ pub async fn start_batch_download(
                         entry: file.clone(),
                         estimated_size: hint,
                         enqueue_order,
+                        prefetched_probe: None,
                     });
                 } else if hint <= large_threshold {
                     small_candidates.push(ScheduledBatchFile {
                         entry: file.clone(),
                         estimated_size: hint,
                         enqueue_order,
+                        prefetched_probe: None,
                     });
                 } else {
                     large_candidates.push(ScheduledBatchFile {
                         entry: file.clone(),
                         estimated_size: hint,
                         enqueue_order,
+                        prefetched_probe: None,
                     });
                 }
                 enqueue_order = enqueue_order.saturating_add(1);
@@ -2171,23 +3297,34 @@ pub async fn start_batch_download(
         match probe_target_with_alternates(&sniff_client, &mut probed_file, &app).await {
             Ok(probe) => {
                 let estimated_size = probed_file.size_hint.unwrap_or(probe.content_length);
+                probed_file.size_hint = Some(estimated_size);
+                let prefetched_probe = probe.prefetched_probe.clone().filter(|seed| {
+                    seed.len() <= promotion_budget_remaining && estimated_size <= large_threshold
+                });
+                if let Some(seed) = &prefetched_probe {
+                    promotion_budget_remaining =
+                        promotion_budget_remaining.saturating_sub(seed.len());
+                }
                 if probe.content_length <= micro_threshold {
                     micro_candidates.push(ScheduledBatchFile {
                         entry: probed_file.clone(),
                         estimated_size,
                         enqueue_order,
+                        prefetched_probe,
                     });
                 } else if probe.content_length <= large_threshold {
                     small_candidates.push(ScheduledBatchFile {
                         entry: probed_file.clone(),
                         estimated_size,
                         enqueue_order,
+                        prefetched_probe,
                     });
                 } else {
                     large_candidates.push(ScheduledBatchFile {
                         entry: probed_file.clone(),
                         estimated_size,
                         enqueue_order,
+                        prefetched_probe: None,
                     });
                 }
             }
@@ -2197,6 +3334,7 @@ pub async fn start_batch_download(
                     .size_hint
                     .unwrap_or(large_threshold.saturating_sub(1)),
                 enqueue_order,
+                prefetched_probe: None,
             }),
         }
         enqueue_order = enqueue_order.saturating_add(1);
@@ -2207,7 +3345,16 @@ pub async fn start_batch_download(
     let micro_files = schedule_srpt_with_starvation(micro_candidates);
     let small_files = schedule_srpt_with_starvation(small_candidates);
     let large_files = schedule_srpt_with_starvation(large_candidates);
-    let lane_plan = plan_batch_lanes(&batch_download_budget, is_onion, total_files, &large_files);
+    let large_file_entries = large_files
+        .iter()
+        .map(|file| file.entry.clone())
+        .collect::<Vec<_>>();
+    let lane_plan = plan_batch_lanes(
+        &batch_download_budget,
+        is_onion,
+        total_files,
+        &large_file_entries,
+    );
     let micro_files = diversify_first_wave_by_host(
         micro_files,
         batch_first_wave_width(lane_plan.micro_parallelism),
@@ -2332,7 +3479,10 @@ pub async fn start_batch_download(
             );
             process_large_pipeline(
                 app_clone,
-                large_files_clone,
+                large_files_clone
+                    .into_iter()
+                    .map(|file| file.entry)
+                    .collect::<Vec<_>>(),
                 large_pipeline_circuits,
                 force_tor,
                 output_dir_clone,
@@ -2382,7 +3532,10 @@ pub async fn start_batch_download(
     if ((!lane_plan.overlap_large_phase) || !overlap_processed) && !large_files.is_empty() {
         process_large_pipeline(
             app.clone(),
-            large_files,
+            large_files
+                .into_iter()
+                .map(|file| file.entry)
+                .collect::<Vec<_>>(),
             batch_circuit_cap,
             force_tor,
             output_dir.clone(),
@@ -2675,13 +3828,15 @@ pub async fn start_download(
         Some(Path::new(&entry.path)),
         download_telemetry.as_ref(),
     );
+    let host_connection_cap = download_host_connection_cap_for_url(&entry.url, is_onion);
     logger.log(
         &app,
         format!(
-            "[*] Download governor: range_mode={} content_length={} circuit_cap={} active_start={} tournament_cap={} pressure={:.2}",
+            "[*] Download governor: range_mode={} content_length={} circuit_cap={} host_cap={} active_start={} tournament_cap={} pressure={:.2}",
             range_mode,
             probe.content_length,
             download_budget.circuit_cap,
+            host_connection_cap,
             download_budget.initial_active_cap,
             download_budget.tournament_cap,
             download_budget.pressure.total_pressure
@@ -2706,6 +3861,7 @@ pub async fn start_download(
     let effective_circuits = if range_mode {
         requested_circuits
             .min(download_budget.circuit_cap.max(1))
+            .min(host_connection_cap.max(1))
             .min(probe.content_length.max(1) as usize)
             .max(1)
     } else {
@@ -2800,33 +3956,35 @@ pub async fn start_download(
         logger.log(&app, format!("[*] Resume validator active: {}", validator));
     }
 
-    if !is_resuming {
-        let file = open_file_with_adaptive_io(
+    let mut file_for_writer: Option<File> = None;
+    let mut initial_mmap_for_writer: Option<memmap2::MmapMut> = None;
+    let mut shared_mmap: Option<Arc<LockFreeMmap>> = None;
+
+    if range_mode && state.content_length > 0 {
+        if let Ok(file) = open_file_with_adaptive_io(
             Path::new(&temp_target),
-            false,
+            !is_resuming, // create/truncate if fresh
             true,
             true,
             true,
             &app,
             Some(&logger),
-        )?;
-        // Pre-allocate full file size to prevent fragmentation
-        if range_mode && state.content_length > 0 {
-            preallocate_windows_nt_blocks(&file, state.content_length)?;
-            let _ = app.emit(
-                "log",
-                format!(
-                    "[+] Pre-allocated {:.2} GB on disk",
-                    state.content_length as f64 / 1_073_741_824.0
-                ),
-            );
-            logger.log(
-                &app,
-                format!(
-                    "[+] Pre-allocated {:.2} GB on disk",
-                    state.content_length as f64 / 1_073_741_824.0
-                ),
-            );
+        ) {
+            if !is_resuming {
+                let _ = preallocate_windows_nt_blocks(&file, state.content_length);
+                let _ = app.emit(
+                    "log",
+                    format!(
+                        "[+] Pre-allocated {:.2} GB on disk",
+                        state.content_length as f64 / 1_073_741_824.0
+                    ),
+                );
+            }
+            if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(&file) } {
+                shared_mmap = Some(Arc::new(LockFreeMmap::new(&m)));
+                initial_mmap_for_writer = Some(m);
+            }
+            file_for_writer = Some(file);
         }
     }
 
@@ -2836,8 +3994,8 @@ pub async fn start_download(
         let _ = fs::remove_file(&state_file_path);
     }
 
-    let ring_buffer = Arc::new(crossbeam_queue::ArrayQueue::<WriteMsg>::new(10_000));
-    let _ring_capacity: usize = 10_000; // Phase 49: backpressure threshold constant
+    let ring_buffer = Arc::new(crossbeam_queue::ArrayQueue::<WriteMsg>::new(1_000_000));
+    let _ring_capacity: usize = 1_000_000; // Phase 105: Massive RAM queuing for Tor bursts
     let tx = Arc::clone(&ring_buffer);
     let rx = Arc::clone(&ring_buffer);
     let state_for_writer = if range_mode {
@@ -2848,10 +4006,55 @@ pub async fn start_download(
 
     let writer_app = app.clone();
     let writer_logger = logger.clone();
+
+    // Phase 105: Offload SHA256 Sync constraints to isolated Tokio Task using Shared Memory
+    enum HashPayload {
+        Mmap(usize, usize),
+        Bytes(Vec<u8>),
+    }
+    let hash_rx = Arc::new(crossbeam_queue::ArrayQueue::<HashPayload>::new(10_000));
+    let hash_tx = hash_rx.clone();
+
+    let hash_mmap_ref = shared_mmap.clone();
+    let _hash_task_handle = tokio::task::spawn_blocking(move || {
+        #[allow(unused_imports)]
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        loop {
+            match hash_rx.pop() {
+                Some(HashPayload::Mmap(start, end)) => {
+                    if let Some(mmap) = hash_mmap_ref.as_ref() {
+                        unsafe {
+                            let slice = std::slice::from_raw_parts(
+                                (mmap.ptr as *const u8).add(start),
+                                end - start,
+                            );
+                            h.update(slice);
+                        }
+                    }
+                }
+                Some(HashPayload::Bytes(b)) => {
+                    if b.is_empty() {
+                        break; // EOF
+                    }
+                    h.update(&b);
+                }
+                None => {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        h
+    });
+
+    let writer_temp_target = temp_target.clone();
     let writer_handle = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let mut active_filepath = String::new();
-        let mut active_file: Option<File> = None;
-        let mut active_mmap: Option<memmap2::MmapMut> = None;
+        let mut active_file: Option<File> = file_for_writer;
+        let mut active_mmap: Option<memmap2::MmapMut> = initial_mmap_for_writer;
+        if active_file.is_some() {
+            active_filepath = writer_temp_target;
+        }
         let mut local_state = state_for_writer;
         let mut last_flush = Instant::now();
         let mut pieces_since_flush = 0u32; // Throttle state saves
@@ -2859,9 +4062,10 @@ pub async fn start_download(
         let mut idle_polls = 0u32;
 
         let mut hash_byte_offset: u64 = 0;
+        let mut last_msync = Instant::now();
         #[allow(unused_imports)]
         use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
+        let hasher = sha2::Sha256::new();
         let mut disk_intervals = IntervalTracker::new();
 
         if let Some((st, _)) = &local_state {
@@ -2895,6 +4099,13 @@ pub async fn start_download(
                     if idle_polls <= 32 {
                         std::hint::spin_loop();
                     } else {
+                        // Periodic MS_ASYNC OS page flush for massive Memory-Mapped buffers
+                        if last_msync.elapsed() >= std::time::Duration::from_secs(5) {
+                            if let Some(mmap) = active_mmap.as_mut() {
+                                let _ = mmap.flush_async();
+                            }
+                            last_msync = Instant::now();
+                        }
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     continue;
@@ -2908,7 +4119,7 @@ pub async fn start_download(
             }
             let mut should_flush = false;
 
-            if !msg.data.is_empty() {
+            if !msg.data.is_empty() || msg.mmap_written {
                 if active_filepath != msg.filepath || active_file.is_none() {
                     if let Some(mmap) = active_mmap.as_mut() {
                         let _ = mmap.flush();
@@ -2918,76 +4129,74 @@ pub async fn start_download(
                     if let Some(dir) = Path::new(&msg.filepath).parent() {
                         fs::create_dir_all(dir)?;
                     }
-                    let file = open_file_with_adaptive_io(
-                        Path::new(&msg.filepath),
-                        true,
-                        true,
-                        true,
-                        false,
-                        &writer_app,
-                        Some(&writer_logger),
-                    )?;
+                    if active_filepath != msg.filepath || active_file.is_none() {
+                        let fout = open_file_with_adaptive_io(
+                            Path::new(&msg.filepath),
+                            true,
+                            true,
+                            true,
+                            false,
+                            &writer_app,
+                            Some(&writer_logger),
+                        )?;
+                        active_file = Some(fout);
+                    }
 
                     if let Some((st, _)) = &local_state {
-                        if st.content_length > 0 {
-                            // Phase 7: HFT Memory-Mapped Virtual Disk (HDD compatibility)
-                            let _ = preallocate_windows_nt_blocks(&file, st.content_length);
-                            if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(&file) } {
-                                active_mmap = Some(m);
+                        if st.content_length > 0 && active_mmap.is_none() {
+                            if let Some(f) = active_file.as_ref() {
+                                let _ = preallocate_windows_nt_blocks(f, st.content_length);
+                                if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(f) } {
+                                    active_mmap = Some(m);
+                                }
                             }
                         }
                     }
 
                     active_filepath = msg.filepath.clone();
-                    active_file = Some(file);
                     last_write_end = u64::MAX; // Reset on new file
                 }
 
-                if let Some(mmap) = active_mmap.as_mut() {
-                    let start = msg.offset as usize;
-                    let end = start + msg.data.len();
-                    if end <= mmap.len() {
-                        // Phase 7: Zero-Copy ram write!
-                        mmap[start..end].copy_from_slice(&msg.data);
+                if !msg.mmap_written {
+                    if let Some(mmap) = active_mmap.as_mut() {
+                        let start = msg.offset as usize;
+                        let end = start + msg.data.len();
+                        if end <= mmap.len() {
+                            // Phase 7: Zero-Copy ram write!
+                            mmap[start..end].copy_from_slice(&msg.data);
+                        } else if let Some(file) = active_file.as_mut() {
+                            if msg.offset != last_write_end {
+                                file.seek(SeekFrom::Start(msg.offset))?;
+                            }
+                            file.write_all(&msg.data)?;
+                            last_write_end = msg.offset + msg.data.len() as u64;
+                        }
                     } else if let Some(file) = active_file.as_mut() {
-                        // Fallback if out-of-bounds mapping
                         if msg.offset != last_write_end {
-                            // On slower mechanical drives, out-of-order writes with many circuits
-                            // can cause thrashing. The seek will succeed but kill IOPS.
+                            use std::io::{Seek, SeekFrom};
                             file.seek(SeekFrom::Start(msg.offset))?;
                         }
+                        use std::io::Write;
                         file.write_all(&msg.data)?;
                         last_write_end = msg.offset + msg.data.len() as u64;
                     }
-                } else if let Some(file) = active_file.as_mut() {
-                    // Phase 35: Windows IO Mechanical HDD Optimization
-                    // If mmap failed to allocate (e.g. low 4GB RAM or fragmented hard drive),
-                    // fallback to standard file writes.
-                    if msg.offset != last_write_end {
-                        use std::io::{Seek, SeekFrom};
-                        file.seek(SeekFrom::Start(msg.offset))?;
-                    }
-                    use std::io::Write;
-                    file.write_all(&msg.data)?;
-                    last_write_end = msg.offset + msg.data.len() as u64;
+                    disk_intervals.add(msg.offset, msg.offset + msg.data.len() as u64);
+                } else {
+                    disk_intervals.add(msg.offset, msg.piece_end as u64);
                 }
-
-                if msg.offset == hash_byte_offset {
-                    hasher.update(&msg.data);
-                    hash_byte_offset += msg.data.len() as u64;
-                }
-                disk_intervals.add(msg.offset, msg.offset + msg.data.len() as u64);
 
                 let new_contiguous = disk_intervals.contiguous_up_to();
                 if new_contiguous > hash_byte_offset {
                     let to_hash_len = (new_contiguous - hash_byte_offset) as usize;
-                    if let Some(mmap) = active_mmap.as_ref() {
+                    if active_mmap.is_some() {
                         let start_idx = hash_byte_offset as usize;
                         let end_idx = start_idx + to_hash_len;
-                        if end_idx <= mmap.len() {
-                            hasher.update(&mmap[start_idx..end_idx]);
-                            hash_byte_offset = new_contiguous;
+                        let mut payload = HashPayload::Mmap(start_idx, end_idx);
+                        while let Err(ret) = hash_tx.push(payload) {
+                            payload = ret;
+                            std::thread::yield_now();
                         }
+                        hash_byte_offset = new_contiguous;
                     } else if active_file.is_some() {
                         if let Ok(mut r) = File::open(&active_filepath) {
                             use std::io::{Read, Seek, SeekFrom};
@@ -3000,7 +4209,11 @@ pub async fn start_download(
                                         if n == 0 {
                                             break;
                                         }
-                                        hasher.update(&buffer[..n]);
+                                        let mut payload = HashPayload::Bytes(buffer[..n].to_vec());
+                                        while let Err(ret) = hash_tx.push(payload) {
+                                            payload = ret;
+                                            std::thread::yield_now();
+                                        }
                                         bytes_to_read -= n;
                                         hash_byte_offset += n as u64;
                                     } else {
@@ -3306,6 +4519,18 @@ pub async fn start_download(
             },
         );
 
+        // Phase 129: Log mirror striping status
+        if !entry.alternate_urls.is_empty() {
+            let mirror_count = entry.alternate_urls.len().min(3) + 1;
+            let _ = app.emit(
+                "log",
+                format!(
+                    "[+] Phase 129: Mirror Striping ACTIVE — {} circuits across {} mirrors (primary + {} alternates)",
+                    scaled_circuits, mirror_count, mirror_count - 1
+                ),
+            );
+        }
+
         // ===== TOURNAMENT-STYLE CIRCUIT RACING =====
         let promoted_count = Arc::new(AtomicUsize::new(0));
 
@@ -3420,9 +4645,14 @@ pub async fn start_download(
                     let probe_timer = Instant::now();
 
                     let probe_ok = match tokio::time::timeout(Duration::from_secs(15), {
-                        let mut req = client
-                            .get(&unchoke_url)
-                            .header("Range", &format!("bytes={probe_start}-{probe_end}"));
+                        let mut req = apply_download_connection_policy(
+                            client
+                                .get(&unchoke_url)
+                                .header("Range", &format!("bytes={probe_start}-{probe_end}")),
+                            &unchoke_url,
+                            unchoke_is_onion,
+                            None,
+                        );
                         if let Some(if_range) = &unchoke_if_range {
                             req = req.header("If-Range", if_range);
                         }
@@ -3519,6 +4749,8 @@ pub async fn start_download(
                             Ok(c) => c,
                             Err(_) => return (c, port, None, u128::MAX),
                         };
+                    let _host_permit =
+                        acquire_download_host_permit(&probe_url, is_onion_clone, None).await;
                     // HEAD request to force the SOCKS5 handshake through Tor
                     let latency = match tokio::time::timeout(
                         Duration::from_secs(15),
@@ -3536,8 +4768,19 @@ pub async fn start_download(
             // Collect all results
             let mut results: Vec<(usize, usize, Option<crate::arti_client::ArtiClient>, u128)> =
                 Vec::new();
-            while let Some(Ok(result)) = handshake_tasks.join_next().await {
-                results.push(result);
+            // Phase 126C: Hard outer deadline — Arti cancellation-safety fix
+            let handshake_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match tokio::time::timeout_at(handshake_deadline, handshake_tasks.join_next()).await {
+                    Ok(Some(Ok(result))) => results.push(result),
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(_) => {
+                        eprintln!("[ARIA] Handshake probe deadline exceeded (30s) — aborting remaining");
+                        handshake_tasks.abort_all();
+                        break;
+                    }
+                }
             }
 
             let ready_durations_ms: Vec<u64> = results
@@ -3592,7 +4835,20 @@ pub async fn start_download(
         {
             let task_tx = tx.clone();
             let task_app = app.clone();
-            let task_url = entry.url.clone();
+            // Phase 129: IDM-style Mirror Striping — assign different mirror URLs
+            // to different circuits so segments download from independent mirrors
+            // simultaneously, stacking bandwidth across multiple Tor relay paths.
+            let task_url = if !entry.alternate_urls.is_empty() {
+                let mirror_pool_size = entry.alternate_urls.len().min(3) + 1; // primary + up to 3 mirrors
+                let mirror_idx = circuit_rank % mirror_pool_size;
+                if mirror_idx == 0 {
+                    entry.url.clone()
+                } else {
+                    entry.alternate_urls[mirror_idx - 1].clone()
+                }
+            } else {
+                entry.url.clone()
+            };
             let task_path = temp_target.clone();
             let task_control = control.clone();
             let task_running = Arc::clone(&run_flag);
@@ -3622,11 +4878,14 @@ pub async fn start_download(
             let task_circuit_rank = circuit_rank;
             let task_if_range = resume_if_range.clone();
             let task_active_client_ptrs = Arc::clone(&active_clients_arc);
+            let task_download_telemetry = download_telemetry.clone();
+            let task_shared_mmap = shared_mmap.clone();
 
             tasks.spawn(async move {
                 use futures::StreamExt;
                 let mut circuit_client = circuit_client; // Mutable for recycling
                 let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
+                let task_low_speed_policy = download_low_speed_policy(task_is_onion);
 
                 // === TOURNAMENT PROBE PHASE ===
                 if !task_skip_tournament {
@@ -3637,11 +4896,20 @@ pub async fn start_download(
                     let probe_end = (probe_start + PROBE_SIZE - 1).min(task_content_length.saturating_sub(1));
 
                     let probe_result = async {
+                        let Some(_host_permit) =
+                            acquire_download_host_permit(&task_url, task_is_onion, Some(&task_control)).await
+                        else {
+                            return false;
+                        };
                         let resp = tokio::time::timeout(Duration::from_secs(30), {
-                            let mut req = circuit_client
-                                .get(&task_url)
-                                .header("Range", &format!("bytes={probe_start}-{probe_end}"))
-                                .header("Connection", "close");
+                            let mut req = apply_download_connection_policy(
+                                circuit_client
+                                    .get(&task_url)
+                                    .header("Range", &format!("bytes={probe_start}-{probe_end}")),
+                                &task_url,
+                                task_is_onion,
+                                task_download_telemetry.as_ref(),
+                            );
                             if let Some(if_range) = &task_if_range {
                                 req = req.header("If-Range", if_range);
                             }
@@ -3768,10 +5036,32 @@ pub async fn start_download(
                             .map(|i| (scan_start + i) % task_total_pieces)
                             .find(|&i| !task_piece_flags[i].load(Ordering::Relaxed));
                         let piece_idx = match found {
-                            Some(idx) => idx,
-                            None => return TaskOutcome::Completed,
+                            Some(idx) => {
+                                // Register ownership for kill-after-steal
+                                stolen_from = task_piece_owner[idx].load(Ordering::Relaxed);
+                                idx
+                            }
+                            None => {
+                                // Phase 129: Dynamic Bisection — if no unstarted pieces remain,
+                                // find the slowest in-progress circuit and bisect its active piece.
+                                // This handles the IDM scenario where one segment stalls while all
+                                // others are complete.
+                                let bisect_target = (0..task_total_pieces)
+                                    .filter(|&i| {
+                                        !task_piece_flags[i].load(Ordering::Relaxed)
+                                            && task_piece_owner[i].load(Ordering::Relaxed) != usize::MAX
+                                            && task_piece_owner[i].load(Ordering::Relaxed) != circuit_id
+                                    })
+                                    .next();
+                                match bisect_target {
+                                    Some(idx) => {
+                                        stolen_from = task_piece_owner[idx].load(Ordering::Relaxed);
+                                        idx
+                                    }
+                                    None => break, // truly nothing left
+                                }
+                            }
                         };
-                        stolen_from = task_piece_owner[piece_idx].load(Ordering::Relaxed);
                         PieceSpan {
                             start_piece: piece_idx,
                             end_piece: piece_idx,
@@ -3806,11 +5096,22 @@ pub async fn start_download(
 
                         let bbr_chunk_size = task_aimd.recommended_chunk_size();
                         let current_chunk_end = (current_offset + bbr_chunk_size - 1).min(piece_end);
+                        let Some(_host_permit) =
+                            acquire_download_host_permit(&task_url, task_is_onion, Some(&task_control)).await
+                        else {
+                            task_running.store(false, Ordering::Relaxed);
+                            return TaskOutcome::Interrupted("download stopped");
+                        };
 
                         let response_future = {
-                            let mut req = circuit_client
-                                .get(&task_url)
-                                .header("Range", &format!("bytes={current_offset}-{current_chunk_end}"));
+                            let mut req = apply_download_connection_policy(
+                                circuit_client
+                                    .get(&task_url)
+                                    .header("Range", &format!("bytes={current_offset}-{current_chunk_end}")),
+                                &task_url,
+                                task_is_onion,
+                                task_download_telemetry.as_ref(),
+                            );
                             if let Some(if_range) = &task_if_range {
                                 req = req.header("If-Range", if_range);
                             }
@@ -3892,6 +5193,8 @@ pub async fn start_download(
 
                         let mut stream = response.bytes_stream();
                         let mut progressed = false;
+                        let mut low_speed_tracker: Option<LowSpeedTracker> = None;
+                        let mut low_speed_abort = false;
 
                         loop {
                             // Check if original owner won the race (steal mode)
@@ -3917,20 +5220,51 @@ pub async fn start_download(
                                     }
                                     progressed = true;
                                     stalls = 0;
+                                    let now = Instant::now();
+                                    if let Some(tracker) = low_speed_tracker.as_mut() {
+                                        if tracker.observe_progress(
+                                            now,
+                                            chunk.len() as u64,
+                                            task_low_speed_policy,
+                                        ) {
+                                            low_speed_abort = true;
+                                            if let Some(telemetry) = &task_download_telemetry {
+                                                telemetry.record_download_low_speed_abort();
+                                            }
+                                            record_host_failure(
+                                                &task_url,
+                                                task_is_onion,
+                                                HostFailureKind::LowSpeed,
+                                            );
+                                            break;
+                                        }
+                                    } else {
+                                        low_speed_tracker =
+                                            Some(LowSpeedTracker::new(now, chunk.len() as u64));
+                                    }
 
                                     let len = chunk.len() as u64;
+                                    let mut mmap_written = false;
+                                    let mut final_chunk = chunk;
+                                    if let Some(mmap) = &task_shared_mmap {
+                                        mmap.write_slice(current_offset as usize, &final_chunk);
+                                        mmap_written = true;
+                                        final_chunk = bytes::Bytes::new();
+                                    }
+
                                     let mut m = WriteMsg {
                                         filepath: task_path.clone(),
                                         offset: current_offset,
-                                        data: chunk,
+                                        data: final_chunk,
+                                        mmap_written,
                                         close_file: false,
                                         chunk_id: piece_idx,
                                         piece_end: piece_end_idx,
                                     };
                                     while let Err(err) = task_tx.push(m) {
                                         m = err;
-                                        // Phase 49: Disk backpressure — slow down when ring buffer >80% full
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                        // Phase 105: Yield back to async reactor to avoid starving TCP receive buffers
+                                        tokio::task::yield_now().await;
                                     }
 
                                     current_offset = current_offset.saturating_add(len);
@@ -3965,6 +5299,27 @@ pub async fn start_download(
                                     break;
                                 }
                                 Err(_) => {
+                                    if low_speed_tracker
+                                        .as_ref()
+                                        .map(|tracker| {
+                                            tracker.should_abort_on_idle(
+                                                Instant::now(),
+                                                task_low_speed_policy,
+                                            )
+                                        })
+                                        .unwrap_or(false)
+                                    {
+                                        low_speed_abort = true;
+                                        if let Some(telemetry) = &task_download_telemetry {
+                                            telemetry.record_download_low_speed_abort();
+                                        }
+                                        record_host_failure(
+                                            &task_url,
+                                            task_is_onion,
+                                            HostFailureKind::LowSpeed,
+                                        );
+                                        break;
+                                    }
                                     let _ = task_app.emit(
                                         "log",
                                         format!("[!] Circuit {} stalled {}s on piece {}. Reconnecting...", circuit_id, STREAM_TIMEOUT_SECS, piece_idx),
@@ -3974,6 +5329,15 @@ pub async fn start_download(
                                     break;
                                 }
                             }
+                        }
+
+                        if low_speed_abort {
+                            stalls += 1;
+                            if task_is_onion {
+                                circuit_client = circuit_client.new_isolated();
+                            }
+                            tokio::time::sleep(backoff_duration(stalls)).await;
+                            continue;
                         }
 
                         if !progressed {
@@ -4015,6 +5379,12 @@ pub async fn start_download(
                         let piece_ms = piece_timer.elapsed().as_millis() as u64;
                         task_scorer.record_piece(circuit_id, piece_bytes, piece_ms);
                         task_aimd.on_success(piece_bytes, piece_ms.max(1));
+                        record_host_success(
+                            &task_url,
+                            task_is_onion,
+                            piece_bytes,
+                            None,
+                        );
 
                         // Phase 4.2: Predictive pre-warming — kill degrading circuits early
                         if task_scorer.is_degrading(circuit_id) && circuit_id < task_circuit_killed.len() {
@@ -4029,14 +5399,15 @@ pub async fn start_download(
                             filepath: task_path.clone(),
                             offset: 0,
                             data: bytes::Bytes::new(),
+                            mmap_written: false,
                             close_file: true,
                             chunk_id: piece_idx,
                             piece_end: piece_end_idx,
                         };
                         while let Err(err) = task_tx.push(m) {
                             m = err;
-                            // Phase 49: Disk backpressure — slow down when ring buffer is full
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                            // Phase 105: Disk backpressure non-blocking yield
+                            tokio::task::yield_now().await;
                         }
 
                         if stealing {
@@ -4087,6 +5458,7 @@ pub async fn start_download(
 
             let mut current_offset = 0u64;
             let mut retries = 0usize;
+            let low_speed_policy = download_low_speed_policy(is_onion);
 
             while task_running.load(Ordering::Relaxed) {
                 if let Some(reason) = task_control.interruption_reason() {
@@ -4094,7 +5466,19 @@ pub async fn start_download(
                     return TaskOutcome::Interrupted(reason);
                 }
 
-                let response_future = stream_client.get(&task_url).send();
+                let Some(_host_permit) =
+                    acquire_download_host_permit(&task_url, is_onion, Some(&task_control)).await
+                else {
+                    task_running.store(false, Ordering::Relaxed);
+                    return TaskOutcome::Interrupted("download stopped");
+                };
+                let response_future = apply_download_connection_policy(
+                    stream_client.get(&task_url),
+                    &task_url,
+                    is_onion,
+                    download_telemetry.as_ref(),
+                )
+                .send();
 
                 let response =
                     match tokio::time::timeout(Duration::from_secs(45), response_future).await {
@@ -4135,6 +5519,8 @@ pub async fn start_download(
 
                 let mut stream = response.bytes_stream();
                 let mut progressed = false;
+                let mut low_speed_tracker: Option<LowSpeedTracker> = None;
+                let mut low_speed_abort = false;
 
                 loop {
                     if let Some(reason) = task_control.interruption_reason() {
@@ -4155,20 +5541,42 @@ pub async fn start_download(
 
                             progressed = true;
                             retries = 0;
+                            let now = Instant::now();
+                            if let Some(tracker) = low_speed_tracker.as_mut() {
+                                if tracker.observe_progress(
+                                    now,
+                                    chunk.len() as u64,
+                                    low_speed_policy,
+                                ) {
+                                    low_speed_abort = true;
+                                    if let Some(telemetry) = &download_telemetry {
+                                        telemetry.record_download_low_speed_abort();
+                                    }
+                                    record_host_failure(
+                                        &task_url,
+                                        is_onion,
+                                        HostFailureKind::LowSpeed,
+                                    );
+                                    break;
+                                }
+                            } else {
+                                low_speed_tracker =
+                                    Some(LowSpeedTracker::new(now, chunk.len() as u64));
+                            }
 
                             let len = chunk.len() as u64;
                             let mut m = WriteMsg {
                                 filepath: task_path.clone(),
                                 offset: current_offset,
                                 data: chunk,
+                                mmap_written: false,
                                 close_file: false,
                                 chunk_id: 0,
                                 piece_end: 0,
                             };
                             while let Err(err) = task_tx.push(m) {
                                 m = err;
-                                // Phase 49: Disk backpressure
-                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                tokio::task::yield_now().await;
                             }
 
                             current_offset = current_offset.saturating_add(len);
@@ -4189,15 +5597,14 @@ pub async fn start_download(
                                     filepath: task_path.clone(),
                                     offset: 0,
                                     data: bytes::Bytes::new(),
+                                    mmap_written: false,
                                     close_file: true,
                                     chunk_id: 0,
                                     piece_end: 0,
                                 };
                                 while let Err(err) = task_tx.push(m) {
                                     m = err;
-                                    // Phase 49: Disk backpressure
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(10))
-                                        .await;
+                                    tokio::task::yield_now().await;
                                 }
 
                                 return TaskOutcome::Completed;
@@ -4212,6 +5619,20 @@ pub async fn start_download(
                             }
                         }
                         Err(_) => {
+                            if low_speed_tracker
+                                .as_ref()
+                                .map(|tracker| {
+                                    tracker.should_abort_on_idle(Instant::now(), low_speed_policy)
+                                })
+                                .unwrap_or(false)
+                            {
+                                low_speed_abort = true;
+                                if let Some(telemetry) = &download_telemetry {
+                                    telemetry.record_download_low_speed_abort();
+                                }
+                                record_host_failure(&task_url, is_onion, HostFailureKind::LowSpeed);
+                                break;
+                            }
                             let _ = task_app.emit(
                                 "log",
                                 format!(
@@ -4226,11 +5647,24 @@ pub async fn start_download(
                     }
                 }
 
+                if low_speed_abort {
+                    retries += 1;
+                    if retries > MAX_STALL_RETRIES {
+                        return TaskOutcome::Failed(
+                            "stream low-speed aborted too many times".to_string(),
+                        );
+                    }
+                    tokio::time::sleep(backoff_duration(retries)).await;
+                    continue;
+                }
+
                 if !progressed {
                     retries += 1;
                     if retries > MAX_STALL_RETRIES {
                         return TaskOutcome::Failed("stream stalled too many times".to_string());
                     }
+                } else {
+                    record_host_success(&task_url, is_onion, current_offset.max(1), None);
                 }
 
                 tokio::time::sleep(backoff_duration(retries)).await;
@@ -4284,13 +5718,14 @@ pub async fn start_download(
         filepath: String::new(),
         offset: 0,
         data: bytes::Bytes::new(),
+        mmap_written: false,
         close_file: true,
         chunk_id: usize::MAX,
         piece_end: usize::MAX,
     };
     while let Err(err) = tx.push(eof) {
         eof = err;
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
     }
     let _ = speed_handle.await;
     if let Some(telemetry) = telemetry_handle(&app) {
@@ -4580,9 +6015,19 @@ pub async fn start_download(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_piece_spans, estimate_downloaded_bytes, normalize_download_state,
-        piece_len_for_index, DownloadState, PieceSpan,
+        build_piece_spans, current_epoch_ms, download_host_capabilities, estimate_downloaded_bytes,
+        host_capability_key, normalize_download_state, piece_len_for_index, record_host_success,
+        DownloadState, HostCapabilityState, PieceSpan,
     };
+
+    fn clear_host_capability(url: &str, is_onion: bool) {
+        let Some(key) = host_capability_key(url, is_onion) else {
+            return;
+        };
+        if let Ok(mut guard) = download_host_capabilities().write() {
+            guard.remove(&key);
+        }
+    }
 
     #[test]
     fn piece_spans_coalesce_contiguous_missing_runs() {
@@ -4675,10 +6120,11 @@ mod tests {
     use super::{
         batch_entry_host, batch_large_threshold_bytes, batch_micro_threshold_bytes,
         batch_no_byte_requeue_limit, batch_swarm_first_byte_timeout, diversify_first_wave_by_host,
-        handshake_keep_count, plan_batch_lanes, remap_queued_file_to_next_alternate,
-        schedule_srpt_with_starvation, BatchFileEntry, QueuedBatchFile, ScheduledBatchFile,
-        DEFAULT_BATCH_LARGE_THRESHOLD_CLEARNET, DEFAULT_BATCH_LARGE_THRESHOLD_ONION_HEAVY,
-        DEFAULT_BATCH_MICRO_THRESHOLD,
+        handshake_keep_count, ordered_probe_candidates, plan_batch_lanes,
+        probe_timeout_for_attempt, record_host_failure, remap_queued_file_to_next_alternate,
+        reseed_probe_alternates, schedule_srpt_with_starvation, BatchFileEntry, HostFailureKind,
+        QueuedBatchFile, ScheduledBatchFile, DEFAULT_BATCH_LARGE_THRESHOLD_CLEARNET,
+        DEFAULT_BATCH_LARGE_THRESHOLD_ONION_HEAVY, DEFAULT_BATCH_MICRO_THRESHOLD,
     };
     use crate::resource_governor::{DownloadBudget, GovernorPressure};
 
@@ -4695,6 +6141,7 @@ mod tests {
                 },
                 estimated_size: 100,
                 enqueue_order: 0,
+                prefetched_probe: None,
             },
             ScheduledBatchFile {
                 entry: BatchFileEntry {
@@ -4706,6 +6153,7 @@ mod tests {
                 },
                 estimated_size: 10,
                 enqueue_order: 1,
+                prefetched_probe: None,
             },
             ScheduledBatchFile {
                 entry: BatchFileEntry {
@@ -4717,6 +6165,7 @@ mod tests {
                 },
                 estimated_size: 50,
                 enqueue_order: 2,
+                prefetched_probe: None,
             },
         ];
 
@@ -4724,9 +6173,9 @@ mod tests {
         let scheduled = schedule_srpt_with_starvation(files);
 
         assert_eq!(scheduled.len(), 3);
-        assert_eq!(scheduled[0].url, "b");
-        assert_eq!(scheduled[1].url, "c");
-        assert_eq!(scheduled[2].url, "a");
+        assert_eq!(scheduled[0].entry.url, "b");
+        assert_eq!(scheduled[1].entry.url, "c");
+        assert_eq!(scheduled[2].entry.url, "a");
     }
 
     #[test]
@@ -4813,33 +6262,53 @@ mod tests {
     #[test]
     fn first_wave_is_diversified_by_host() {
         let files = vec![
-            BatchFileEntry {
-                url: "http://a.onion/file1".to_string(),
-                path: "1".to_string(),
-                size_hint: Some(1),
-                jwt_exp: None,
-                alternate_urls: Vec::new(),
+            ScheduledBatchFile {
+                entry: BatchFileEntry {
+                    url: "http://a.onion/file1".to_string(),
+                    path: "1".to_string(),
+                    size_hint: Some(1),
+                    jwt_exp: None,
+                    alternate_urls: Vec::new(),
+                },
+                estimated_size: 1,
+                enqueue_order: 0,
+                prefetched_probe: None,
             },
-            BatchFileEntry {
-                url: "http://a.onion/file2".to_string(),
-                path: "2".to_string(),
-                size_hint: Some(2),
-                jwt_exp: None,
-                alternate_urls: Vec::new(),
+            ScheduledBatchFile {
+                entry: BatchFileEntry {
+                    url: "http://a.onion/file2".to_string(),
+                    path: "2".to_string(),
+                    size_hint: Some(2),
+                    jwt_exp: None,
+                    alternate_urls: Vec::new(),
+                },
+                estimated_size: 2,
+                enqueue_order: 1,
+                prefetched_probe: None,
             },
-            BatchFileEntry {
-                url: "http://b.onion/file3".to_string(),
-                path: "3".to_string(),
-                size_hint: Some(3),
-                jwt_exp: None,
-                alternate_urls: Vec::new(),
+            ScheduledBatchFile {
+                entry: BatchFileEntry {
+                    url: "http://b.onion/file3".to_string(),
+                    path: "3".to_string(),
+                    size_hint: Some(3),
+                    jwt_exp: None,
+                    alternate_urls: Vec::new(),
+                },
+                estimated_size: 3,
+                enqueue_order: 2,
+                prefetched_probe: None,
             },
-            BatchFileEntry {
-                url: "http://c.onion/file4".to_string(),
-                path: "4".to_string(),
-                size_hint: Some(4),
-                jwt_exp: None,
-                alternate_urls: Vec::new(),
+            ScheduledBatchFile {
+                entry: BatchFileEntry {
+                    url: "http://c.onion/file4".to_string(),
+                    path: "4".to_string(),
+                    size_hint: Some(4),
+                    jwt_exp: None,
+                    alternate_urls: Vec::new(),
+                },
+                estimated_size: 4,
+                enqueue_order: 3,
+                prefetched_probe: None,
             },
         ];
 
@@ -4847,7 +6316,7 @@ mod tests {
         let first_hosts = diversified
             .iter()
             .take(3)
-            .map(|file| batch_entry_host(&file.url).unwrap())
+            .map(|file| batch_entry_host(&file.entry.url).unwrap())
             .collect::<Vec<_>>();
 
         assert_eq!(first_hosts, vec!["a.onion", "b.onion", "c.onion"]);
@@ -4878,8 +6347,10 @@ mod tests {
                     "http://hostc.onion/root/file.pdf".to_string(),
                 ],
             },
+            estimated_size: 10,
             requeue_count: 0,
             alternate_url_cursor: 0,
+            prefetched_probe: None,
         };
 
         let remap = remap_queued_file_to_next_alternate(&mut queued).expect("should remap");
@@ -4888,6 +6359,126 @@ mod tests {
         assert_eq!(remap.1, "hostb.onion");
         assert_eq!(queued.entry.url, "http://hostb.onion/root/file.pdf");
         assert_eq!(queued.alternate_url_cursor, 1);
+    }
+
+    #[test]
+    fn probe_candidate_order_demotes_quarantined_primary_host() {
+        let primary = "http://quarantine-a.onion/root/file.pdf".to_string();
+        clear_host_capability(&primary, true);
+        record_host_failure(&primary, true, HostFailureKind::Timeout);
+
+        let entry = BatchFileEntry {
+            url: primary.clone(),
+            path: "kent/root/file.pdf".to_string(),
+            size_hint: Some(10),
+            jwt_exp: None,
+            alternate_urls: vec![
+                "http://quarantine-b.onion/root/file.pdf".to_string(),
+                "http://quarantine-c.onion/root/file.pdf".to_string(),
+            ],
+        };
+
+        let ordered = ordered_probe_candidates(&entry, true);
+
+        assert_eq!(ordered.len(), 3);
+        assert_ne!(ordered[0].url, primary);
+        assert_eq!(ordered.last().unwrap().url, primary);
+    }
+
+    #[test]
+    fn repeated_onion_connect_failures_extend_quarantine_window() {
+        let url = "http://cooldown-host.onion/root/file.pdf";
+        clear_host_capability(url, true);
+        record_host_success(url, true, 64 * 1024, Some(120));
+        record_host_failure(url, true, HostFailureKind::Connect);
+        let first_quarantine = super::host_capability_snapshot(url, true)
+            .expect("host snapshot after first failure")
+            .quarantine_until_epoch_ms;
+
+        record_host_failure(url, true, HostFailureKind::Connect);
+        let snapshot =
+            super::host_capability_snapshot(url, true).expect("host snapshot after second failure");
+
+        assert!(snapshot.quarantine_until_epoch_ms > first_quarantine);
+        assert_eq!(snapshot.last_productive_epoch_ms, 0);
+        clear_host_capability(url, true);
+    }
+
+    #[test]
+    fn stale_failed_primary_host_loses_productive_priority() {
+        let primary = "http://stale-primary.onion/root/file.pdf";
+        let alternate = "http://fresh-alternate.onion/root/file.pdf";
+        clear_host_capability(primary, true);
+        clear_host_capability(alternate, true);
+
+        let now_ms = current_epoch_ms();
+        let primary_key = host_capability_key(primary, true).expect("primary key");
+        let alternate_key = host_capability_key(alternate, true).expect("alternate key");
+        if let Ok(mut guard) = download_host_capabilities().write() {
+            guard.insert(
+                primary_key,
+                HostCapabilityState {
+                    recent_successes: 3,
+                    recent_failures: 4,
+                    consecutive_connect_failures: 2,
+                    last_productive_epoch_ms: now_ms.saturating_sub(10 * 60 * 1_000),
+                    ..Default::default()
+                },
+            );
+            guard.insert(
+                alternate_key,
+                HostCapabilityState {
+                    recent_successes: 1,
+                    last_productive_epoch_ms: now_ms,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let entry = BatchFileEntry {
+            url: primary.to_string(),
+            path: "kent/stale/file.pdf".to_string(),
+            size_hint: Some(10),
+            jwt_exp: None,
+            alternate_urls: vec![alternate.to_string()],
+        };
+
+        let ordered = ordered_probe_candidates(&entry, true);
+
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(
+            batch_entry_host(&ordered[0].url).as_deref(),
+            Some("fresh-alternate.onion")
+        );
+        assert_eq!(
+            batch_entry_host(&ordered[1].url).as_deref(),
+            Some("stale-primary.onion")
+        );
+
+        clear_host_capability(primary, true);
+        clear_host_capability(alternate, true);
+    }
+
+    #[test]
+    fn reseed_probe_alternates_uses_remaining_probe_order() {
+        let mut entry = BatchFileEntry {
+            url: "http://seed-a.onion/root/file.pdf".to_string(),
+            path: "kent/seed/file.pdf".to_string(),
+            size_hint: Some(10),
+            jwt_exp: None,
+            alternate_urls: vec![
+                "http://seed-b.onion/root/file.pdf".to_string(),
+                "http://seed-c.onion/root/file.pdf".to_string(),
+            ],
+        };
+        let ordered = ordered_probe_candidates(&entry, true);
+        let selected = ordered[1].url.clone();
+
+        reseed_probe_alternates(&mut entry, &ordered, &selected);
+
+        assert_eq!(entry.alternate_urls.len(), 2);
+        assert!(entry.alternate_urls.iter().all(|url| url != &selected));
+        assert_ne!(entry.alternate_urls[0], entry.alternate_urls[1]);
     }
 
     #[test]
@@ -4900,5 +6491,29 @@ mod tests {
     fn onion_handshake_filter_still_culls_bottom_half() {
         assert_eq!(handshake_keep_count(24, 16, true), 12);
         assert_eq!(handshake_keep_count(1, 1, true), 1);
+    }
+
+    #[test]
+    fn onion_probe_timeout_grades_up_for_alternates() {
+        assert_eq!(
+            probe_timeout_for_attempt("http://hosta.onion/file", 0, true),
+            std::time::Duration::from_secs(8)
+        );
+        assert_eq!(
+            probe_timeout_for_attempt("http://hostb.onion/file", 1, true),
+            std::time::Duration::from_secs(12)
+        );
+        assert_eq!(
+            probe_timeout_for_attempt("http://hostc.onion/file", 3, true),
+            std::time::Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn onion_probe_timeout_without_alternates_is_conservative() {
+        assert_eq!(
+            probe_timeout_for_attempt("http://hosta.onion/file", 0, false),
+            std::time::Duration::from_secs(10)
+        );
     }
 }

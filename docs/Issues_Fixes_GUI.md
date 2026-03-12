@@ -1,4 +1,56 @@
-> **Last Updated:** 2026-03-09T03:36 CST
+> **Last Updated:** 2026-03-11T16:58 CST
+
+## Phase 113: VFS Tree Spillage & Direct-Child Guard (2026-03-11)
+
+### Issues Found
+- The VFS tree layout flattened deep child directory content incorrectly when operator filesystem metadata containing `\` backslashes (Windows) was ingested, rendering massive flat hierarchies on screen instead of structured collapsible folders.
+
+### Fixes Implemented
+- React frontend components (`VFSExplorer` / `VfsTreeView.tsx`) were heavily constrained. The renderer now strictly normalizes paths directly in evaluation loops and discards downstream/children-of-children files from popping into the current virtual `row` tree layer.
+- `src/components/VFSExplorer.test.tsx` implemented.
+
+### Prevention Rules
+**38. The VFS UI renderer must not blindly trust the backend hierarchical array. The frontend must implement a Direct-Child Guard validating that incoming rows belong functionally to the selected layer.**## Phase 109: Hidden Hex Virtualizer + Click-Through Stability (2026-03-11)
+
+### Issues Found
+- Full `App.tsx` interaction testing in fixture mode could still exhaust the renderer heap even after the earlier overlay split work.
+- Checkbox and `Start Queue` interactions could become unreliable after an error toast appeared because the toast layer still occupied click space over the upper operator surface.
+- Two remaining crawl-option `<select>` handlers still used object-spread state writes, which risked stale option state under rapid operator interaction.
+
+### Fixes Implemented
+- Refactored `HexViewer.tsx` so the heavy `useVirtualizer` path only mounts when the modal is actually open. The closed modal is now a zero-work `null` render instead of instantiating a hidden virtualized `256,000,000`-row disk surface on every app render.
+- Kept `.toast-container` and `.toast` pointer-transparent in `App.css` so error/success overlays no longer intercept clicks intended for `Start Queue`, checkboxes, or nearby controls.
+- Converted the remaining swarm/concurrency `<select>` handlers in `App.tsx` to functional `setCrawlOptions(...)` updates so rapid UI interactions cannot clobber each other with stale spreads.
+- Added and passed `src/App.interaction.test.tsx`, then revalidated the real browser-mounted `?fixture=vfs&surface=app` path with before/after screenshots under `output/ui-fix-validation/`.
+
+### Root Cause
+- The main renderer issue was hidden workload, not visible layout. `HexViewer` always ran its virtualization hooks even while closed, which meant the app was paying for an enormous virtual disk surface during ordinary operator interactions.
+- The click issue was a separate layering bug: once a toast appeared, the overlay could sit above actionable controls and steal pointer events even though it was only informational.
+
+### Prevention Rules
+**35. Hidden dialogs with heavy virtualization or polling must not instantiate their expensive hooks until they are actually open.**
+**36. Informational overlays (toasts, HUD notices) must default to `pointer-events: none` unless they contain intentionally interactive controls.**
+**37. Shared option objects in hot UI paths must use functional state updates so rapid clicks cannot replay stale state snapshots.**
+
+## Phase 108: Overlay Integrity Audit Boundary + Modal Selector Hardening (2026-03-11)
+
+### Issues Found
+- The user requested an every-clickable overlay integrity run, but the existing Playwright audit only covered the reduced `BrowserPreviewApp.tsx` shell.
+- Forcing the real `App.tsx` through browser fixture mode (`?fixture=vfs&surface=app`) did not mount successfully in headless Chromium. The renderer crashed before `.app-container` appeared, so the full operator tree could not be certified through Playwright.
+- Modal-heavy controls (Azure and Hex Viewer) did not expose stable test ids for deterministic reopen/close traversal during overlay audits.
+
+### Fixes Implemented
+- Added a browser-only `surface=app` override in `src/main.tsx` so the real app can be mounted intentionally for diagnostic browser-fixture probes without changing the default preview-shell path.
+- Added stable `data-testid` selectors to Azure modal controls and Hex Viewer actions so future overlay/native smoke work has deterministic hooks instead of relying on fragile text/class signatures.
+- Extended `tests/overlay_integrity_runner.cjs` with modal reopen/tab-selection logic and conditional Mega protected-link seeding, while leaving the default audit target on the stable preview shell.
+- Re-ran the supported preview-shell audit successfully: `32/32 PASS`, `0 FAIL`, `0 SKIP`, geometry unchanged within `1px`.
+
+### Root Cause
+- The current full-app browser-fixture path is still outside the validated Playwright design boundary. The earlier Phase 97 split was correct: the reduced preview shell is stable, but the real `App.tsx` tree can still crash headless Chromium before mount when it is forced into the browser-only route.
+
+### Prevention Rules
+**33. Do not replace the stable preview-shell Playwright gate with the full `App.tsx` browser fixture until that surface survives headless Chromium mount without crashing.**
+**34. Modal/dialog controls that must participate in overlay or native smoke audits need stable `data-testid` selectors plus deterministic reopen logic.**
 
 ## Phase 97: Browser Preview Shell Split + Remote Font Removal (2026-03-10)
 
@@ -302,3 +354,26 @@ After fixing the `tokio::sync::RwLock` deadlock (Phase 61), the GUI still froze 
 
 ### Prevention Rules
 **30. Pool architectures allocating heavyweight external libraries/resources MUST implement lazy instantiation (Optionals via double-checked locking) rather than strictly-sized upfront loops to comply with "Adaptive Scaling" policies.**
+
+## Phase 98A: Native-Webview Smoke Bootstrap Bypass (2026-03-10)
+
+### Issues Found
+- A native-webview smoke runner was added to prove the real Tauri shell mounts and exposes the critical operator controls, but the first local runs stalled without ever producing a smoke report.
+- stderr from the early attempt showed startup immediately entering `Phantom Pool: Building 4 warm standby circuits...`, so the supposed smoke layer was still paying the normal crawler bootstrap cost.
+
+### Root Cause
+- `run_gui()` always spawned onion bootstrap during `tauri::Builder::setup(...)`, even when the app was being launched purely for a narrow smoke check.
+- That coupled a GUI mount assertion to expensive network bootstrap and made the smoke layer unreliable on slower or automation-constrained hosts.
+
+### Fixes Implemented
+- Added a dedicated smoke-mode detector keyed off `CRAWLI_NATIVE_SMOKE_REPORT_PATH`.
+- In smoke mode, `run_gui()` now skips automatic startup bootstrap and only emits runtime metrics / telemetry bridge setup, allowing the real Tauri shell to mount without phantom-pool warmup.
+- Added frontend-side native smoke reporting through `get_native_smoke_config` / `report_native_smoke_result` so the real app can publish which critical `data-testid` controls were present once mounted.
+
+### Remaining Limitation
+- Local March 10, 2026 macOS validation still did not emit the smoke report even after the startup-bootstrap bypass was applied. Browser preview remains healthy, so the unresolved gap is the local native-webview automation surface, not the browser preview shell.
+- Operationally, keep browser preview as the canonical visual/Playwright gate and use native-webview smoke as a smaller secondary check on hosts where a real Tauri webview session is observable.
+
+### Prevention Rules
+**31. Native smoke tests must prove mountability, not full-runtime bootstrap. Any expensive network startup in a smoke path is a design bug.**
+**32. Browser preview and native-webview smoke are different layers; a browser-green result does not certify native mount, and a native smoke failure should not force the visual-regression baseline off the browser preview shell.**

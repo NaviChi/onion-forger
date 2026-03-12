@@ -9,6 +9,23 @@ npm ci
 npm run dev
 ```
 
+## Get Latest Code
+
+Fresh clone:
+
+```bash
+git clone https://github.com/NaviChi/onion-forger.git
+cd onion-forger
+git checkout main
+```
+
+Update an existing checkout to the latest consolidated source:
+
+```bash
+git checkout main
+git pull --ff-only origin main
+```
+
 ## Validation
 
 ```bash
@@ -35,17 +52,22 @@ Build outputs are written under:
 
 `src-tauri/target/release/bundle/`
 
-## GitHub Multi-OS Release Build
+## GitHub Release Workflows
 
-This repository includes a GitHub Actions workflow at:
+Primary multi-OS release workflow:
 
 `.github/workflows/release.yml`
 
-It builds and uploads release installers for:
+Published assets:
+- Linux: `.deb` / `.rpm` bundles + portable tarball
+- Windows: portable zip only (`crawli_<tag>_windows_x64_portable.zip`)
+- macOS: portable `.app` tarballs for Intel and Apple Silicon
 
-- Linux (`.deb` / `.rpm`)
-- Windows (`.msi` / `.exe`)
-- macOS (`.dmg` / `.app`) for both Intel and Apple Silicon
+Windows portable zip contents:
+- `crawli.exe` (GUI)
+- `crawli-cli.exe` (console CLI)
+- `crawli-cli.cmd` wrapper
+- optional runtime payloads from `src-tauri/bin/win_x64` when present
 
 ### Trigger by Tag (recommended)
 
@@ -58,9 +80,13 @@ git push origin v0.1.0
 
 Run `Release` in GitHub Actions with input tag like `v0.1.0`.
 
-Windows releases also publish a portable asset:
-- `crawli_<tag>_windows_x64_portable.zip`
-- Contains `crawli.exe` plus any optional legacy runtime payloads that still exist under `src-tauri/bin/win_x64` at build time. The primary runtime path is native Arti and does not require bundled Tor binaries.
+### Windows-Only Portable Publish
+
+Run `.github/workflows/release-windows-portable.yml` with:
+- `tag`: release tag (for example `v0.1.0`)
+- `ref`: commit/branch to build (defaults to `main`)
+
+This workflow uploads or replaces only the Windows portable zip and removes stale Windows installer assets (`.exe`/`.msi`) if they exist.
 
 ## Browser Fixture Mode
 

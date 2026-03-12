@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
 
     // ═══ STAGE 5: Crawl Root Directory ═══
     println!("─── STAGE 5: Crawl Root Directory ───");
-    let s5 = Instant::now();
+    let _s5 = Instant::now();
     print!("  Fetching {}... ", storage_url);
     match tokio::time::timeout(
         std::time::Duration::from_secs(20),

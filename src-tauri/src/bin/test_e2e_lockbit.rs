@@ -56,11 +56,11 @@ fn main() {
                 sizes: true,
                 download: false,
                 circuits: Some(5),
-                daemons: Some(1),
                 agnostic_state: false,
                 resume: false,
                 resume_index: None,
-                stealth_ramp: false,
+                stealth_ramp: false, parallel_download: false,
+            force_clearnet: false,
                 mega_password: None,
             };
 

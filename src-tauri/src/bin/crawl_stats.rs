@@ -373,11 +373,12 @@ async fn run_single_benchmark(
         sizes: true,
         download: false,
         circuits: Some(CIRCUIT_COUNT),
-        daemons: Some(TOR_DAEMONS),
+        // Phase 117: daemons removed — TorClient count handled by MultiClientPool
         agnostic_state: false,
         resume: false,
         resume_index: None,
-        stealth_ramp: false,
+        stealth_ramp: false, parallel_download: false,
+            force_clearnet: false,
         mega_password: None,
     };
 

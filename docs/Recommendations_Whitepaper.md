@@ -1,4 +1,93 @@
-> **Last Updated:** 2026-03-10T11:55 CDT
+> **Last Updated:** 2026-03-10T19:20 CDT
+
+## Phase 102: Probe Admission Telemetry + Cooldown Escalation (2026-03-11)
+
+**Status: Implemented, backend-validated, and quick-live-validated on the exact-target CLI replay**
+
+What this tranche changed:
+- Probe-stage admission now exposes two first-class counters in the shared telemetry plane: `download_probe_quarantine_hits` and `download_probe_candidate_exhaustions`. They flow through `runtime_metrics`, `telemetry_bridge`, binary telemetry, protobuf bindings, React normalization, the dashboard, and the compact CLI summary (`probe_admission=...`).
+- Onion host productivity memory is no longer effectively immortal. Repeated connect failures now decay productive priority and escalate quarantine harder, so hosts that succeeded sometime in the past stop being treated as preferred if they keep failing the first wave.
+- The exact-target CLI replay surface is now more actionable because it logs full candidate exhaustion explicitly instead of leaving the operator to infer it from repeated timeout lines alone.
+
+Quick live result:
+- The short March 11, 2026 `90s` `crawli-cli download-files` replay against the exact `current/listing_canonical.json` snapshot hit the new path immediately. The first file exhausted all `3` probe candidates, the next file entered with `quarantined_candidates=3/3`, and the summary printed `dl_transport=1/0/0 probe_admission=1/1`.
+- That is progress in observability, not yet in useful work. The replay still did not show non-zero payload progress before timeout, so the blocker has narrowed further: the next issue is what to do once the full three-host candidate set is already degraded.
+
+Next recommended steps:
+- Split the CLI execution path from full Tauri desktop linkage so exact-target validation starts transport work sooner.
+- Change exhausted-candidate fallback so the downloader does not simply re-arm the same degraded winner host after a full three-host probe failure.
+- Re-run the exact-target replay long enough to verify `probe_admission` rises while useful payload bytes also become non-zero before touching concurrency.
+
+## Phase 101: IDM Transport Audit + Qilin Probe Admission Hardening (2026-03-11)
+
+**Status: Implemented and live-validated on the rebuilt exact-target replay**
+
+What the IDM investigation confirmed from official documentation:
+- IDM's strongest practical ideas are scheduler policy, not magic transport primitives: dynamic segmentation, per-site max-connection tuning, immediate transfer start before a second request can fail, and site-specific exceptions for hosts that break under the normal multi-request path. Source basis: official IDM features/help pages from Tonec.
+- The safest ideas to copy into Crawli are the host-specific exception mechanisms, not blanket global aggression. For clearnet that means stronger per-host admission and reuse; for Qilin/onion that means early degraded-host quarantine and alternate-host rotation before the transfer scheduler commits to a host.
+- This maps cleanly onto the current bottleneck: the exact-target onion path is still dying in probe/connect collapse before useful transfer work begins.
+
+Implemented in this tranche:
+- `src-tauri/src/aria_downloader.rs` now records probe-stage degraded hosts into a short-lived quarantine window on repeated connect/timeout failures.
+- Probe candidates are now ordered by live host health before transfer scheduling, and if no host has proven productive yet the order rotates by path so the first wave does not keep hammering the same host.
+- After probe selection, `alternate_urls` are reseeded so the next transfer-time failover starts from the remaining best host instead of replaying the stale pre-probe ordering.
+
+Live validation results:
+- The local toolchain blocker is cleared. `rustc -vV` returned immediately on March 11, 2026, `cargo build --bin crawli` finished in `3m49s`, and `cargo build --bin crawli-cli` finished in `10.70s`.
+- The rebuilt exact-target `150s` replay through `crawli-cli` still produced `0` payload files and `0` payload bytes, with only `519` `.gitkeep` placeholders created under the output root.
+- The new probe path is active: the replay logged `GET Range` probe timeouts at `8s`, `12s`, and `16s`, then emitted `Probe rotation` lines with `quarantined_candidates=2/3` and `3/3`, and finally armed alternate transfer fallbacks on both `lbln...` and `4xl2hta3...`.
+- `dl_transport` rose from `0/0/0` to `18/0/0`, which proves the scheduler is spending transport attempts, but those attempts are still dying in first-wave connect/probe collapse before payload bytes flow.
+
+Next recommended steps:
+- Add probe-stage quarantine-hit and candidate-exhaustion counters to the shared telemetry plane so the operator can see exactly when all first-wave hosts are already degraded.
+- Tighten degraded-host eviction/cooldown after repeated first-wave `Connect` failures; the current rotation is active, but weak hosts are still re-entering admission too early.
+- Split the CLI execution path from full Tauri desktop linkage so validation runs do not spend roughly `11.8s` in binary startup before transport work begins.
+- Keep concurrency frozen until the same exact-target replay produces non-zero payload bytes.
+
+## Phase 100: Active Host Cap + Comparative Downloader Research (2026-03-10)
+
+**Status: Implemented and live-validated on both direct and exact-target onion paths**
+
+What the broader transport comparison confirmed:
+- libcurl, aria2, and wget2 do not beat general Rust downloaders merely because they are C/C++. They win because they expose mature transport policy: active per-host caps, shared host memory, progress-sensitive aborts, and scheduler-driven admission.
+- aria2 is the clearest comparator for direct-file throughput because it combines segmented HTTP range fetching with `max-connection-per-server` and `lowest-speed-limit`. That maps directly onto Crawli's downloader hot path.
+- Wget2 is more relevant for recursive correctness and persistence than for the highest-throughput hot path; its lessons matter more for crawl durability than for direct-file speed.
+- reqwest/hyper remain viable foundations. The missing wins are application policy and host-admission logic, not a need to replace Rust with a C transport stack.
+
+Implemented in this tranche:
+- A true downloader-side active per-host cap now exists in `src-tauri/src/aria_downloader.rs`, analogous to libcurl's `CURLMOPT_MAX_HOST_CONNECTIONS` and aria2's `max-connection-per-server`.
+- Clearnet/direct traffic currently defaults to `32` live host-local transfers, while onion/Qilin stays conservative at `4` so one rotating hidden-service host cannot monopolize the batch.
+- Excess work now queues behind host permits instead of immediately overcommitting the same host.
+
+Live results:
+- Clean direct benchmark: `host_cap=32`, `bytes=758923264`, `elapsed_secs=15.39`, `throughput_mbps=394.59`.
+- Exact-target Qilin replay: `host_cap_ceiling=4`, `dl_transport` rose to `18/0/0`, but the batch still produced `0` payload bytes because the first wave died in probe/connect collapse before useful work began.
+
+Next recommended steps:
+- Add probe-stage degraded-host quarantine so hosts that fail the first wave do not keep consuming micro/small admission slots.
+- Rotate alternate-host cursors more aggressively before transfer scheduling begins.
+- Keep concurrency frozen until the same exact-target Qilin replay produces non-zero payload bytes under the new host-pressure regime.
+
+## Phase 99: Libcurl Transport Reverse-Engineering Audit (2026-03-10)
+
+**Status: Core transport tranche implemented and validation-complete for build/test/telemetry parity**
+
+What the audit confirmed:
+- Crawli already matches libcurl in a few important ways: pooled clients exist on both the Tor and clearnet paths, HTTP/2 is enabled on the Tor client, and downloader probing already uses a real `GET Range: bytes=0-0` instead of a detached `HEAD`.
+- The strongest remaining transport gaps are not "more sockets" problems. They are reuse and admission problems: Crawli still lacks a generic host-capability cache, still leans heavily on fixed wall-clock timeouts instead of low-speed semantics, and still lacks a downloader-side active per-host cap analogous to libcurl's `CURLMOPT_MAX_HOST_CONNECTIONS`.
+- The current code still contains one especially expensive anti-libcurl pattern: the small-file swarm and range tournament probe explicitly force `Connection: close` in `src-tauri/src/aria_downloader.rs`, which destroys keep-alive reuse even after a productive host is known.
+- The current probe path still pays for a real ranged GET and then starts a second transfer request later, which means Crawli often spends two request setups where a libcurl-style promoted first transfer could spend one.
+
+Implemented in this tranche:
+- Clearnet paths now keep transport reuse enabled by default, while onion reuse is gated by host-quality state instead of a blanket disable.
+- Micro/small swarm lanes now promote successful range probes into the first transfer span when the prefetched seed is bounded and useful, reducing duplicated request setup on many-small-file batches.
+- The downloader now keeps a shared host-capability cache keyed by host and traffic class and records range support, validator kind, connect/first-byte EWMA, low-speed abort history, and a provisional safe parallelism cap.
+- Low-speed abort counters now survive end to end through runtime metrics, CLI summaries, protobuf/binary telemetry, and the React bridge.
+
+Next recommended steps:
+- Add a true active per-host transfer cap before any further concurrency increase. `pool_max_idle_per_host` is still not a substitute for live host-pressure control.
+- Validate the new transport counters on a clean direct benchmark rerun and an exact-target Qilin replay that produces non-zero useful work.
+- After the per-host cap exists, consider using the host-capability ledger to bias early admission and lane width, but only from proven productive hosts.
 
 ## Phase 95: Clearnet Direct-File Audit + Direct Mode Fix (2026-03-10)
 

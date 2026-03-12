@@ -539,7 +539,7 @@ fn download_budget_for_profile(
         StorageClass::Unknown => 12,
     };
     let onion_cap = if is_onion {
-        base_cap
+        base_cap.saturating_mul(2) // IDM-tier multiplexing stream packing
     } else {
         base_cap.saturating_mul(2)
     };
@@ -567,8 +567,8 @@ fn download_budget_for_profile(
     // blindly expanding the first-wave circuit spray beyond the proven stable cap.
     if is_onion && content_length.is_none() {
         let onion_batch_cap = env_cap("CRAWLI_ONION_BATCH_CIRCUIT_CAP_MAX")
-            .unwrap_or(16)
-            .clamp(8, 24);
+            .unwrap_or(64)
+            .clamp(8, 64);
         circuit_cap = circuit_cap.min(onion_batch_cap);
     }
 
@@ -582,18 +582,18 @@ fn download_budget_for_profile(
     }
 
     let small_file_parallelism = match download_storage_class {
-        StorageClass::Hdd => circuit_cap.min(4),
-        StorageClass::Ssd => circuit_cap.min(8),
-        StorageClass::Nvme => circuit_cap.min(12),
-        StorageClass::Unknown => circuit_cap.min(6),
+        StorageClass::Hdd => circuit_cap.min(8),
+        StorageClass::Ssd => circuit_cap.min(32),
+        StorageClass::Nvme => circuit_cap.min(64),
+        StorageClass::Unknown => circuit_cap.min(16),
     }
     .max(1);
 
     let initial_active_cap = match download_storage_class {
-        StorageClass::Hdd => circuit_cap.min(4),
-        StorageClass::Ssd => circuit_cap.min(10),
-        StorageClass::Nvme => circuit_cap.min(16),
-        StorageClass::Unknown => circuit_cap.min(8),
+        StorageClass::Hdd => circuit_cap.min(8),
+        StorageClass::Ssd => circuit_cap.min(32),
+        StorageClass::Nvme => circuit_cap.min(64),
+        StorageClass::Unknown => circuit_cap.min(16),
     }
     .max(1);
 
@@ -611,9 +611,9 @@ fn download_budget_for_profile(
         initial_active_cap,
         tournament_cap,
         micro_swarm_circuits: apply_pressure_to_budget(
-            8,
+            32,
             2,
-            12,
+            64,
             pressure.total_pressure,
             matches!(profile.storage_class, StorageClass::Nvme),
         )
@@ -989,7 +989,7 @@ mod tests {
     #[test]
     fn onion_batch_budget_keeps_first_wave_capped() {
         let budget = recommend_download_budget(120, None, true, None, None);
-        assert!(budget.circuit_cap <= 16);
+        assert!(budget.circuit_cap <= 64);
     }
 
     #[test]

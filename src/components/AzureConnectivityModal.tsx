@@ -151,7 +151,7 @@ export function AzureConnectivityModal({ isOpen, onClose }: AzureConnectivityMod
                         <Cloud size={20} style={{ color: "var(--accent-secondary)" }} />
                         Azure Connectivity
                     </h2>
-                    <button className="azure-modal-close" onClick={onClose}>
+                    <button className="azure-modal-close" data-testid="btn-azure-close" onClick={onClose}>
                         <X size={18} />
                     </button>
                 </div>
@@ -160,6 +160,7 @@ export function AzureConnectivityModal({ isOpen, onClose }: AzureConnectivityMod
                 <div className="azure-tabs">
                     <button
                         className={`azure-tab ${activeTab === "intranet" ? "active" : ""}`}
+                        data-testid="btn-azure-tab-intranet"
                         onClick={() => setActiveTab("intranet")}
                     >
                         <Globe size={14} style={{ marginRight: 6, verticalAlign: "middle" }} />
@@ -167,6 +168,7 @@ export function AzureConnectivityModal({ isOpen, onClose }: AzureConnectivityMod
                     </button>
                     <button
                         className={`azure-tab ${activeTab === "storage" ? "active" : ""}`}
+                        data-testid="btn-azure-tab-storage"
                         onClick={() => setActiveTab("storage")}
                     >
                         <Server size={14} style={{ marginRight: 6, verticalAlign: "middle" }} />
@@ -188,6 +190,7 @@ export function AzureConnectivityModal({ isOpen, onClose }: AzureConnectivityMod
                             <div className="azure-form-group">
                                 <label>Server Port</label>
                                 <input
+                                    data-testid="input-azure-intranet-port"
                                     type="number"
                                     value={intranetPort}
                                     onChange={(e) => setIntranetPort(e.target.value)}
@@ -217,6 +220,7 @@ export function AzureConnectivityModal({ isOpen, onClose }: AzureConnectivityMod
                             <div className="azure-toggle-row">
                                 <span className="azure-toggle-label">Use Managed Identity</span>
                                 <input
+                                    data-testid="chk-azure-managed-identity"
                                     type="checkbox"
                                     checked={useManagedIdentity}
                                     onChange={(e) => setUseManagedIdentity(e.target.checked)}
@@ -225,41 +229,41 @@ export function AzureConnectivityModal({ isOpen, onClose }: AzureConnectivityMod
 
                             <div className="azure-form-group">
                                 <label>Subscription ID</label>
-                                <input value={subscriptionId} onChange={(e) => setSubscriptionId(e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+                                <input data-testid="input-azure-subscription-id" value={subscriptionId} onChange={(e) => setSubscriptionId(e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
                             </div>
                             <div className="azure-form-group">
                                 <label>Tenant ID</label>
-                                <input value={tenantId} onChange={(e) => setTenantId(e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+                                <input data-testid="input-azure-tenant-id" value={tenantId} onChange={(e) => setTenantId(e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
                             </div>
 
                             {!useManagedIdentity && (
                                 <>
                                     <div className="azure-form-group">
                                         <label>Client ID</label>
-                                        <input value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="App (client) ID" />
+                                        <input data-testid="input-azure-client-id" value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="App (client) ID" />
                                     </div>
                                     <div className="azure-form-group">
                                         <label>Client Secret</label>
-                                        <input type="password" value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} placeholder="Client secret value" />
+                                        <input data-testid="input-azure-client-secret" type="password" value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} placeholder="Client secret value" />
                                     </div>
                                 </>
                             )}
 
                             <div className="azure-form-group">
                                 <label>Resource Group</label>
-                                <input value={resourceGroup} onChange={(e) => setResourceGroup(e.target.value)} placeholder="my-resource-group" />
+                                <input data-testid="input-azure-resource-group" value={resourceGroup} onChange={(e) => setResourceGroup(e.target.value)} placeholder="my-resource-group" />
                             </div>
                             <div className="azure-form-group">
                                 <label>Storage Account Name</label>
-                                <input value={storageAccount} onChange={(e) => setStorageAccount(e.target.value)} placeholder="crawlistorage" />
+                                <input data-testid="input-azure-storage-account" value={storageAccount} onChange={(e) => setStorageAccount(e.target.value)} placeholder="crawlistorage" />
                             </div>
                             <div className="azure-form-group">
                                 <label>Container Name</label>
-                                <input value={containerName} onChange={(e) => setContainerName(e.target.value)} placeholder="crawli-downloads" />
+                                <input data-testid="input-azure-container-name" value={containerName} onChange={(e) => setContainerName(e.target.value)} placeholder="crawli-downloads" />
                             </div>
                             <div className="azure-form-group">
                                 <label>Region</label>
-                                <select value={region} onChange={(e) => setRegion(e.target.value)}>
+                                <select data-testid="sel-azure-region" value={region} onChange={(e) => setRegion(e.target.value)}>
                                     <option value="eastus">East US</option>
                                     <option value="westus2">West US 2</option>
                                     <option value="westeurope">West Europe</option>
@@ -271,7 +275,7 @@ export function AzureConnectivityModal({ isOpen, onClose }: AzureConnectivityMod
                             </div>
                             <div className="azure-form-group">
                                 <label>Storage Size (GB)</label>
-                                <input type="number" value={sizeGb} onChange={(e) => setSizeGb(e.target.value)} min={1} max={10000} />
+                                <input data-testid="input-azure-size-gb" type="number" value={sizeGb} onChange={(e) => setSizeGb(e.target.value)} min={1} max={10000} />
                             </div>
                         </>
                     )}
@@ -297,11 +301,11 @@ export function AzureConnectivityModal({ isOpen, onClose }: AzureConnectivityMod
                     {activeTab === "intranet" && (
                         <>
                             {status?.intranetServerRunning ? (
-                                <button className="azure-btn azure-btn-danger" onClick={() => handleToggleIntranet(false)} disabled={loading}>
+                                <button className="azure-btn azure-btn-danger" data-testid="btn-azure-intranet-stop" onClick={() => handleToggleIntranet(false)} disabled={loading}>
                                     Stop Server
                                 </button>
                             ) : (
-                                <button className="azure-btn azure-btn-primary" onClick={() => handleToggleIntranet(true)} disabled={loading}>
+                                <button className="azure-btn azure-btn-primary" data-testid="btn-azure-intranet-start" onClick={() => handleToggleIntranet(true)} disabled={loading}>
                                     {loading ? "Starting..." : "Start Intranet Server"}
                                 </button>
                             )}
@@ -309,18 +313,18 @@ export function AzureConnectivityModal({ isOpen, onClose }: AzureConnectivityMod
                     )}
                     {activeTab === "storage" && (
                         <>
-                            <button className="azure-btn azure-btn-secondary" onClick={handleTestConnection} disabled={loading}>
+                            <button className="azure-btn azure-btn-secondary" data-testid="btn-azure-test-connection" onClick={handleTestConnection} disabled={loading}>
                                 Test Connection
                             </button>
-                            <button className="azure-btn azure-btn-primary" onClick={handleConfigureAzure} disabled={loading}>
+                            <button className="azure-btn azure-btn-primary" data-testid="btn-azure-configure" onClick={handleConfigureAzure} disabled={loading}>
                                 {loading ? "Saving..." : "Save & Configure"}
                             </button>
                             {status?.storageEnabled ? (
-                                <button className="azure-btn azure-btn-danger" onClick={() => handleToggleStorage(false)} disabled={loading}>
+                                <button className="azure-btn azure-btn-danger" data-testid="btn-azure-storage-disable" onClick={() => handleToggleStorage(false)} disabled={loading}>
                                     Disable
                                 </button>
                             ) : (
-                                <button className="azure-btn azure-btn-secondary" onClick={() => handleToggleStorage(true)} disabled={loading}>
+                                <button className="azure-btn azure-btn-secondary" data-testid="btn-azure-storage-enable" onClick={() => handleToggleStorage(true)} disabled={loading}>
                                     Enable Storage
                                 </button>
                             )}

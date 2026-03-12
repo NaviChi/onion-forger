@@ -7,9 +7,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tor_rtcompat::PreferredRuntime;
 
+pub type SharedTorClient = Arc<RwLock<Option<Arc<TorClient<PreferredRuntime>>>>>;
+
 #[derive(Clone)]
 pub struct MultiClientPool {
-    clients: Vec<Arc<RwLock<Option<Arc<TorClient<PreferredRuntime>>>>>>,
+    clients: Vec<SharedTorClient>,
     next_slot: Arc<std::sync::atomic::AtomicUsize>,
     vanguard_cache_path: std::path::PathBuf,
     seed_clients: Arc<Vec<Arc<TorClient<PreferredRuntime>>>>,

@@ -125,8 +125,8 @@ impl CrawlerAdapter for AutoindexAdapter {
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
-        let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let queue = Arc::new(crate::spillover::SpilloverQueue::new());
+        let all_discovered_entries = Arc::new(crate::spillover::SpilloverList::new());
 
         queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
@@ -241,7 +241,8 @@ impl CrawlerAdapter for AutoindexAdapter {
                                 tokio::time::sleep(delay).await;
                             }
                             if resp.status().is_success() {
-                                if let Ok(body) = resp.text().await {
+                                if let Ok(body_bytes) = resp.bytes().await {
+                                    let body = String::from_utf8_lossy(&body_bytes).into_owned();
                                     bytes_downloaded += body.len() as u64;
                                     fetch_success = true;
                                     if next_url.contains("lockbit") {
@@ -377,8 +378,9 @@ impl CrawlerAdapter for AutoindexAdapter {
                     }
 
                     if !new_files.is_empty() {
-                        let mut lock = discovered_ref.lock().await;
-                        lock.extend(new_files);
+                        for nf in new_files {
+                            discovered_ref.push(nf);
+                        }
                     }
 
                     pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -389,8 +391,8 @@ impl CrawlerAdapter for AutoindexAdapter {
         while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
-        let mut final_results = all_discovered_entries.lock().await;
-        Ok(final_results.drain(..).collect())
+        let final_results = all_discovered_entries.drain_all();
+        Ok(final_results)
     }
 
     fn name(&self) -> &'static str {

@@ -423,12 +423,12 @@ async fn run_adapter_test(
         sizes: true,
         download: false,
         circuits: Some(circuits),
-        daemons: Some(daemons),
         agnostic_state: false,
         resume: false,
         resume_index: None,
         mega_password: None,
-        stealth_ramp: true,
+        stealth_ramp: true, parallel_download: false,
+            force_clearnet: false,
     };
 
     let daemon_count = active_ports.len().max(arti_clients.len()).max(1);

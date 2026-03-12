@@ -309,6 +309,14 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
      * @property {string|null} [slowestCircuit] ResourceMetricsFrame slowestCircuit
      * @property {number|null} [lateThrottles] ResourceMetricsFrame lateThrottles
      * @property {number|null} [outlierIsolations] ResourceMetricsFrame outlierIsolations
+     * @property {number|null} [downloadHostCacheHits] ResourceMetricsFrame downloadHostCacheHits
+     * @property {number|null} [downloadProbePromotionHits] ResourceMetricsFrame downloadProbePromotionHits
+     * @property {number|null} [downloadLowSpeedAborts] ResourceMetricsFrame downloadLowSpeedAborts
+     * @property {number|null} [downloadProbeQuarantineHits] ResourceMetricsFrame downloadProbeQuarantineHits
+     * @property {number|null} [downloadProbeCandidateExhaustions] ResourceMetricsFrame downloadProbeCandidateExhaustions
+     * @property {number|null} [qilinFreshRedirectCandidates] ResourceMetricsFrame qilinFreshRedirectCandidates
+     * @property {number|null} [qilinStaleHostOnlyCandidates] ResourceMetricsFrame qilinStaleHostOnlyCandidates
+     * @property {number|null} [qilinDegradedStageDActivations] ResourceMetricsFrame qilinDegradedStageDActivations
      */
 
     /**
@@ -494,6 +502,70 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
      */
     ResourceMetricsFrame.prototype.outlierIsolations = 0;
 
+    /**
+     * ResourceMetricsFrame downloadHostCacheHits.
+     * @member {number} downloadHostCacheHits
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadHostCacheHits = 0;
+
+    /**
+     * ResourceMetricsFrame downloadProbePromotionHits.
+     * @member {number} downloadProbePromotionHits
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadProbePromotionHits = 0;
+
+    /**
+     * ResourceMetricsFrame downloadLowSpeedAborts.
+     * @member {number} downloadLowSpeedAborts
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadLowSpeedAborts = 0;
+
+    /**
+     * ResourceMetricsFrame downloadProbeQuarantineHits.
+     * @member {number} downloadProbeQuarantineHits
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadProbeQuarantineHits = 0;
+
+    /**
+     * ResourceMetricsFrame downloadProbeCandidateExhaustions.
+     * @member {number} downloadProbeCandidateExhaustions
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadProbeCandidateExhaustions = 0;
+
+    /**
+     * ResourceMetricsFrame qilinFreshRedirectCandidates.
+     * @member {number} qilinFreshRedirectCandidates
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.qilinFreshRedirectCandidates = 0;
+
+    /**
+     * ResourceMetricsFrame qilinStaleHostOnlyCandidates.
+     * @member {number} qilinStaleHostOnlyCandidates
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.qilinStaleHostOnlyCandidates = 0;
+
+    /**
+     * ResourceMetricsFrame qilinDegradedStageDActivations.
+     * @member {number} qilinDegradedStageDActivations
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.qilinDegradedStageDActivations = 0;
+
     // OneOf field names bound to virtual getters and setters
     let $oneOfFields;
 
@@ -581,6 +653,22 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             writer.uint32(/* id 20, wireType 0 =*/160).uint32(message.lateThrottles);
         if (message.outlierIsolations != null && Object.hasOwnProperty.call(message, "outlierIsolations"))
             writer.uint32(/* id 21, wireType 0 =*/168).uint32(message.outlierIsolations);
+        if (message.downloadHostCacheHits != null && Object.hasOwnProperty.call(message, "downloadHostCacheHits"))
+            writer.uint32(/* id 22, wireType 0 =*/176).uint32(message.downloadHostCacheHits);
+        if (message.downloadProbePromotionHits != null && Object.hasOwnProperty.call(message, "downloadProbePromotionHits"))
+            writer.uint32(/* id 23, wireType 0 =*/184).uint32(message.downloadProbePromotionHits);
+        if (message.downloadLowSpeedAborts != null && Object.hasOwnProperty.call(message, "downloadLowSpeedAborts"))
+            writer.uint32(/* id 24, wireType 0 =*/192).uint32(message.downloadLowSpeedAborts);
+        if (message.downloadProbeQuarantineHits != null && Object.hasOwnProperty.call(message, "downloadProbeQuarantineHits"))
+            writer.uint32(/* id 25, wireType 0 =*/200).uint32(message.downloadProbeQuarantineHits);
+        if (message.downloadProbeCandidateExhaustions != null && Object.hasOwnProperty.call(message, "downloadProbeCandidateExhaustions"))
+            writer.uint32(/* id 26, wireType 0 =*/208).uint32(message.downloadProbeCandidateExhaustions);
+        if (message.qilinFreshRedirectCandidates != null && Object.hasOwnProperty.call(message, "qilinFreshRedirectCandidates"))
+            writer.uint32(/* id 27, wireType 0 =*/216).uint32(message.qilinFreshRedirectCandidates);
+        if (message.qilinStaleHostOnlyCandidates != null && Object.hasOwnProperty.call(message, "qilinStaleHostOnlyCandidates"))
+            writer.uint32(/* id 28, wireType 0 =*/224).uint32(message.qilinStaleHostOnlyCandidates);
+        if (message.qilinDegradedStageDActivations != null && Object.hasOwnProperty.call(message, "qilinDegradedStageDActivations"))
+            writer.uint32(/* id 29, wireType 0 =*/232).uint32(message.qilinDegradedStageDActivations);
         return writer;
     };
 
@@ -701,6 +789,38 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
                     message.outlierIsolations = reader.uint32();
                     break;
                 }
+            case 22: {
+                    message.downloadHostCacheHits = reader.uint32();
+                    break;
+                }
+            case 23: {
+                    message.downloadProbePromotionHits = reader.uint32();
+                    break;
+                }
+            case 24: {
+                    message.downloadLowSpeedAborts = reader.uint32();
+                    break;
+                }
+            case 25: {
+                    message.downloadProbeQuarantineHits = reader.uint32();
+                    break;
+                }
+            case 26: {
+                    message.downloadProbeCandidateExhaustions = reader.uint32();
+                    break;
+                }
+            case 27: {
+                    message.qilinFreshRedirectCandidates = reader.uint32();
+                    break;
+                }
+            case 28: {
+                    message.qilinStaleHostOnlyCandidates = reader.uint32();
+                    break;
+                }
+            case 29: {
+                    message.qilinDegradedStageDActivations = reader.uint32();
+                    break;
+                }
             default:
                 reader.skipType(tag & 7);
                 break;
@@ -806,6 +926,30 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
         if (message.outlierIsolations != null && message.hasOwnProperty("outlierIsolations"))
             if (!$util.isInteger(message.outlierIsolations))
                 return "outlierIsolations: integer expected";
+        if (message.downloadHostCacheHits != null && message.hasOwnProperty("downloadHostCacheHits"))
+            if (!$util.isInteger(message.downloadHostCacheHits))
+                return "downloadHostCacheHits: integer expected";
+        if (message.downloadProbePromotionHits != null && message.hasOwnProperty("downloadProbePromotionHits"))
+            if (!$util.isInteger(message.downloadProbePromotionHits))
+                return "downloadProbePromotionHits: integer expected";
+        if (message.downloadLowSpeedAborts != null && message.hasOwnProperty("downloadLowSpeedAborts"))
+            if (!$util.isInteger(message.downloadLowSpeedAborts))
+                return "downloadLowSpeedAborts: integer expected";
+        if (message.downloadProbeQuarantineHits != null && message.hasOwnProperty("downloadProbeQuarantineHits"))
+            if (!$util.isInteger(message.downloadProbeQuarantineHits))
+                return "downloadProbeQuarantineHits: integer expected";
+        if (message.downloadProbeCandidateExhaustions != null && message.hasOwnProperty("downloadProbeCandidateExhaustions"))
+            if (!$util.isInteger(message.downloadProbeCandidateExhaustions))
+                return "downloadProbeCandidateExhaustions: integer expected";
+        if (message.qilinFreshRedirectCandidates != null && message.hasOwnProperty("qilinFreshRedirectCandidates"))
+            if (!$util.isInteger(message.qilinFreshRedirectCandidates))
+                return "qilinFreshRedirectCandidates: integer expected";
+        if (message.qilinStaleHostOnlyCandidates != null && message.hasOwnProperty("qilinStaleHostOnlyCandidates"))
+            if (!$util.isInteger(message.qilinStaleHostOnlyCandidates))
+                return "qilinStaleHostOnlyCandidates: integer expected";
+        if (message.qilinDegradedStageDActivations != null && message.hasOwnProperty("qilinDegradedStageDActivations"))
+            if (!$util.isInteger(message.qilinDegradedStageDActivations))
+                return "qilinDegradedStageDActivations: integer expected";
         return null;
     };
 
@@ -884,6 +1028,22 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             message.lateThrottles = object.lateThrottles >>> 0;
         if (object.outlierIsolations != null)
             message.outlierIsolations = object.outlierIsolations >>> 0;
+        if (object.downloadHostCacheHits != null)
+            message.downloadHostCacheHits = object.downloadHostCacheHits >>> 0;
+        if (object.downloadProbePromotionHits != null)
+            message.downloadProbePromotionHits = object.downloadProbePromotionHits >>> 0;
+        if (object.downloadLowSpeedAborts != null)
+            message.downloadLowSpeedAborts = object.downloadLowSpeedAborts >>> 0;
+        if (object.downloadProbeQuarantineHits != null)
+            message.downloadProbeQuarantineHits = object.downloadProbeQuarantineHits >>> 0;
+        if (object.downloadProbeCandidateExhaustions != null)
+            message.downloadProbeCandidateExhaustions = object.downloadProbeCandidateExhaustions >>> 0;
+        if (object.qilinFreshRedirectCandidates != null)
+            message.qilinFreshRedirectCandidates = object.qilinFreshRedirectCandidates >>> 0;
+        if (object.qilinStaleHostOnlyCandidates != null)
+            message.qilinStaleHostOnlyCandidates = object.qilinStaleHostOnlyCandidates >>> 0;
+        if (object.qilinDegradedStageDActivations != null)
+            message.qilinDegradedStageDActivations = object.qilinDegradedStageDActivations >>> 0;
         return message;
     };
 
@@ -931,6 +1091,14 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             object.offWinnerChildRequests = 0;
             object.lateThrottles = 0;
             object.outlierIsolations = 0;
+            object.downloadHostCacheHits = 0;
+            object.downloadProbePromotionHits = 0;
+            object.downloadLowSpeedAborts = 0;
+            object.downloadProbeQuarantineHits = 0;
+            object.downloadProbeCandidateExhaustions = 0;
+            object.qilinFreshRedirectCandidates = 0;
+            object.qilinStaleHostOnlyCandidates = 0;
+            object.qilinDegradedStageDActivations = 0;
         }
         if (message.processCpuPercent != null && message.hasOwnProperty("processCpuPercent"))
             object.processCpuPercent = options.json && !isFinite(message.processCpuPercent) ? String(message.processCpuPercent) : message.processCpuPercent;
@@ -992,6 +1160,22 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             object.lateThrottles = message.lateThrottles;
         if (message.outlierIsolations != null && message.hasOwnProperty("outlierIsolations"))
             object.outlierIsolations = message.outlierIsolations;
+        if (message.downloadHostCacheHits != null && message.hasOwnProperty("downloadHostCacheHits"))
+            object.downloadHostCacheHits = message.downloadHostCacheHits;
+        if (message.downloadProbePromotionHits != null && message.hasOwnProperty("downloadProbePromotionHits"))
+            object.downloadProbePromotionHits = message.downloadProbePromotionHits;
+        if (message.downloadLowSpeedAborts != null && message.hasOwnProperty("downloadLowSpeedAborts"))
+            object.downloadLowSpeedAborts = message.downloadLowSpeedAborts;
+        if (message.downloadProbeQuarantineHits != null && message.hasOwnProperty("downloadProbeQuarantineHits"))
+            object.downloadProbeQuarantineHits = message.downloadProbeQuarantineHits;
+        if (message.downloadProbeCandidateExhaustions != null && message.hasOwnProperty("downloadProbeCandidateExhaustions"))
+            object.downloadProbeCandidateExhaustions = message.downloadProbeCandidateExhaustions;
+        if (message.qilinFreshRedirectCandidates != null && message.hasOwnProperty("qilinFreshRedirectCandidates"))
+            object.qilinFreshRedirectCandidates = message.qilinFreshRedirectCandidates;
+        if (message.qilinStaleHostOnlyCandidates != null && message.hasOwnProperty("qilinStaleHostOnlyCandidates"))
+            object.qilinStaleHostOnlyCandidates = message.qilinStaleHostOnlyCandidates;
+        if (message.qilinDegradedStageDActivations != null && message.hasOwnProperty("qilinDegradedStageDActivations"))
+            object.qilinDegradedStageDActivations = message.qilinDegradedStageDActivations;
         return object;
     };
 
@@ -1506,6 +1690,7 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
      * @property {string|null} [currentFile] BatchProgressFrame currentFile
      * @property {number|Long|null} [downloadedBytes] BatchProgressFrame downloadedBytes
      * @property {number|null} [activeCircuits] BatchProgressFrame activeCircuits
+     * @property {number|null} [speedMbps] BatchProgressFrame speedMbps
      */
 
     /**
@@ -1571,6 +1756,14 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
      */
     BatchProgressFrame.prototype.activeCircuits = null;
 
+    /**
+     * BatchProgressFrame speedMbps.
+     * @member {number} speedMbps
+     * @memberof BatchProgressFrame
+     * @instance
+     */
+    BatchProgressFrame.prototype.speedMbps = 0;
+
     // OneOf field names bound to virtual getters and setters
     let $oneOfFields;
 
@@ -1616,6 +1809,8 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
             writer.uint32(/* id 5, wireType 0 =*/40).uint64(message.downloadedBytes);
         if (message.activeCircuits != null && Object.hasOwnProperty.call(message, "activeCircuits"))
             writer.uint32(/* id 6, wireType 0 =*/48).uint32(message.activeCircuits);
+        if (message.speedMbps != null && Object.hasOwnProperty.call(message, "speedMbps"))
+            writer.uint32(/* id 7, wireType 1 =*/57).double(message.speedMbps);
         return writer;
     };
 
@@ -1676,6 +1871,10 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
                     message.activeCircuits = reader.uint32();
                     break;
                 }
+            case 7: {
+                    message.speedMbps = reader.double();
+                    break;
+                }
             default:
                 reader.skipType(tag & 7);
                 break;
@@ -1732,6 +1931,9 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
             if (!$util.isInteger(message.activeCircuits))
                 return "activeCircuits: integer expected";
         }
+        if (message.speedMbps != null && message.hasOwnProperty("speedMbps"))
+            if (typeof message.speedMbps !== "number")
+                return "speedMbps: number expected";
         return null;
     };
 
@@ -1787,6 +1989,8 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
                 message.downloadedBytes = new $util.LongBits(object.downloadedBytes.low >>> 0, object.downloadedBytes.high >>> 0).toNumber(true);
         if (object.activeCircuits != null)
             message.activeCircuits = object.activeCircuits >>> 0;
+        if (object.speedMbps != null)
+            message.speedMbps = Number(object.speedMbps);
         return message;
     };
 
@@ -1825,6 +2029,7 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
                 object.downloadedBytes = options.longs === String ? long.toString() : options.longs === Number ? long.toNumber() : long;
             } else
                 object.downloadedBytes = options.longs === String ? "0" : 0;
+            object.speedMbps = 0;
         }
         if (message.completed != null && message.hasOwnProperty("completed"))
             if (typeof message.completed === "number")
@@ -1853,6 +2058,8 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
             if (options.oneofs)
                 object._activeCircuits = "activeCircuits";
         }
+        if (message.speedMbps != null && message.hasOwnProperty("speedMbps"))
+            object.speedMbps = options.json && !isFinite(message.speedMbps) ? String(message.speedMbps) : message.speedMbps;
         return object;
     };
 

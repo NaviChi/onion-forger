@@ -172,12 +172,12 @@ async fn main() -> Result<()> {
                 sizes: true,
                 download: false,
                 circuits: Some(config.circuits_ceiling),
-                daemons: Some(config.daemons),
                 agnostic_state: false,
                 resume: false,
                 resume_index: None,
                 mega_password: None,
-                stealth_ramp: true,
+                stealth_ramp: true, parallel_download: false,
+            force_clearnet: false,
             },
             output_dir.to_string_lossy().to_string(),
             app.handle().clone(),
@@ -256,7 +256,8 @@ async fn main() -> Result<()> {
                     aria_downloader::start_download(
                         app.handle().clone(),
                         crawli_lib::aria_downloader::BatchFileEntry {
-                            url: entry.raw_url.clone(),
+                            url: entry.raw_url.clone(), // Keeping original url, as instruction only specified adding alternate_urls
+                            alternate_urls: Vec::new(),
                             path: safe_target.to_string_lossy().to_string(),
                             size_hint: entry.size_bytes,
                             jwt_exp: entry.jwt_exp,

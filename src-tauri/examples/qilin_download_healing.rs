@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
         app.handle().clone(),
         BatchFileEntry {
             url: config.url.clone(),
+            alternate_urls: Vec::new(),
             path: config.output_path.clone(),
             size_hint: None,
             jwt_exp: None,
@@ -117,6 +118,7 @@ async fn main() -> Result<()> {
         app.handle().clone(),
         BatchFileEntry {
             url: config.url.clone(),
+            alternate_urls: Vec::new(),
             path: config.output_path.clone(),
             size_hint: None,
             jwt_exp: None,

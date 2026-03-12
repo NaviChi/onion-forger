@@ -28,6 +28,14 @@ message ResourceMetricsFrame {
     optional string slowest_circuit = 19;
     uint32 late_throttles = 20;
     uint32 outlier_isolations = 21;
+    uint32 download_host_cache_hits = 22;
+    uint32 download_probe_promotion_hits = 23;
+    uint32 download_low_speed_aborts = 24;
+    uint32 download_probe_quarantine_hits = 25;
+    uint32 download_probe_candidate_exhaustions = 26;
+    uint32 qilin_fresh_redirect_candidates = 27;
+    uint32 qilin_stale_host_only_candidates = 28;
+    uint32 qilin_degraded_stage_d_activations = 29;
 }
 
 message CrawlStatusFrame {
@@ -49,6 +57,7 @@ message BatchProgressFrame {
     string current_file = 4;
     uint64 downloaded_bytes = 5;
     optional uint32 active_circuits = 6;
+    double speed_mbps = 7;
 }
 
 message DownloadStatusFrame {

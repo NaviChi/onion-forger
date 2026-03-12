@@ -231,7 +231,7 @@ export default function BrowserPreviewApp() {
         </button>
       </div>
 
-      <div className="options-bar" style={{ display: "flex", gap: "32px", padding: "0 24px 16px", borderBottom: "var(--panel-border)" }}>
+      <div className="options-bar" style={{ display: "flex", flexWrap: "wrap", gap: "32px", padding: "0 24px 16px", borderBottom: "var(--panel-border)" }}>
         <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
           <input data-testid="chk-listing" type="checkbox" checked={crawlOptions.listing} onChange={(e) => setCrawlOptions((prev) => ({ ...prev, listing: e.target.checked }))} />
           <span style={{ fontSize: "0.85rem" }}>Index Framework (Files)</span>

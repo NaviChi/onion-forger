@@ -21,9 +21,9 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
         use tauri::Emitter;
 
         // 1. Setup channels
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
+        let queue = Arc::new(crate::spillover::SpilloverQueue::new());
 
-        let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let all_discovered_entries = Arc::new(crate::spillover::SpilloverList::new());
 
         // Pending counter to fix BFS race conditions
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -59,30 +59,42 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
             }
         });
 
-        // 4. Thread Pool config
-        let max_concurrent = frontier.recommended_listing_workers();
+        // Phase 119: Work-stealing + reduced timeout/retries
+        let retry_q = Arc::new(crate::work_stealing::new_retry_queue());
+        let max_concurrent = frontier.recommended_listing_workers().min(12);
         let mut workers = tokio::task::JoinSet::new();
 
-        for _ in 0..max_concurrent {
+        for worker_idx in 0..max_concurrent {
             let f = frontier.clone();
             let q_clone = queue.clone();
             let pending_clone = pending.clone();
+            let rq = retry_q.clone();
 
             workers.spawn(async move {
+                // Phase 126: Per-worker HS health tracking via shared CircuitHealth
+                use crate::circuit_health::CircuitHealth;
+                let health = CircuitHealth::new();
+                let mut consecutive_all_dead: u32 = 0;
+                let mut request_count: u32 = 0;
+
                 loop {
                     if f.is_cancelled() {
                         break;
                     }
 
-                    let next_url = match q_clone.pop() {
-                        Some(url) => url,
-                        None => {
-                            if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                            continue;
+                    // Work-stealing: primary queue first, then retry queue
+                    let (next_url, retry_attempt) = if let Some(url) = q_clone.pop() {
+                        (url, 0u8)
+                    } else if let Some((url, attempt)) = crate::work_stealing::try_pop_retry(&rq) {
+                        (url, attempt)
+                    } else {
+                        if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0
+                            && rq.is_empty()
+                        {
+                            break;
                         }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
                     };
 
                     struct TaskGuard {
@@ -94,82 +106,103 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
                                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
-                    let _guard = TaskGuard {
-                        counter: pending_clone.clone(),
+                    let _guard = if retry_attempt == 0 {
+                        Some(TaskGuard {
+                            counter: pending_clone.clone(),
+                        })
+                    } else {
+                        None
                     };
 
-                    // Advanced Politeness Throttle
+                    // Phase 126: CUSUM graduated backoff
+                    request_count += 1;
+                    if request_count > 2 && health.cusum_triggered() {
+                        consecutive_all_dead += 1;
+                        let backoff_secs = 2u64.pow(consecutive_all_dead.min(4));
+                        println!(
+                            "[WorldLeaks W{} BACKOFF] CUSUM triggered — sleeping {}s (cycle {})",
+                            worker_idx, backoff_secs, consecutive_all_dead
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        health.reset_cusum();
+                    }
+
                     let _permit = f.politeness_semaphore.acquire().await.ok();
-                    let (cid, _client) = f.get_client();
+                    let (cid, client) = f.get_client();
                     let start_time = std::time::Instant::now();
 
-                    let mut fetch_success = false;
-                    let mut bytes_downloaded = 0;
-                    let mut html = String::new();
-                    let mut active_cid = cid;
-                    let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
+                    // Phase 126: Adaptive timeout from EWMA latency
+                    let timeout_ms = if request_count <= 2 { 20_000u64 } else { health.adaptive_ttfb_ms().min(20_000) };
+                    let req = client.get(&next_url).send();
+                    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), req).await {
+                        Ok(Ok(resp)) => {
+                            let status = resp.status().as_u16();
+                            let action = crate::work_stealing::classify_http_status(status);
 
-                    for _ in 0..4 {
-                        let (current_cid, current_client) = f.get_client();
-                        active_cid = current_cid;
-
-                        let req = current_client.get(&next_url).send();
-                        if let Ok(Ok(resp)) =
-                            tokio::time::timeout(std::time::Duration::from_secs(45), req).await
-                        {
-                            if let Some(delay) =
-                                ddos_guard.record_response_legacy(resp.status().as_u16())
+                            if action != crate::work_stealing::FailureAction::Skip
+                                && !resp.status().is_success()
                             {
-                                tokio::time::sleep(delay).await;
+                                f.record_failure(cid);
+                                health.record_failure();
+                                crate::work_stealing::handle_failure(
+                                    &rq,
+                                    next_url,
+                                    retry_attempt,
+                                    action,
+                                );
+                                continue;
                             }
 
-                            println!(
-                                "[DEBUG WORLDLEAKS] Fetch status for {}: {}",
-                                next_url,
-                                resp.status()
-                            );
-
                             if resp.status().is_success() {
-                                if let Ok(Ok(body)) = tokio::time::timeout(
-                                    std::time::Duration::from_secs(45),
-                                    resp.text(),
+                                if let Ok(Ok(body_bytes)) = tokio::time::timeout(
+                                    std::time::Duration::from_secs(20),
+                                    resp.bytes(),
                                 )
                                 .await
                                 {
-                                    bytes_downloaded += body.len() as u64;
-                                    html = body;
-                                    fetch_success = true;
-                                    break;
+                                    let body = String::from_utf8_lossy(&body_bytes).into_owned();
+                                    let bytes_downloaded = body.len() as u64;
+                                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                                    f.record_success(cid, bytes_downloaded, elapsed_ms);
+                                    health.record_success();
+                                    health.record_latency(elapsed_ms as f32);
+                                    consecutive_all_dead = 0; // Reset backoff on success
+
+                                    if !body.is_empty() {
+                                        let html_len = body.len();
+                                        let start_idx = html_len.saturating_sub(4000);
+                                        println!(
+                                            "[DEBUG WORLDLEAKS PARSER] Raw HTML end ({} bytes): {}",
+                                            html_len,
+                                            &body[start_idx..]
+                                        );
+                                    }
+                                } else {
+                                    f.record_failure(cid);
+                                    health.record_failure();
+                                    crate::work_stealing::requeue_with_backoff(
+                                        &rq, next_url, retry_attempt, 3,
+                                    );
                                 }
-                            } else if resp.status() == 404 {
-                                break;
                             }
-                        } else {
-                            println!(
-                                "[DEBUG WORLDLEAKS] Timeout or client error connecting to {}",
-                                next_url
+                        }
+                        Ok(Err(e)) => {
+                            if e.to_string().contains("TTFB Timeout") {
+                                f.trigger_circuit_isolation(cid).await;
+                            }
+                            f.record_failure(cid);
+                            health.record_failure();
+                            crate::work_stealing::requeue_with_backoff(
+                                &rq, next_url, retry_attempt, 3,
                             );
                         }
-                        f.record_failure(active_cid);
-                    }
-
-                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
-                    if fetch_success {
-                        f.record_success(active_cid, bytes_downloaded, elapsed_ms);
-                    } else {
-                        f.record_failure(active_cid);
-                    }
-
-                    if fetch_success && !html.is_empty() {
-                        let html_len = html.len();
-                        let start_idx = html_len.saturating_sub(4000);
-                        println!(
-                            "[DEBUG WORLDLEAKS PARSER] Raw HTML end ({} bytes): {}",
-                            html_len,
-                            &html[start_idx..]
-                        );
-
-                        // We will add the actual HTML parsing here later
+                        Err(_) => {
+                            f.record_failure(cid);
+                            health.record_failure();
+                            crate::work_stealing::requeue_with_backoff(
+                                &rq, next_url, retry_attempt, 3,
+                            );
+                        }
                     }
                 }
             });
@@ -178,8 +211,8 @@ impl super::CrawlerAdapter for WorldLeaksAdapter {
         while workers.join_next().await.is_some() {}
 
         drop(ui_tx); // Signals the UI batcher to flush and shutdown
-        let mut final_results = all_discovered_entries.lock().await;
-        Ok(final_results.drain(..).collect())
+        let final_results = all_discovered_entries.drain_all();
+        Ok(final_results)
     }
 
     fn name(&self) -> &'static str {

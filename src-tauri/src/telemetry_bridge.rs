@@ -252,6 +252,16 @@ pub(crate) fn publish_resource_metrics(app: &AppHandle, snapshot: ResourceMetric
             slowest_circuit: snapshot.slowest_circuit.clone(),
             late_throttles: snapshot.late_throttles as u32,
             outlier_isolations: snapshot.outlier_isolations as u32,
+            download_host_cache_hits: snapshot.download_host_cache_hits as u32,
+            download_probe_promotion_hits: snapshot.download_probe_promotion_hits as u32,
+            download_low_speed_aborts: snapshot.download_low_speed_aborts as u32,
+            download_probe_quarantine_hits: snapshot.download_probe_quarantine_hits as u32,
+            download_probe_candidate_exhaustions: snapshot.download_probe_candidate_exhaustions
+                as u32,
+            qilin_fresh_redirect_candidates: snapshot.qilin_fresh_redirect_candidates as u32,
+            qilin_stale_host_only_candidates: snapshot.qilin_stale_host_only_candidates as u32,
+            qilin_degraded_stage_d_activations: snapshot
+                .qilin_degraded_stage_d_activations as u32,
         },
     );
 
@@ -270,6 +280,7 @@ pub(crate) fn publish_batch_progress(app: &AppHandle, progress: BridgeBatchProgr
             current_file: progress.current_file.clone(),
             downloaded_bytes: progress.downloaded_bytes,
             active_circuits: progress.active_circuits.map(|value| value as u32),
+            speed_mbps: progress.speed_mbps,
         },
     );
 

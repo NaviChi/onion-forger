@@ -24,8 +24,8 @@ impl CrawlerAdapter for PearAdapter {
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
-        let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let queue = Arc::new(crate::spillover::SpilloverQueue::new());
+        let all_discovered_entries = Arc::new(crate::spillover::SpilloverList::new());
 
         queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
@@ -127,7 +127,7 @@ impl CrawlerAdapter for PearAdapter {
                                     tokio::time::sleep(delay).await;
                                 }
                                 if resp.status().is_success() {
-                                    resp.text().await.unwrap_or_default()
+                                    String::from_utf8_lossy(&resp.bytes().await.unwrap_or_default()).into_owned()
                                 } else if resp.status() == 404 {
                                     break;
                                 } else {
@@ -200,8 +200,9 @@ impl CrawlerAdapter for PearAdapter {
                     }
 
                     if !new_files.is_empty() {
-                        let mut lock = discovered_ref.lock().await;
-                        lock.extend(new_files);
+                        for nf in new_files {
+                            discovered_ref.push(nf);
+                        }
                     }
                 }
             });
@@ -210,8 +211,8 @@ impl CrawlerAdapter for PearAdapter {
         while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
-        let mut final_results = all_discovered_entries.lock().await;
-        Ok(final_results.drain(..).collect())
+        let final_results = all_discovered_entries.drain_all();
+        Ok(final_results)
     }
 
     fn name(&self) -> &'static str {

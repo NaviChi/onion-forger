@@ -5,6 +5,7 @@ pub mod azure_connectivity;
 pub mod bbr;
 pub mod bft_quorum;
 pub mod binary_telemetry;
+pub mod circuit_health;
 mod cli;
 pub mod db;
 pub mod frontier;
@@ -22,6 +23,8 @@ pub mod resource_governor;
 pub mod runtime_metrics;
 pub mod scorer;
 pub mod speculative_prefetch;
+pub mod spillover;
+pub mod work_stealing;
 pub mod subtree_heatmap;
 pub mod target_state;
 pub mod telemetry_bridge;
@@ -82,6 +85,70 @@ pub struct AppState {
     /// Phase 53: Azure connectivity state (only compiled with `--features azure`)
     #[cfg(feature = "azure")]
     pub azure: tokio::sync::Mutex<azure_connectivity::AzureConnectivityState>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeWebviewSmokeConfig {
+    enabled: bool,
+    report_path: Option<String>,
+    auto_exit: bool,
+    wait_ms: u64,
+    expected_test_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeWebviewSmokeResult {
+    mounted: bool,
+    title: String,
+    href: String,
+    is_tauri_runtime: bool,
+    expected_test_ids: Vec<String>,
+    found_test_ids: Vec<String>,
+    missing_test_ids: Vec<String>,
+    reported_at_epoch_ms: u64,
+}
+
+fn native_webview_smoke_expected_test_ids() -> Vec<String> {
+    vec![
+        "toolbar".to_string(),
+        "input-target-url".to_string(),
+        "btn-start-queue".to_string(),
+        "btn-load-target".to_string(),
+        "resource-metrics-card".to_string(),
+    ]
+}
+
+fn native_webview_smoke_report_path() -> Option<std::path::PathBuf> {
+    std::env::var("CRAWLI_NATIVE_SMOKE_REPORT_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn native_webview_smoke_enabled() -> bool {
+    native_webview_smoke_report_path().is_some()
+}
+
+fn native_webview_smoke_auto_exit() -> bool {
+    std::env::var("CRAWLI_NATIVE_SMOKE_AUTO_EXIT")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn native_webview_smoke_wait_ms() -> u64 {
+    std::env::var("CRAWLI_NATIVE_SMOKE_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(12_000)
+        .clamp(1_000, 60_000)
 }
 
 impl Default for AppState {
@@ -472,7 +539,23 @@ fn ranked_qilin_download_hosts(entries: &[adapters::FileEntry]) -> Vec<String> {
     ranked.into_iter().map(|(host, _)| host).collect()
 }
 
-fn build_qilin_alternate_urls(raw_url: &str, ranked_hosts: &[String]) -> Vec<String> {
+fn stable_rotation_index(key: &str, len: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+
+    if len <= 1 {
+        return 0;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % len
+}
+
+fn build_qilin_alternate_urls(
+    raw_url: &str,
+    ranked_hosts: &[String],
+    rotation_key: &str,
+) -> Vec<String> {
     let Some(current_host) = reqwest::Url::parse(raw_url)
         .ok()
         .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
@@ -481,17 +564,24 @@ fn build_qilin_alternate_urls(raw_url: &str, ranked_hosts: &[String]) -> Vec<Str
     };
 
     let mut seen = std::collections::HashSet::<String>::new();
-    let mut alternates = Vec::new();
+    let mut candidate_hosts = Vec::new();
     for host in ranked_hosts {
         let normalized = host.to_ascii_lowercase();
         if normalized == current_host || !seen.insert(normalized.clone()) {
             continue;
         }
-        if let Some(rewritten) = rewrite_qilin_seed_host(raw_url, &normalized) {
-            alternates.push(rewritten);
-        }
+        candidate_hosts.push(normalized);
     }
-    alternates
+
+    if candidate_hosts.len() > 1 {
+        let rotation = stable_rotation_index(rotation_key, candidate_hosts.len());
+        candidate_hosts.rotate_left(rotation);
+    }
+
+    candidate_hosts
+        .into_iter()
+        .filter_map(|host| rewrite_qilin_seed_host(raw_url, &host))
+        .collect()
 }
 
 fn build_batch_file_entry(
@@ -504,7 +594,7 @@ fn build_batch_file_entry(
         path: safe_target,
         size_hint: entry.size_bytes,
         jwt_exp: entry.jwt_exp,
-        alternate_urls: build_qilin_alternate_urls(&entry.raw_url, ranked_hosts),
+        alternate_urls: build_qilin_alternate_urls(&entry.raw_url, ranked_hosts, &entry.path),
     }
 }
 
@@ -651,7 +741,7 @@ async fn execute_crawl_attempt(
     let timer = crate::timer::CrawlTimer::new(app.clone());
     timer.emit_log(&format!("[System] Bootstrapping Target: {}", url));
 
-    let is_onion = url_targets_onion(url);
+    let is_onion = url_targets_onion(url) && !options.force_clearnet;
     let support_resolution = ensure_support_artifact_dir_for_output_root(output_root)
         .map_err(|e| format!("Failed to create support directory: {e}"))?;
     let support_dir = support_resolution.path;
@@ -694,18 +784,16 @@ async fn execute_crawl_attempt(
         }
 
         if !pre_warmed {
-            timer.emit_log("[Tor Swarm] No pre-warmed swarm found. Cleaning stale daemons...");
+            timer.emit_log("[Tor Swarm] No pre-warmed swarm found. Cleaning up...");
             tor::cleanup_stale_tor_daemons();
             timer.emit_log("[Tor Swarm] Bootstrapping new native Arti cluster...");
             println!("[Crawli Bootstrap] starting tor bootstrap for {}", url);
 
-            let target_daemons = options
-                .daemons
-                .unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 })
-                .max(1);
+            // Phase 117: Hardcoded to 8 clients — MultiClientPool caps at 8 anyway
+            let target_clients = 8usize;
             match tor::bootstrap_tor_cluster_for_traffic(
                 app.clone(),
-                target_daemons,
+                target_clients,
                 0,
                 tor::SwarmTrafficClass::OnionService,
             )
@@ -713,7 +801,7 @@ async fn execute_crawl_attempt(
             {
                 Ok((guard, ports)) => {
                     timer.emit_log(&format!(
-                        "[Tor Swarm] Bootstrap complete: {} runtime, {} daemons active",
+                        "[Tor Swarm] Bootstrap complete: {} runtime, {} clients active",
                         guard.runtime_label(),
                         ports.len()
                     ));
@@ -732,19 +820,16 @@ async fn execute_crawl_attempt(
         }
     }
 
-    let daemon_count = if is_onion {
+    let client_count = if is_onion {
         arti_clients.len().max(1)
     } else {
-        options
-            .daemons
-            .unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 })
-            .max(1)
+        1 // Clearnet uses a single client
     };
 
     let mut frontier = frontier::CrawlerFrontier::new(
         Some(app.clone()),
         url.to_string(),
-        daemon_count,
+        client_count,
         is_onion,
         Vec::new(), // explicit ports removed, handled internally
         arti_clients,
@@ -752,9 +837,8 @@ async fn execute_crawl_attempt(
         Some(target_paths.clone()),
     );
     println!(
-        "[Crawli Bootstrap] frontier initialized: clients={} daemons={} onion={}",
+        "[Crawli Bootstrap] frontier initialized: clients={} onion={}",
         frontier.http_clients.len(),
-        frontier.num_daemons,
         frontier.is_onion
     );
     frontier.swarm_guard = swarm_guard_for_frontier;
@@ -1437,6 +1521,113 @@ async fn start_crawl(
     let mut final_instability_reasons = Vec::new();
     let mut retry_count_used = 0usize;
 
+    // Phase 128: True parallel download — polls VFS and downloads files DURING the crawl
+    let parallel_download_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let parallel_download_handle: Option<tokio::task::JoinHandle<()>> = if options.parallel_download && options.download {
+        let pd_vfs = vfs.clone();
+        let pd_app = app.clone();
+        let pd_output = output_root.clone();
+        let pd_target_dir = target_paths.target_dir.clone();
+        let pd_cancel = parallel_download_cancel.clone();
+        let pd_circuits = options.circuits.unwrap_or(8).max(1).min(6); // Moderate budget during crawl
+        let pd_is_onion = url_targets_onion(&url) && !options.force_clearnet;
+
+        app.emit(
+            "crawl_log",
+            "[PARALLEL] ⚡ Parallel download consumer armed. Will stream files during crawl.".to_string(),
+        )
+        .unwrap_or_default();
+
+        Some(tokio::spawn(async move {
+            use tauri::Emitter;
+            // Phase 128B: Reduced from 30s to 15s — Qilin entries appear within seconds
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let mut downloaded_paths = std::collections::HashSet::<String>::new();
+            let mut batch_round = 0u32;
+
+            while !pd_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let all_entries = match pd_vfs.iter_entries().await {
+                    Ok(e) => e,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                let mut new_files: Vec<adapters::FileEntry> = all_entries
+                    .into_iter()
+                    .filter(|e| {
+                        matches!(e.entry_type, adapters::EntryType::File)
+                            && !e.raw_url.is_empty()
+                            && (e.raw_url.starts_with("http://") || e.raw_url.starts_with("https://"))
+                            && !downloaded_paths.contains(&e.path)
+                    })
+                    .collect();
+
+                if new_files.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                    continue;
+                }
+
+                // Phase 129: IDM-style intelligent download scheduling — sort by size
+                // Small files first for fast completion + rapid progress feedback,
+                // then large files benefit from multi-segment download.
+                new_files.sort_by_key(|e| e.size_bytes.unwrap_or(u64::MAX));
+
+                batch_round += 1;
+                let batch_size = new_files.len();
+                for e in &new_files {
+                    downloaded_paths.insert(e.path.clone());
+                }
+
+                let _ = pd_app.emit(
+                    "crawl_log",
+                    format!(
+                        "[PARALLEL] ⚡ Download batch #{}: {} new files (cumulative: {})",
+                        batch_round, batch_size, downloaded_paths.len()
+                    ),
+                );
+
+                // Repin Qilin URLs to preferred storage hosts if route summary exists
+                let _ = maybe_repin_qilin_entries_from_context(
+                    &mut new_files,
+                    Some(pd_target_dir.as_path()),
+                    &pd_app,
+                );
+
+                match scaffold_download(
+                    &new_files,
+                    &pd_output,
+                    &pd_app,
+                    pd_circuits,
+                    pd_is_onion,
+                )
+                .await
+                {
+                    Ok(count) => {
+                        let _ = pd_app.emit(
+                            "crawl_log",
+                            format!("[PARALLEL] ⚡ Batch #{} complete: {} items", batch_round, count),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = pd_app.emit(
+                            "crawl_log",
+                            format!("[PARALLEL] Batch #{} error: {}", batch_round, e),
+                        );
+                    }
+                }
+
+                if pd_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        }))
+    } else {
+        None
+    };
+
     for attempt_idx in 0..=retry_budget {
         if attempt_idx > 0 {
             retry_count_used = attempt_idx;
@@ -1510,6 +1701,9 @@ async fn start_crawl(
         final_attempt_result = Some(attempt_result);
         break;
     }
+
+    // Phase 128: Signal parallel download consumer to stop after crawl completes
+    parallel_download_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let final_attempt_result = final_attempt_result.ok_or_else(|| {
         "No crawl attempt result was produced for baseline evaluation.".to_string()
@@ -1611,6 +1805,35 @@ async fn start_crawl(
     .unwrap_or_default();
 
     let mut auto_download_started = false;
+
+    // Phase 128: Wait for parallel download consumer to finish its current batch
+    if let Some(handle) = parallel_download_handle {
+        app.emit(
+            "crawl_log",
+            "[PARALLEL] Waiting for parallel download consumer to finish current batch...".to_string(),
+        )
+        .unwrap_or_default();
+        match handle.await {
+            Ok(_) => {
+                auto_download_started = true;
+                app.emit(
+                    "crawl_log",
+                    "[PARALLEL] ⚡ Parallel download consumer finished.".to_string(),
+                )
+                .unwrap_or_default();
+            }
+            Err(e) => {
+                app.emit(
+                    "crawl_log",
+                    format!("[PARALLEL] Consumer task error: {}", e),
+                )
+                .unwrap_or_default();
+            }
+        }
+    }
+
+    // Phase 128: Auto download runs as post-crawl final sweep.
+    // Resume plan naturally skips files already downloaded by the parallel consumer.
     if auto_download {
         let failure_records =
             target_state::load_failure_manifest(&target_paths.failure_manifest_path)
@@ -1662,7 +1885,7 @@ async fn start_crawl(
                 ),
             )
             .unwrap_or_default();
-            let is_onion = url_targets_onion(&url);
+            let is_onion = url_targets_onion(&url) && !options.force_clearnet;
             match scaffold_download_from_entries_with_plan(
                 &authoritative_entries,
                 &resume_build.ordered_entries,
@@ -1877,28 +2100,48 @@ fn preferred_qilin_host_for_subtree(
     winner_host.map(|host| host.to_string())
 }
 
+#[cfg(test)]
 fn preferred_qilin_download_host_for_subtree(
     subtree: &str,
     routes_by_subtree: &std::collections::HashMap<String, PersistedQilinSubtreeRouteEntry>,
     winner_host: Option<&str>,
-    updated_at_epoch: u64,
 ) -> Option<String> {
     let mut cursor = Some(subtree);
     while let Some(candidate) = cursor {
         if let Some(route) = routes_by_subtree.get(candidate) {
-            if let Some(winner_host) = winner_host {
-                let route_age = updated_at_epoch.saturating_sub(route.last_success_epoch);
-                let should_prefer_winner = !winner_host.eq_ignore_ascii_case(&route.preferred_host)
-                    && (route.success_count < 2 || route_age > 120);
-                if should_prefer_winner {
-                    return Some(winner_host.to_string());
-                }
-            }
             return Some(route.preferred_host.clone());
         }
         cursor = candidate.rsplit_once('/').map(|(parent, _)| parent);
     }
     winner_host.map(|host| host.to_string())
+}
+
+fn should_repin_qilin_download_to_preferred_host(
+    route: &PersistedQilinSubtreeRouteEntry,
+    winner_host: Option<&str>,
+    updated_at_epoch: u64,
+) -> bool {
+    let route_age = updated_at_epoch.saturating_sub(route.last_success_epoch);
+    if route.success_count >= 4 && route_age <= 900 {
+        return true;
+    }
+
+    winner_host
+        .map(|winner| winner.eq_ignore_ascii_case(&route.preferred_host))
+        .unwrap_or(false)
+        && route.success_count >= 2
+        && route_age <= 180
+}
+
+fn balanced_qilin_repin_host_cap(total_files: usize, distinct_hosts: usize) -> usize {
+    if distinct_hosts <= 1 {
+        return total_files.max(1);
+    }
+
+    let average = total_files.div_ceil(distinct_hosts).max(1);
+    average
+        .saturating_add((average / 4).max(1))
+        .saturating_add(24)
 }
 
 fn maybe_repin_qilin_entries_from_context(
@@ -1923,26 +2166,73 @@ fn maybe_repin_qilin_entries_from_context(
             .into_iter()
             .map(|entry| (entry.subtree_key.clone(), entry))
             .collect();
+    let mut host_counts = std::collections::HashMap::<String, usize>::new();
+    let mut total_onion_files = 0usize;
+    for entry in entries.iter() {
+        if !matches!(entry.entry_type, adapters::EntryType::File)
+            || !url_targets_onion(&entry.raw_url)
+        {
+            continue;
+        }
+        if let Some(host) = reqwest::Url::parse(&entry.raw_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        {
+            *host_counts.entry(host).or_default() += 1;
+            total_onion_files = total_onion_files.saturating_add(1);
+        }
+    }
+    let host_cap = balanced_qilin_repin_host_cap(total_onion_files, host_counts.len().max(1));
 
     let mut rewrites = 0usize;
     for entry in entries.iter_mut() {
-        if !url_targets_onion(&entry.raw_url) {
+        if !matches!(entry.entry_type, adapters::EntryType::File)
+            || !url_targets_onion(&entry.raw_url)
+        {
             continue;
         }
         let Some(subtree_key) = subtree_key_for_qilin_download(&entry.raw_url) else {
             continue;
         };
-        let Some(preferred_host) = preferred_qilin_download_host_for_subtree(
-            &subtree_key,
-            &routes_by_subtree,
-            winner_host.as_deref(),
-            updated_at_epoch,
-        ) else {
+        let Some(route) = routes_by_subtree.get(&subtree_key).or_else(|| {
+            let mut cursor = subtree_key.rsplit_once('/').map(|(parent, _)| parent);
+            while let Some(candidate) = cursor {
+                if let Some(route) = routes_by_subtree.get(candidate) {
+                    return Some(route);
+                }
+                cursor = candidate.rsplit_once('/').map(|(parent, _)| parent);
+            }
+            None
+        }) else {
             continue;
         };
+        if !should_repin_qilin_download_to_preferred_host(
+            route,
+            winner_host.as_deref(),
+            updated_at_epoch,
+        ) {
+            continue;
+        }
+        let preferred_host = route.preferred_host.to_ascii_lowercase();
+        let Some(current_host) = reqwest::Url::parse(&entry.raw_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        else {
+            continue;
+        };
+        if preferred_host == current_host {
+            continue;
+        }
+        if host_counts.get(&preferred_host).copied().unwrap_or(0) >= host_cap {
+            continue;
+        }
         let Some(remapped) = rewrite_qilin_seed_host(&entry.raw_url, &preferred_host) else {
             continue;
         };
+        if let Some(count) = host_counts.get_mut(&current_host) {
+            *count = count.saturating_sub(1);
+        }
+        *host_counts.entry(preferred_host).or_default() += 1;
         entry.raw_url = remapped;
         rewrites = rewrites.saturating_add(1);
     }
@@ -1952,13 +2242,61 @@ fn maybe_repin_qilin_entries_from_context(
         let _ = app.emit(
             "crawl_log",
             format!(
-                "[Qilin Download] Repinned {} saved URLs using subtree route memory (winner host {}).",
-                rewrites, winner_host
+                "[Qilin Download] Repinned {} saved URLs using subtree route memory with host_cap={} (winner host {}).",
+                rewrites, host_cap, winner_host
             ),
         );
     }
 
     Ok(rewrites)
+}
+
+#[tauri::command]
+fn get_native_smoke_config() -> NativeWebviewSmokeConfig {
+    NativeWebviewSmokeConfig {
+        enabled: native_webview_smoke_enabled(),
+        report_path: native_webview_smoke_report_path()
+            .map(|path| path.to_string_lossy().to_string()),
+        auto_exit: native_webview_smoke_auto_exit(),
+        wait_ms: native_webview_smoke_wait_ms(),
+        expected_test_ids: native_webview_smoke_expected_test_ids(),
+    }
+}
+
+#[tauri::command]
+async fn report_native_smoke_result(
+    result: NativeWebviewSmokeResult,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let Some(report_path) = native_webview_smoke_report_path() else {
+        return Ok(());
+    };
+
+    if let Some(parent) = report_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let json = serde_json::to_vec_pretty(&result).map_err(|e| e.to_string())?;
+    tokio::fs::write(&report_path, json)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let _ = app.emit(
+        "log",
+        format!(
+            "[NATIVE_SMOKE] mounted={} missing={}",
+            result.mounted,
+            result.missing_test_ids.len()
+        ),
+    );
+
+    if native_webview_smoke_auto_exit() {
+        app.exit(0);
+    }
+
+    Ok(())
 }
 
 async fn scaffold_download(
@@ -2415,16 +2753,16 @@ fn stop_active_download(app: tauri::AppHandle) -> Result<bool, String> {
 
 pub(crate) async fn ensure_crawl_swarm(
     app: &tauri::AppHandle,
-    daemon_count: usize,
 ) -> Result<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>, String> {
     let state = app.state::<AppState>();
     if let Some(existing) = state.crawl_swarm_guard.lock().await.clone() {
         return Ok(existing);
     }
 
+    // Phase 117: Hardcoded to 8 — MultiClientPool caps at 8 TorClients
     let (guard, _) = tor::bootstrap_tor_cluster_for_traffic(
         app.clone(),
-        daemon_count.max(1),
+        8,
         0,
         tor::SwarmTrafficClass::OnionService,
     )
@@ -2440,7 +2778,7 @@ async fn perform_pre_resolve_onion(url: &str, app: &tauri::AppHandle) -> Result<
         return Ok(());
     }
 
-    let guard_arc = ensure_crawl_swarm(app, 1).await?;
+    let guard_arc = ensure_crawl_swarm(app).await?;
     let guard = guard_arc.lock().await;
     let shared_client = guard
         .get_arti_clients()
@@ -2552,6 +2890,13 @@ fn run_gui() {
                 app.handle().clone(),
                 state.telemetry_bridge.clone(),
             );
+            if native_webview_smoke_enabled() {
+                let _ = app.emit(
+                    "log",
+                    "[NATIVE_SMOKE] startup bootstrap bypass enabled".to_string(),
+                );
+                return Ok(());
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
@@ -2585,6 +2930,8 @@ fn run_gui() {
             get_subtree_heatmap,
             open_folder_os,
             set_telemetry_enabled,
+            get_native_smoke_config,
+            report_native_smoke_result,
             crate::binary_telemetry::drain_telemetry_ring,
             detect_input_mode,
             get_system_profile,
@@ -2631,8 +2978,9 @@ pub fn run_cli() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_qilin_alternate_urls, preferred_qilin_download_host_for_subtree,
-        preferred_qilin_host_for_subtree, rewrite_qilin_seed_host,
+        balanced_qilin_repin_host_cap, build_qilin_alternate_urls,
+        preferred_qilin_download_host_for_subtree, preferred_qilin_host_for_subtree,
+        rewrite_qilin_seed_host, should_repin_qilin_download_to_preferred_host,
         split_qilin_download_seed_and_relative_path, subtree_key_for_qilin_download,
         support_artifact_dir_for_output_root, support_key_for_path, url_targets_onion,
         PersistedQilinSubtreeRouteEntry,
@@ -2702,7 +3050,7 @@ mod tests {
     }
 
     #[test]
-    fn download_host_bias_prefers_fresh_winner_over_aged_subtree_host() {
+    fn download_host_bias_uses_subtree_preference_before_winner_fallback() {
         let mut routes = HashMap::new();
         routes.insert(
             "kent/Business%20Related".to_string(),
@@ -2718,10 +3066,40 @@ mod tests {
             "kent/Business%20Related/1%20and%201%20internet",
             &routes,
             Some("winner.onion"),
-            260,
         );
 
-        assert_eq!(preferred.as_deref(), Some("winner.onion"));
+        assert_eq!(preferred.as_deref(), Some("stale.onion"));
+    }
+
+    fn strong_subtree_route_is_required_before_download_repin() {
+        let weak_route = PersistedQilinSubtreeRouteEntry {
+            subtree_key: "kent/Business%20Related".to_string(),
+            preferred_host: "winner.onion".to_string(),
+            success_count: 1,
+            last_success_epoch: 100,
+        };
+        assert!(!should_repin_qilin_download_to_preferred_host(
+            &weak_route,
+            Some("winner.onion"),
+            260,
+        ));
+
+        let strong_route = PersistedQilinSubtreeRouteEntry {
+            success_count: 4,
+            last_success_epoch: 250,
+            ..weak_route
+        };
+        assert!(should_repin_qilin_download_to_preferred_host(
+            &strong_route,
+            Some("winner.onion"),
+            260,
+        ));
+    }
+
+    #[test]
+    fn balanced_qilin_repin_cap_preserves_host_diversity() {
+        assert_eq!(balanced_qilin_repin_host_cap(1, 1), 1);
+        assert!(balanced_qilin_repin_host_cap(2_394, 3) < 1_100);
     }
 
     #[test]
@@ -2783,18 +3161,17 @@ mod tests {
                 "hostb.onion".to_string(),
                 "hostc.onion".to_string(),
             ],
+            "kent/Bankrupcy/report.pdf",
         );
         assert_eq!(alternates.len(), 2);
-        assert_eq!(
-            alternates[0],
-            "http://hostb.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Bankrupcy/report.pdf"
-        );
-        assert_eq!(
-            alternates[1],
-            "http://hostc.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Bankrupcy/report.pdf"
-        );
+        assert!(alternates[0].contains("hostb.onion") || alternates[0].contains("hostc.onion"));
+        assert_ne!(alternates[0], alternates[1]);
+        assert!(alternates
+            .iter()
+            .all(|url| url.contains("/kent/Bankrupcy/report.pdf")));
     }
 }
 pub mod arti_client;
 pub mod arti_connector;
 pub mod seed_manager;
+mod sp_test;

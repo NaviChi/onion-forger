@@ -20,24 +20,28 @@ describe("App interactions", () => {
     const autoDownload = screen.getByTestId("chk-auto-download");
     const agnosticState = screen.getByTestId("chk-agnostic-state");
     const stealthRamp = screen.getByTestId("chk-stealth-ramp");
+    const forceClearnet = screen.getByTestId("chk-force-clearnet");
 
     expect(listing).toBeChecked();
     expect(sizes).toBeChecked();
     expect(autoDownload).not.toBeChecked();
     expect(agnosticState).not.toBeChecked();
     expect(stealthRamp).toBeChecked();
+    expect(forceClearnet).not.toBeChecked();
 
     fireEvent.click(listing);
     fireEvent.click(sizes);
     fireEvent.click(autoDownload);
     fireEvent.click(agnosticState);
     fireEvent.click(stealthRamp);
+    fireEvent.click(forceClearnet);
 
     expect(listing).not.toBeChecked();
     expect(sizes).not.toBeChecked();
     expect(autoDownload).toBeChecked();
     expect(agnosticState).toBeChecked();
     expect(stealthRamp).not.toBeChecked();
+    expect(forceClearnet).toBeChecked();
   });
 
   it("keeps the app interactive after Start Queue is clicked in browser fixture mode", async () => {

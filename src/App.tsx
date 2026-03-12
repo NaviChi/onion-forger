@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { VFSExplorer, FileEntry } from "./components/VFSExplorer";
 import { Dashboard } from "./components/Dashboard";
+import { PatientRetryPanel, PatientRetryState } from "./components/PatientRetryPanel";
 import { AzureConnectivityModal } from "./components/AzureConnectivityModal";
 import { VibeLoader } from "./components/VibeLoader";
 import { HexViewer } from "./components/HexViewer";
@@ -141,6 +142,9 @@ interface ResourceMetricsSnapshot {
   failedRequests?: number;
   fingerprintLatencyMs?: number;
   cachedRouteHits?: number;
+  qilinFreshRedirectCandidates?: number;
+  qilinStaleHostOnlyCandidates?: number;
+  qilinDegradedStageDActivations?: number;
   subtreeReroutes?: number;
   subtreeQuarantineHits?: number;
   offWinnerChildRequests?: number;
@@ -148,6 +152,11 @@ interface ResourceMetricsSnapshot {
   slowestCircuit?: string | null;
   lateThrottles?: number;
   outlierIsolations?: number;
+  downloadHostCacheHits?: number;
+  downloadProbePromotionHits?: number;
+  downloadLowSpeedAborts?: number;
+  downloadProbeQuarantineHits?: number;
+  downloadProbeCandidateExhaustions?: number;
 }
 
 interface EfficiencyHistory {
@@ -472,6 +481,9 @@ const INITIAL_RESOURCE_METRICS: ResourceMetricsSnapshot = {
   failedRequests: 0,
   fingerprintLatencyMs: 0,
   cachedRouteHits: 0,
+  qilinFreshRedirectCandidates: 0,
+  qilinStaleHostOnlyCandidates: 0,
+  qilinDegradedStageDActivations: 0,
   subtreeReroutes: 0,
   subtreeQuarantineHits: 0,
   offWinnerChildRequests: 0,
@@ -479,6 +491,11 @@ const INITIAL_RESOURCE_METRICS: ResourceMetricsSnapshot = {
   slowestCircuit: null,
   lateThrottles: 0,
   outlierIsolations: 0,
+  downloadHostCacheHits: 0,
+  downloadProbePromotionHits: 0,
+  downloadLowSpeedAborts: 0,
+  downloadProbeQuarantineHits: 0,
+  downloadProbeCandidateExhaustions: 0,
 };
 
 const INITIAL_EFFICIENCY_HISTORY: EfficiencyHistory = {
@@ -647,6 +664,18 @@ function normalizeResourceMetricsFrame(
       frame.cachedRouteHits,
       previous.cachedRouteHits ?? 0,
     ),
+    qilinFreshRedirectCandidates: toNonNegativeInteger(
+      frame.qilinFreshRedirectCandidates,
+      previous.qilinFreshRedirectCandidates ?? 0,
+    ),
+    qilinStaleHostOnlyCandidates: toNonNegativeInteger(
+      frame.qilinStaleHostOnlyCandidates,
+      previous.qilinStaleHostOnlyCandidates ?? 0,
+    ),
+    qilinDegradedStageDActivations: toNonNegativeInteger(
+      frame.qilinDegradedStageDActivations,
+      previous.qilinDegradedStageDActivations ?? 0,
+    ),
     subtreeReroutes: toNonNegativeInteger(
       frame.subtreeReroutes,
       previous.subtreeReroutes ?? 0,
@@ -672,6 +701,26 @@ function normalizeResourceMetricsFrame(
     outlierIsolations: toNonNegativeInteger(
       frame.outlierIsolations,
       previous.outlierIsolations ?? 0,
+    ),
+    downloadHostCacheHits: toNonNegativeInteger(
+      frame.downloadHostCacheHits,
+      previous.downloadHostCacheHits ?? 0,
+    ),
+    downloadProbePromotionHits: toNonNegativeInteger(
+      frame.downloadProbePromotionHits,
+      previous.downloadProbePromotionHits ?? 0,
+    ),
+    downloadLowSpeedAborts: toNonNegativeInteger(
+      frame.downloadLowSpeedAborts,
+      previous.downloadLowSpeedAborts ?? 0,
+    ),
+    downloadProbeQuarantineHits: toNonNegativeInteger(
+      frame.downloadProbeQuarantineHits,
+      previous.downloadProbeQuarantineHits ?? 0,
+    ),
+    downloadProbeCandidateExhaustions: toNonNegativeInteger(
+      frame.downloadProbeCandidateExhaustions,
+      previous.downloadProbeCandidateExhaustions ?? 0,
     ),
   };
 }
@@ -741,6 +790,11 @@ function App() {
   const [torStatus, setTorStatus] = useState<TorStatus | null>(null);
 
   const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadProgressEvent>>({});
+  // Phase 128B: Throttled download progress to prevent GUI crash during large batch downloads.
+  // Per-file progress is stored in a mutable ref and flushed to React state at most every 500ms.
+  const downloadProgressBufferRef = useRef<Record<string, DownloadProgressEvent>>({});
+  const downloadProgressFlushPending = useRef(false);
+  const downloadProgressLastFlush = useRef(0);
   const [crawlStatus, setCrawlStatus] = useState<CrawlStatusEvent>(INITIAL_CRAWL_STATUS);
   const [downloadBatchStatus, setDownloadBatchStatus] = useState<DownloadBatchStatus>(INITIAL_DOWNLOAD_BATCH_STATUS);
   const [resourceMetrics, setResourceMetrics] = useState<ResourceMetricsSnapshot>(INITIAL_RESOURCE_METRICS);
@@ -780,16 +834,30 @@ function App() {
     value: 0, direction: null, lastChange: null
   });
 
+  // Phase 116: Patient Retry Mode state
+  const [patientRetryState, setPatientRetryState] = useState<PatientRetryState>({
+    active: false,
+    intervalMins: 15,
+    maxRetries: 96,
+    totalNodes: 0,
+    rounds: [],
+    startedAt: null,
+    countdownSeconds: 0,
+    currentRound: 0,
+  });
+  const patientRetryCountdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const [crawlOptions, setCrawlOptions] = useState({
     listing: true,
     sizes: true,
     download: false,
     circuits: 8,
-    daemons: 1,
     agnosticState: false,
     resume: false,
     resumeIndex: undefined as string | undefined,
-    stealthRamp: true
+    stealthRamp: true,
+    forceClearnet: false,
+    parallelDownload: false
   });
 
   useEffect(() => {
@@ -877,8 +945,10 @@ function App() {
           storageClass: string; os: string;
         }>("get_system_profile");
         setSystemProfile(profile);
-        setCrawlOptions(prev => ({ ...prev, circuits: profile.circuits, daemons: 1 }));
-        setLogs(l => [...l, `[SYSTEM] Auto-detected: ${profile.os} ${profile.cpuCores}c/${profile.totalRamGb}GB/${profile.storageClass.toUpperCase()} → ${profile.preset} (${profile.circuits} circuits)`]);
+        // Snap auto-detected circuits to nearest UI preset: Low(4), Balanced(8), Performance(64)
+        const presetCircuits = profile.circuits <= 4 ? 4 : profile.circuits <= 12 ? 8 : 64;
+        setCrawlOptions(prev => ({ ...prev, circuits: presetCircuits }));
+        setLogs(l => [...l, `[SYSTEM] Auto-detected: ${profile.os} ${profile.cpuCores}c/${profile.totalRamGb}GB/${profile.storageClass.toUpperCase()} → ${profile.preset} (${presetCircuits} circuits)`]);
       } catch {
         // Fallback: keep default 8 circuits
       }
@@ -1073,6 +1143,115 @@ function App() {
         })
       );
 
+      // Phase 116: Patient Retry Mode event listeners
+      unlistenPromises.push(
+        listenEvent<{ interval_mins: number; max_retries: number; total_nodes: number }>("patient_retry_started", (event) => {
+          const p = event.payload;
+          setPatientRetryState({
+            active: true,
+            intervalMins: p.interval_mins,
+            maxRetries: p.max_retries,
+            totalNodes: p.total_nodes,
+            rounds: [],
+            startedAt: Date.now(),
+            countdownSeconds: p.interval_mins * 60,
+            currentRound: 0,
+          });
+          // Start countdown timer
+          if (patientRetryCountdownRef.current) clearInterval(patientRetryCountdownRef.current);
+          patientRetryCountdownRef.current = setInterval(() => {
+            setPatientRetryState(prev => ({
+              ...prev,
+              countdownSeconds: Math.max(0, prev.countdownSeconds - 1),
+            }));
+          }, 1000);
+        })
+      );
+      unlistenPromises.push(
+        listenEvent<{ round: number; max_retries: number; wait_mins: number }>("patient_retry_waiting", (event) => {
+          const p = event.payload;
+          setPatientRetryState(prev => ({
+            ...prev,
+            currentRound: p.round,
+            countdownSeconds: p.wait_mins * 60,
+            rounds: prev.rounds.some(r => r.round === p.round)
+              ? prev.rounds.map(r => r.round === p.round ? { ...r, status: "waiting" as const } : r)
+              : [...prev.rounds, { round: p.round, status: "waiting" as const, resetNodes: 0, timestamp: Date.now(), nextRetryMins: p.wait_mins }],
+          }));
+        })
+      );
+      unlistenPromises.push(
+        listenEvent<{ round: number; reset_nodes: number }>("patient_retry_probing", (event) => {
+          const p = event.payload;
+          setPatientRetryState(prev => ({
+            ...prev,
+            countdownSeconds: 0,
+            rounds: prev.rounds.map(r =>
+              r.round === p.round
+                ? { ...r, status: "probing" as const, resetNodes: p.reset_nodes, timestamp: Date.now() }
+                : r
+            ),
+          }));
+        })
+      );
+      unlistenPromises.push(
+        listenEvent<{ round: number; host: string; latency_ms: number }>("patient_retry_success", (event) => {
+          const p = event.payload;
+          if (patientRetryCountdownRef.current) {
+            clearInterval(patientRetryCountdownRef.current);
+            patientRetryCountdownRef.current = null;
+          }
+          setPatientRetryState(prev => ({
+            ...prev,
+            active: false,
+            countdownSeconds: 0,
+            rounds: prev.rounds.map(r =>
+              r.round === p.round
+                ? { ...r, status: "success" as const, host: p.host, latencyMs: p.latency_ms, timestamp: Date.now() }
+                : r
+            ),
+          }));
+        })
+      );
+      unlistenPromises.push(
+        listenEvent<{ round: number; max_retries: number; next_retry_mins: number }>("patient_retry_failed", (event) => {
+          const p = event.payload;
+          const exhausted = p.round >= p.max_retries;
+          if (exhausted && patientRetryCountdownRef.current) {
+            clearInterval(patientRetryCountdownRef.current);
+            patientRetryCountdownRef.current = null;
+          }
+          setPatientRetryState(prev => ({
+            ...prev,
+            active: !exhausted,
+            rounds: prev.rounds.map(r =>
+              r.round === p.round
+                ? { ...r, status: "failed" as const, nextRetryMins: p.next_retry_mins, timestamp: Date.now() }
+                : r
+            ),
+          }));
+        })
+      );
+      unlistenPromises.push(
+        listenEvent<{ round: number }>("patient_retry_cancelled", (event) => {
+          const p = event.payload;
+          if (patientRetryCountdownRef.current) {
+            clearInterval(patientRetryCountdownRef.current);
+            patientRetryCountdownRef.current = null;
+          }
+          setPatientRetryState(prev => ({
+            ...prev,
+            active: false,
+            countdownSeconds: 0,
+            rounds: prev.rounds.map(r =>
+              r.round === p.round
+                ? { ...r, status: "cancelled" as const, timestamp: Date.now() }
+                : r
+            ),
+          }));
+        })
+      );
+
       unlistenPromises.push(
         listenEvent<FileEntry[]>("crawl_progress", (event) => {
           // Stream directly to backend DB
@@ -1231,11 +1410,17 @@ function App() {
           active_circuits: activeCircuitsValue,
         };
 
-        setDownloadProgress((prev) => ({
-          ...prev,
-          [displayPath]: normalizedPayload,
-        }));
-
+        // Phase 128B: Buffer per-file progress in ref (zero re-renders), flush to state every 500ms
+        downloadProgressBufferRef.current[displayPath] = normalizedPayload;
+        const progressNow = Date.now();
+        if (!downloadProgressFlushPending.current && progressNow - downloadProgressLastFlush.current > 500) {
+          downloadProgressFlushPending.current = true;
+          requestAnimationFrame(() => {
+            setDownloadProgress({ ...downloadProgressBufferRef.current });
+            downloadProgressLastFlush.current = Date.now();
+            downloadProgressFlushPending.current = false;
+          });
+        }
         const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
         const nextBytes = Math.max(previousBytes, bytesDownloaded);
         if (nextBytes > previousBytes) {
@@ -1463,20 +1648,34 @@ function App() {
           const displayPath = toDisplayPath(event.payload.path, roots);
           setLogs((l) => [...l.slice(-399), `[✓] Download finished: ${displayPath} (SHA256: ${event.payload.hash})`]);
           showToast("success", "Download Finished", `File saved and verified (${event.payload.hash})`);
-          setDownloadProgress((prev) => {
-            const p = prev[displayPath];
-            if (!p) return prev;
-            const completedBytes = p.total_bytes || p.bytes_downloaded;
-            const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
-            if (completedBytes > previousBytes) {
-              perFileDownloadedBytesRef.current[displayPath] = completedBytes;
-              aggregateDownloadBytesRef.current += completedBytes - previousBytes;
-            }
-            return {
-              ...prev,
-              [displayPath]: { ...p, bytes_downloaded: completedBytes, speed_bps: 0 },
-            };
-          });
+
+          // Phase 128B: Mark completed in buffer + aggregate tracking
+          const existingProgress = downloadProgressBufferRef.current[displayPath];
+          const completedBytes = existingProgress?.total_bytes || existingProgress?.bytes_downloaded || 0;
+          downloadProgressBufferRef.current[displayPath] = {
+            path: displayPath,
+            bytes_downloaded: completedBytes,
+            total_bytes: completedBytes > 0 ? completedBytes : null,
+            speed_bps: 0,
+          };
+
+          const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
+          if (completedBytes > previousBytes) {
+            perFileDownloadedBytesRef.current[displayPath] = completedBytes;
+            aggregateDownloadBytesRef.current += completedBytes - previousBytes;
+          }
+
+          // Throttled flush to React state
+          const now2 = Date.now();
+          if (!downloadProgressFlushPending.current && now2 - downloadProgressLastFlush.current > 500) {
+            downloadProgressFlushPending.current = true;
+            requestAnimationFrame(() => {
+              setDownloadProgress({ ...downloadProgressBufferRef.current });
+              downloadProgressLastFlush.current = Date.now();
+              downloadProgressFlushPending.current = false;
+            });
+          }
+
           setDownloadBatchStatus((prev) => ({
             ...prev,
             downloadedBytes: Math.max(prev.downloadedBytes, aggregateDownloadBytesRef.current),
@@ -1598,6 +1797,7 @@ function App() {
     setCrawlStartTime(Date.now());
     setCrawlElapsed(0);
     setDownloadProgress({});
+    downloadProgressBufferRef.current = {};
     setDownloadBatchStatus(INITIAL_DOWNLOAD_BATCH_STATUS);
     setLastCrawlResult(null);
     setDownloadResumePlan(null);
@@ -1632,7 +1832,7 @@ function App() {
 
       const payloadOptions = {
         ...crawlOptions,
-        daemons: crawlOptions.daemons > 0 ? crawlOptions.daemons : null,
+        circuits: crawlOptions.circuits > 0 ? crawlOptions.circuits : null,
         resume: resumeMode,
         mega_password: megaPassword || null,
       };
@@ -2252,6 +2452,18 @@ function App() {
           <span style={{ fontSize: '0.85rem', color: crawlOptions.download ? 'var(--text-main)' : 'var(--text-muted)' }}>Auto-Download During Crawl</span>
         </label>
 
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Stream discovered files to the download engine in real-time while crawl is still running. Useful for download testing during short intervals.">
+          <input
+            data-testid="chk-parallel-download"
+            type="checkbox"
+            checked={crawlOptions.parallelDownload}
+            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, parallelDownload: e.target.checked }))}
+            style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
+            disabled={isCrawling}
+          />
+          <span style={{ fontSize: '0.85rem', color: crawlOptions.parallelDownload ? 'var(--text-main)' : 'var(--text-muted)' }}>⚡ Parallel Download</span>
+        </label>
+
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Ignore the server domain when caching to dynamically resume aborted downloads even if the host changes.">
           <input
             data-testid="chk-agnostic-state"
@@ -2274,6 +2486,18 @@ function App() {
             disabled={isCrawling}
           />
           <span style={{ fontSize: '0.85rem', color: crawlOptions.stealthRamp ? 'var(--text-main)' : 'var(--text-muted)' }}>Vanguard Stealth Ramp</span>
+        </label>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Force routing through standard Clearnet HTTP interface instead of Tor (Requires Direct URL or compatible domain)">
+          <input
+            data-testid="chk-force-clearnet"
+            type="checkbox"
+            checked={crawlOptions.forceClearnet}
+            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, forceClearnet: e.target.checked }))}
+            style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
+            disabled={isCrawling}
+          />
+          <span style={{ fontSize: '0.85rem', color: crawlOptions.forceClearnet ? 'var(--text-main)' : 'var(--text-muted)' }}>Force Clearnet Route</span>
         </label>
 
         <button
@@ -2307,63 +2531,68 @@ function App() {
           {crawlOptions.resumeIndex ? `Advanced Override: ${crawlOptions.resumeIndex.split(/[\\/]/).pop()}` : "Advanced Baseline Override"}
         </button>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: 'auto' }}>
-          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Swarms:</span>
-          <select
-            data-testid="sel-daemons"
-            value={`${crawlOptions.daemons}`}
-            onChange={(e) => {
-              const daemons = Number(e.target.value);
-              setCrawlOptions((prev) => ({ ...prev, daemons }));
-            }}
-            disabled={isCrawling}
-            style={{
-              background: 'var(--bg-dark)',
-              color: 'var(--text-main)',
-              border: '1px solid var(--border-color)',
-              borderRadius: '4px',
-              padding: '4px 8px',
-              fontSize: '0.85rem',
-              outline: 'none',
-              cursor: isCrawling ? 'not-allowed' : 'pointer'
-            }}
-          >
-            <option value="1">1 Swarm</option>
-            <option value="3">3 Swarms</option>
-            <option value="6">6 Swarms</option>
-          </select>
-
-          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Concurrency:</span>
-          <select
-            data-testid="sel-circuits"
-            value={`${crawlOptions.circuits}`}
-            onChange={(e) => {
-              const circuits = Number(e.target.value);
-              setCrawlOptions((prev) => ({ ...prev, circuits }));
-            }}
-            disabled={isCrawling}
-            style={{
-              background: 'var(--bg-dark)',
-              color: 'var(--text-main)',
-              border: '1px solid var(--border-color)',
-              borderRadius: '4px',
-              padding: '4px 8px',
-              fontSize: '0.85rem',
-              outline: 'none',
-              cursor: isCrawling ? 'not-allowed' : 'pointer'
-            }}
-          >
-            <option value="2">🔒 Stealth (2 Workers){systemProfile?.preset === 'Stealth' ? ' ★' : ''}</option>
-            <option value="4">🛡️ Conservative (4 Workers){systemProfile?.preset === 'Conservative' ? ' ★' : ''}</option>
-            <option value="8">⚡ Balanced (8 Workers){systemProfile?.preset === 'Balanced' ? ' ★' : ''}</option>
-            <option value="16">🚀 Aggressive (16 Workers){systemProfile?.preset === 'Aggressive' ? ' ★' : ''}</option>
-            <option value="32">💥 Maximum (32 Workers){systemProfile?.preset === 'Maximum' ? ' ★' : ''}</option>
-            <option value="64">💀 Aerospace (64 Workers){systemProfile?.preset === 'Aerospace' ? ' ★' : ''}</option>
-            <option value="128">💀💀 Aerospace+ (128 Workers){systemProfile?.preset === 'Aerospace+' ? ' ★' : ''}</option>
-          </select>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginLeft: 'auto' }} data-testid="preset-selector">
+          <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', letterSpacing: '0.04em', marginRight: '2px' }}>MODE:</span>
+          {([
+            { key: 'low', label: 'Low', emoji: '🛡️', circuits: 4, desc: '4 Workers · 2 Clients', tip: 'For 4GB RAM / weak CPUs / VMs' },
+            { key: 'balanced', label: 'Balanced', emoji: '⚡', circuits: 8, desc: '8 Workers · 4 Clients', tip: 'Recommended for Windows 8GB / mid-range' },
+            { key: 'performance', label: 'Performance', emoji: '🚀', circuits: 64, desc: '64 Workers · 8 Clients', tip: 'For 16GB+ RAM / M1 Max / high-end — matches tor.exe 120 circuits' },
+          ] as const).map((preset) => {
+            const isSelected = crawlOptions.circuits === preset.circuits;
+            const isAutoDetected = systemProfile && (
+              (preset.key === 'low' && (systemProfile.preset === 'Conservative' || (systemProfile.totalRamGb <= 4.5))) ||
+              (preset.key === 'balanced' && (systemProfile.preset === 'Balanced' || (systemProfile.totalRamGb > 4.5 && systemProfile.totalRamGb <= 8.5))) ||
+              (preset.key === 'performance' && (systemProfile.preset === 'Aggressive' || systemProfile.preset === 'Maximum' || systemProfile.preset === 'Aerospace'))
+            );
+            return (
+              <button
+                key={preset.key}
+                data-testid={`preset-${preset.key}`}
+                title={preset.tip}
+                disabled={isCrawling}
+                onClick={() => setCrawlOptions(prev => ({ ...prev, circuits: preset.circuits }))}
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  gap: '1px',
+                  padding: '5px 14px',
+                  background: isSelected
+                    ? 'linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(99, 102, 241, 0.15))'
+                    : 'rgba(255, 255, 255, 0.03)',
+                  border: isSelected
+                    ? '1px solid rgba(139, 92, 246, 0.5)'
+                    : '1px solid var(--border-color)',
+                  borderRadius: '8px',
+                  cursor: isCrawling ? 'not-allowed' : 'pointer',
+                  transition: 'all 0.2s ease',
+                  minWidth: '105px',
+                  opacity: isCrawling ? 0.5 : 1,
+                }}
+              >
+                <span style={{ fontSize: '0.9rem' }}>{preset.emoji}</span>
+                <span style={{
+                  fontSize: '0.72rem',
+                  fontWeight: 700,
+                  color: isSelected ? 'var(--accent-primary)' : 'var(--text-main)',
+                  letterSpacing: '0.06em',
+                }}>
+                  {preset.label}{isAutoDetected ? ' ★' : ''}
+                </span>
+                <span style={{
+                  fontSize: '0.6rem',
+                  color: 'var(--text-muted)',
+                  fontFamily: 'JetBrains Mono',
+                  whiteSpace: 'nowrap',
+                }}>
+                  {preset.desc}
+                </span>
+              </button>
+            );
+          })}
           {systemProfile && (
             <span
-              style={{ fontSize: '0.72rem', color: 'var(--accent-secondary)', opacity: 0.7 }}
+              style={{ fontSize: '0.68rem', color: 'var(--accent-secondary)', opacity: 0.6, marginLeft: '4px' }}
               title={`Detected: ${systemProfile.cpuCores} cores, ${systemProfile.totalRamGb}GB RAM, ${systemProfile.storageClass.toUpperCase()}, ${systemProfile.os}`}
             >
               {systemProfile.os} · {systemProfile.cpuCores}c · {systemProfile.totalRamGb}GB
@@ -2505,6 +2734,8 @@ function App() {
             ceilingStatus={ceilingStatus}
             onAzureClick={() => setShowAzureModal(true)}
           />
+
+          <PatientRetryPanel retryState={patientRetryState} />
 
           <div className="main-workspace">
             <div className="panel" style={{ flex: 1 }}>

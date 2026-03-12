@@ -18,7 +18,9 @@ const WINNER_LEASE_TTL_SECS: u64 = 10 * 60;
 const HINT_PROBE_TIMEOUT_SECS: u64 = 12;
 const FAST_PATH_PROBE_LIMIT: usize = 2;
 const PRIORITIZED_MIRROR_LIMIT: usize = 5;
+const DEGRADED_PRIORITIZED_MIRROR_LIMIT: usize = 12;
 const PROBE_WAVE_SIZE: usize = 2;
+const DEGRADED_PROBE_WAVE_SIZE: usize = 3;
 const REDIRECT_RING_LIMIT: usize = 4;
 const STAGE_A_SAMPLE_ATTEMPTS: usize = 3;
 const STAGE_A_TARGET_UNIQUE_HOSTS: usize = 2;
@@ -438,6 +440,30 @@ impl QilinNodeCache {
         }
     }
 
+    fn is_site_candidate_url(url: &str) -> bool {
+        url.contains("/site/")
+    }
+
+    pub(crate) fn is_host_only_seed_url(uuid: &str, url: &str) -> bool {
+        !url.is_empty()
+            && !Self::is_site_candidate_url(url)
+            && url.ends_with(&format!("/{}/", uuid))
+    }
+
+    pub(crate) fn has_specific_listing_url(uuid: &str, url: &str) -> bool {
+        !url.is_empty()
+            && !Self::is_site_candidate_url(url)
+            && !Self::is_host_only_seed_url(uuid, url)
+    }
+
+    pub(crate) fn is_retryable_listing_node(uuid: &str, node: &StorageNode) -> bool {
+        Self::has_specific_listing_url(uuid, &node.url)
+    }
+
+    pub(crate) fn is_host_only_seed_node(uuid: &str, node: &StorageNode) -> bool {
+        Self::is_host_only_seed_url(uuid, &node.url)
+    }
+
     fn merged_seed_node(
         uuid: &str,
         seed: StorageNode,
@@ -507,7 +533,9 @@ impl QilinNodeCache {
             ..StorageNode::default()
         };
 
-        let _ = self.save_seed_nodes_batch(uuid, &[node.clone()]).await;
+        let _ = self
+            .save_seed_nodes_batch(uuid, std::slice::from_ref(&node))
+            .await;
         let _ = self.save_redirect_hint(uuid, &node).await;
         let _ = self.save_redirect_ring_sample(uuid, &node).await;
         Some(node)
@@ -566,8 +594,15 @@ impl QilinNodeCache {
         record_failures: bool,
         app: Option<tauri::AppHandle>,
     ) -> Option<StorageNode> {
-        if node.url.is_empty() {
-            node.url = format!("http://{}/{}/", node.host, uuid);
+        if node.url.trim().is_empty() {
+            println!(
+                "[QilinNodeCache] Skipping candidate {} because no listing URL is available",
+                node.host
+            );
+            if !record_failures {
+                self.invalidate_cached_hints_for_host(uuid, &node.host).await;
+            }
+            return None;
         }
 
         let started = std::time::Instant::now();
@@ -1056,6 +1091,38 @@ impl QilinNodeCache {
         println!("[QilinNodeCache] Seeded: {} -> {}", uuid, url);
     }
 
+    /// Phase 116: Reset all cooldowns and failure streaks for a UUID.
+    /// Called during patient retry mode so that after a 15-minute wait,
+    /// every cached node gets a fresh chance to be probed.
+    pub async fn reset_all_cooldowns(&self, uuid: &str) -> usize {
+        let guard = self.db.lock().await;
+        let mut reset_count = 0usize;
+        if let Some(db) = guard.as_ref() {
+            let prefix = format!("node:{}:", uuid);
+            for item in db.scan_prefix(prefix.as_bytes()).flatten() {
+                if let Ok(mut node) = serde_json::from_slice::<StorageNode>(&item.1) {
+                    if node.cooldown_until > 0 || node.failure_streak > 0 {
+                        node.cooldown_until = 0;
+                        node.failure_streak = 0;
+                        node.last_seen = now_unix();
+                        if let Ok(serialized) = serde_json::to_vec(&node) {
+                            let _ = db.insert(&item.0, serialized);
+                            reset_count += 1;
+                        }
+                    }
+                }
+            }
+            if reset_count > 0 {
+                let _ = db.flush_async().await;
+            }
+        }
+        println!(
+            "[QilinNodeCache] Phase 116 — Reset cooldowns on {} nodes for UUID {}",
+            reset_count, uuid
+        );
+        reset_count
+    }
+
     async fn persist_node_state(&self, uuid: &str, node: StorageNode) {
         let _ = self.save_node(uuid, &node).await;
     }
@@ -1289,6 +1356,7 @@ impl QilinNodeCache {
         uuid: &str,
         client: &crate::arti_client::ArtiClient,
         candidates: Vec<StorageNode>,
+        wave_size: usize,
         app: Option<&tauri::AppHandle>,
     ) -> Option<StorageNode> {
         let mut seen_hosts = std::collections::HashSet::new();
@@ -1297,6 +1365,15 @@ impl QilinNodeCache {
             if seen_hosts.insert(node.host.clone()) {
                 filtered.push(node);
             }
+        }
+
+        if filtered.is_empty() {
+            emit_discovery_progress(
+                app,
+                "Stage D",
+                "No retryable listing candidates remain after filtering.",
+            );
+            return None;
         }
 
         emit_discovery_progress(
@@ -1308,10 +1385,11 @@ impl QilinNodeCache {
             ),
         );
 
+        let wave_size = wave_size.max(1);
         let total_candidates = filtered.len();
-        let total_waves = total_candidates.div_ceil(PROBE_WAVE_SIZE);
+        let total_waves = total_candidates.div_ceil(wave_size);
 
-        for (wave_idx, chunk) in filtered.chunks(PROBE_WAVE_SIZE).enumerate() {
+        for (wave_idx, chunk) in filtered.chunks(wave_size).enumerate() {
             let wave_nodes: Vec<StorageNode> = chunk.to_vec();
             emit_discovery_progress(
                 app,
@@ -1343,10 +1421,21 @@ impl QilinNodeCache {
                 });
             }
 
-            while let Some(result) = wave.join_next().await {
-                if let Ok(Some(winner)) = result {
-                    wave.abort_all();
-                    return Some(winner);
+            // Phase 126C: Hard outer deadline to handle Arti cancellation-safety issue
+            let wave_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                match tokio::time::timeout_at(wave_deadline, wave.join_next()).await {
+                    Ok(Some(Ok(Some(winner)))) => {
+                        wave.abort_all();
+                        return Some(winner);
+                    }
+                    Ok(Some(_)) => continue, // Task returned None or JoinError
+                    Ok(None) => break,       // All tasks completed
+                    Err(_) => {
+                        println!("[QilinNodeCache] Wave probe deadline exceeded (40s) — aborting remaining");
+                        wave.abort_all();
+                        break;
+                    }
                 }
             }
         }
@@ -1660,7 +1749,13 @@ impl QilinNodeCache {
                 ),
             );
             if let Some(winner) = self
-                .probe_until_first_valid_listing(uuid, client, prioritized_stage_a, app)
+                .probe_until_first_valid_listing(
+                    uuid,
+                    client,
+                    prioritized_stage_a,
+                    PROBE_WAVE_SIZE,
+                    app,
+                )
                 .await
             {
                 return Some(winner);
@@ -1773,6 +1868,59 @@ impl QilinNodeCache {
             return None;
         }
 
+        let fresh_redirect_candidates = stage_a_redirect_candidates.len();
+        let stale_host_only_candidates = cached_nodes
+            .iter()
+            .filter(|node| Self::is_host_only_seed_node(uuid, node))
+            .count();
+        let retryable_cached_candidates = cached_nodes
+            .iter()
+            .filter(|node| Self::is_retryable_listing_node(uuid, node))
+            .count();
+
+        with_runtime_telemetry(app, |telemetry| {
+            telemetry.set_qilin_discovery_candidate_mix(
+                fresh_redirect_candidates,
+                stale_host_only_candidates,
+            )
+        });
+        emit_discovery_progress(
+            app,
+            "Stage C",
+            &format!(
+                "Candidate mix: fresh_redirect={} retryable_cached={} stale_host_only={}",
+                fresh_redirect_candidates,
+                retryable_cached_candidates,
+                stale_host_only_candidates
+            ),
+        );
+
+        let degraded_stage_d = fresh_redirect_candidates == 0;
+        if degraded_stage_d {
+            emit_discovery_progress(
+                app,
+                "Stage D",
+                &format!(
+                    "No fresh redirect captured. Entering degraded Stage D with wider probing across {} cached listing URLs.",
+                    retryable_cached_candidates
+                ),
+            );
+            with_runtime_telemetry(app, |telemetry| {
+                telemetry.record_qilin_degraded_stage_d_activation()
+            });
+        }
+
+        let ranked_limit = if degraded_stage_d {
+            DEGRADED_PRIORITIZED_MIRROR_LIMIT
+        } else {
+            PRIORITIZED_MIRROR_LIMIT
+        };
+        let probe_wave_size = if degraded_stage_d {
+            DEGRADED_PROBE_WAVE_SIZE
+        } else {
+            PROBE_WAVE_SIZE
+        };
+
         let first_stable_candidate = winner_lease
             .clone()
             .or_else(|| sticky_winner_candidate.clone())
@@ -1787,28 +1935,47 @@ impl QilinNodeCache {
             now,
         );
         if let Some(first_redirect) = ordered_stage_a.first().cloned() {
-            prioritized.push(first_redirect);
+            if Self::is_retryable_listing_node(uuid, &first_redirect) {
+                prioritized.push(first_redirect);
+            }
         }
         if let Some(stable_candidate) = first_stable_candidate {
-            prioritized.push(stable_candidate);
+            if Self::is_retryable_listing_node(uuid, &stable_candidate) {
+                prioritized.push(stable_candidate);
+            }
         }
         if ordered_stage_a.len() > 1 {
-            prioritized.extend(ordered_stage_a.drain(1..));
+            prioritized.extend(
+                ordered_stage_a
+                    .drain(1..)
+                    .filter(|node| Self::is_retryable_listing_node(uuid, node)),
+            );
         }
         if let Some(candidate) = winner_lease {
-            prioritized.push(candidate);
+            if Self::is_retryable_listing_node(uuid, &candidate) {
+                prioritized.push(candidate);
+            }
         }
         if let Some(candidate) = last_known_good {
-            prioritized.push(candidate);
+            if Self::is_retryable_listing_node(uuid, &candidate) {
+                prioritized.push(candidate);
+            }
         }
         if let Some(candidate) = redirect_hint {
-            prioritized.push(candidate);
+            if Self::is_retryable_listing_node(uuid, &candidate) {
+                prioritized.push(candidate);
+            }
         }
-        prioritized.extend(redirect_ring);
+        prioritized.extend(
+            redirect_ring
+                .into_iter()
+                .filter(|node| Self::is_retryable_listing_node(uuid, node)),
+        );
 
         let mut ranked: Vec<StorageNode> = cached_nodes
             .iter()
             .filter(|node| !node.is_cooling_down(now))
+            .filter(|node| Self::is_retryable_listing_node(uuid, node))
             .cloned()
             .collect();
         ranked.sort_by(|a, b| {
@@ -1816,9 +1983,20 @@ impl QilinNodeCache {
                 .partial_cmp(&a.tournament_score(now))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        prioritized.extend(ranked.into_iter().take(PRIORITIZED_MIRROR_LIMIT));
+        prioritized.extend(ranked.into_iter().take(ranked_limit));
 
-        self.probe_until_first_valid_listing(uuid, client, prioritized, app)
+        if prioritized.is_empty() && stale_host_only_candidates > 0 {
+            emit_discovery_progress(
+                app,
+                "Stage D",
+                &format!(
+                    "Skipping {} stale host-only candidates because /<cms_uuid>/ retries are banned.",
+                    stale_host_only_candidates
+                ),
+            );
+        }
+
+        self.probe_until_first_valid_listing(uuid, client, prioritized, probe_wave_size, app)
             .await
     }
 
@@ -2011,6 +2189,26 @@ mod tests {
         assert_eq!(ranked.len(), super::FAST_PATH_PROBE_LIMIT);
         assert_eq!(ranked[0].host, "winner.onion");
         assert_eq!(ranked[1].host, "fresh-alt.onion");
+    }
+
+    #[test]
+    fn listing_url_classification_distinguishes_remapped_and_host_only_paths() {
+        assert!(QilinNodeCache::has_specific_listing_url(
+            "cms-uuid",
+            "http://winner.onion/remapped-storage-uuid/"
+        ));
+        assert!(!QilinNodeCache::has_specific_listing_url(
+            "cms-uuid",
+            "http://winner.onion/cms-uuid/"
+        ));
+        assert!(QilinNodeCache::is_host_only_seed_url(
+            "cms-uuid",
+            "http://winner.onion/cms-uuid/"
+        ));
+        assert!(!QilinNodeCache::is_host_only_seed_url(
+            "cms-uuid",
+            "http://winner.onion/remapped-storage-uuid/"
+        ));
     }
 
     #[tokio::test]

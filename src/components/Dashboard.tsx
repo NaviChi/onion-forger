@@ -88,9 +88,14 @@ interface DashboardProps {
     failedRequests?: number;
     fingerprintLatencyMs?: number;
     cachedRouteHits?: number;
+    qilinFreshRedirectCandidates?: number;
+    qilinStaleHostOnlyCandidates?: number;
+    qilinDegradedStageDActivations?: number;
     subtreeReroutes?: number;
     subtreeQuarantineHits?: number;
     offWinnerChildRequests?: number;
+    downloadProbeQuarantineHits?: number;
+    downloadProbeCandidateExhaustions?: number;
   };
   efficiencyHistory?: EfficiencyHistory;
   crawlRunStatus: {
@@ -254,9 +259,19 @@ export function Dashboard({
     settledRequests > 0 ? (successfulRequests / settledRequests) * 100 : 0;
   const fingerprintLatencyMs = resourceMetrics.fingerprintLatencyMs || 0;
   const cachedRouteHits = resourceMetrics.cachedRouteHits || 0;
+  const qilinFreshRedirectCandidates =
+    resourceMetrics.qilinFreshRedirectCandidates || 0;
+  const qilinStaleHostOnlyCandidates =
+    resourceMetrics.qilinStaleHostOnlyCandidates || 0;
+  const qilinDegradedStageDActivations =
+    resourceMetrics.qilinDegradedStageDActivations || 0;
   const subtreeReroutes = resourceMetrics.subtreeReroutes || 0;
   const subtreeQuarantineHits = resourceMetrics.subtreeQuarantineHits || 0;
   const offWinnerChildRequests = resourceMetrics.offWinnerChildRequests || 0;
+  const downloadProbeQuarantineHits =
+    resourceMetrics.downloadProbeQuarantineHits || 0;
+  const downloadProbeCandidateExhaustions =
+    resourceMetrics.downloadProbeCandidateExhaustions || 0;
   const swarmClientCount =
     resourceMetrics.swarmClientCount ||
     torStatus?.ready_clients ||
@@ -418,7 +433,13 @@ export function Dashboard({
             Probe {healthProbeTarget} | Requests {totalRequests} | Failures {failedRequests}
           </div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>
+            Qilin fresh redirects {qilinFreshRedirectCandidates} | Stale host-only {qilinStaleHostOnlyCandidates} | Degraded Stage D {qilinDegradedStageDActivations}
+          </div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>
             Subtree reroutes {subtreeReroutes} | Quarantine hits {subtreeQuarantineHits} | Off-winner child reqs {offWinnerChildRequests}
+          </div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>
+            DL probe q-hits {downloadProbeQuarantineHits} | Candidate exhaustions {downloadProbeCandidateExhaustions}
           </div>
           <div
             style={{

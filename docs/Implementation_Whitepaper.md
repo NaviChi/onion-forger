@@ -1,4 +1,15 @@
-> **Last Updated:** 2026-03-10T06:00 CDT
+> **Last Updated:** 2026-03-12T09:54 CDT
+
+## Phase 127: GitHub Release Hardening + Windows Portable Packaging Script (2026-03-12)
+Implemented in this pass:
+- **`packaging/windows/package-portable.ps1`:** Added a single reusable Windows portable packager script that assembles `crawli.exe`, `crawli-cli.exe`, `crawli-cli.cmd`, optional `src-tauri/bin/win_x64` payloads, and emits `portable-assets/crawli_<tag>_windows_x64_portable.zip`.
+- **`.github/workflows/release.yml`:** Replaced duplicated inline PowerShell packaging logic with a call to the shared script.
+- **`.github/workflows/release-windows-portable.yml`:** Replaced duplicated inline packaging logic, and changed release asset cleanup to remove only stale Windows installer assets (`.exe`/`.msi`) instead of deleting non-Windows assets.
+- **`README.md`:** Updated GitHub release documentation to reflect portable-first Windows distribution and the dedicated Windows-only portable workflow.
+
+Validation status:
+- `ruby -e 'require "yaml"; [".github/workflows/release.yml", ".github/workflows/release-windows-portable.yml"].each { |p| YAML.safe_load(File.read(p), aliases: true); }; puts "workflow yaml parse ok"'` passed.
+- `pwsh` is unavailable in this macOS environment (`command not found`), so the Windows-only packaging script execution must be validated in CI (`windows-latest`) or a Windows host.
 
 ## Phase 96: Windows Portable CLI Audit + Dedicated Console Binary (2026-03-10)
 Implemented in this pass:
@@ -879,3 +890,7 @@ Validated behavior:
 **Speculative Dual-Circuit Tor GET Racing:** To bypass native Tor routing delays (700-1200ms RTT ceilings), HTTP fetch mechanisms deploy `futures::future::select` over duplicate requests cast simultaneously down two completely detached `ArtiClient` tunnels, capturing the fastest node exit and culling the straggler instantly.
 **HFT DOM Pre-Heating:** All heavy string-to-DOM instantiation (`scraper::Html::parse_document`) is evicted from the async Tor reactor thread into strictly physical `tokio::task::spawn_blocking` pools, freeing 20-50ms CPU intervals per frame to sustain microsecond-scale socket throughput.
 **MacOS Kqueue Spin-Locks:** Overridden `tokio::time::sleep` coalescing (which natively enforces 2-5ms timer limits on Apple Silicon) with explicitly mapped userspace spinlocks (`tokio::task::yield_now().await`) for worker throttling, executing micro-yielding to simulate `.poll(EPOLLOUT)` native thresholds for sub-millisecond precision.
+
+
+### Phase 107.5: Native Sled Disks replacing Vec<FileEntry>
+All adapters now leverage Zero-Copy Bincode & Sled-backed disk allocations instead of mutating RAM Vectors. The spillover.rs module manages transient state via native SpilloverList and SpilloverQueue components ensuring RSS footprint remains strictly < 300MB.

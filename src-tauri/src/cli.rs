@@ -104,8 +104,6 @@ struct CrawlArgs {
     #[arg(long)]
     circuits: Option<usize>,
     #[arg(long)]
-    daemons: Option<usize>,
-    #[arg(long)]
     download: bool,
     #[arg(long)]
     resume: bool,
@@ -121,6 +119,11 @@ struct CrawlArgs {
     no_sizes: bool,
     #[arg(long, hide = true)]
     no_stealth_ramp: bool,
+    #[arg(long)]
+    force_clearnet: bool,
+    /// Download files in parallel while crawl is still running (real-time stream)
+    #[arg(long)]
+    parallel_download: bool,
 }
 
 #[derive(Debug, Args)]
@@ -312,7 +315,6 @@ impl CrawlArgs {
             sizes: !self.no_sizes,
             download: self.download,
             circuits: Some(self.circuits.unwrap_or(8).max(1)),
-            daemons: Some(self.daemons.unwrap_or(1).max(1)),
             agnostic_state: self.agnostic_state,
             resume: self.resume || self.resume_index.is_some(),
             resume_index: self.resume_index.clone(),
@@ -321,6 +323,8 @@ impl CrawlArgs {
                 self.no_stealth_ramp,
                 benchmark_flag_override_enabled(),
             ),
+            force_clearnet: self.force_clearnet,
+            parallel_download: self.parallel_download,
         }
     }
 }
@@ -399,9 +403,11 @@ fn should_run_cli_mode(args: &[String]) -> bool {
 
 #[cfg(not(test))]
 fn run_cli(cli: Cli) -> Result<(), String> {
+    let mut ctx = crate::tauri_context();
+    ctx.config_mut().app.windows.clear();
     let app = tauri::Builder::default()
         .manage(crate::AppState::default())
-        .build(crate::tauri_context())
+        .build(ctx)
         .map_err(|e| format!("Failed to build headless Tauri app: {e}"))?;
     let app_handle = app.handle().clone();
     let state = app.state::<crate::AppState>();
@@ -462,6 +468,7 @@ struct CliProgressSummaryState {
     last_rendered: Option<String>,
     last_final_rendered: Option<String>,
     last_emitted_at: Option<std::time::Instant>,
+    last_rss_emitted_at: Option<std::time::Instant>,
 }
 
 #[cfg(not(test))]
@@ -527,12 +534,12 @@ fn install_cli_event_streams(app: &tauri::AppHandle, config: CliEventConfig) {
 
             let rendered = render_progress_summary(&guard);
             let now = std::time::Instant::now();
-            let force_emit = guard.crawl_status.as_ref().map_or(false, |status| {
+            let force_emit = guard.crawl_status.as_ref().is_some_and(|status| {
                 matches!(status.phase.as_str(), "complete" | "cancelled" | "error")
             });
             let enough_time = guard
                 .last_emitted_at
-                .map_or(true, |last| now.duration_since(last) >= interval);
+                .is_none_or(|last| now.duration_since(last) >= interval);
             let changed = guard.last_rendered.as_ref() != Some(&rendered);
 
             if force_emit {
@@ -547,6 +554,18 @@ fn install_cli_event_streams(app: &tauri::AppHandle, config: CliEventConfig) {
                 eprintln!("[summary] {rendered}");
                 guard.last_rendered = Some(rendered);
                 guard.last_emitted_at = Some(now);
+            }
+
+            if let Some(metrics) = &guard.resource_metrics {
+                let rss_enough_time = guard
+                    .last_rss_emitted_at
+                    .is_none_or(|last| now.duration_since(last).as_secs() >= 15);
+
+                if rss_enough_time {
+                    let rss_mb = metrics.process_memory_bytes as f64 / 1_048_576.0;
+                    eprintln!("[telemetry:rss] Memory RSS: {:.1} MB", rss_mb);
+                    guard.last_rss_emitted_at = Some(now);
+                }
             }
         });
     }
@@ -593,13 +612,37 @@ fn render_progress_summary(state: &CliProgressSummaryState) -> String {
         .and_then(|snapshot| snapshot.current_node_host.as_deref())
         .map(shorten_host_for_summary)
         .unwrap_or_else(|| "-".to_string());
+    let download_host_cache_hits = metrics
+        .map(|snapshot| snapshot.download_host_cache_hits)
+        .unwrap_or(0);
+    let download_probe_promotion_hits = metrics
+        .map(|snapshot| snapshot.download_probe_promotion_hits)
+        .unwrap_or(0);
+    let download_low_speed_aborts = metrics
+        .map(|snapshot| snapshot.download_low_speed_aborts)
+        .unwrap_or(0);
+    let download_probe_quarantine_hits = metrics
+        .map(|snapshot| snapshot.download_probe_quarantine_hits)
+        .unwrap_or(0);
+    let download_probe_candidate_exhaustions = metrics
+        .map(|snapshot| snapshot.download_probe_candidate_exhaustions)
+        .unwrap_or(0);
+    let qilin_fresh_redirect_candidates = metrics
+        .map(|snapshot| snapshot.qilin_fresh_redirect_candidates)
+        .unwrap_or(0);
+    let qilin_stale_host_only_candidates = metrics
+        .map(|snapshot| snapshot.qilin_stale_host_only_candidates)
+        .unwrap_or(0);
+    let qilin_degraded_stage_d_activations = metrics
+        .map(|snapshot| snapshot.qilin_degraded_stage_d_activations)
+        .unwrap_or(0);
     let eta = crawl
         .and_then(|status| status.eta_seconds)
         .map(|seconds| format!("{seconds}s"))
         .unwrap_or_else(|| "-".to_string());
 
     let mut summary = format!(
-        "phase={phase} progress={progress:.1}% seen={visited} processed={processed} queue={queued} workers={active_workers}/{worker_target} delta={delta} node={node} circuits={active_circuits} failovers={failovers} 429/503={throttles} timeouts={timeouts} eta={eta}"
+        "phase={phase} progress={progress:.1}% seen={visited} processed={processed} queue={queued} workers={active_workers}/{worker_target} delta={delta} node={node} circuits={active_circuits} failovers={failovers} 429/503={throttles} timeouts={timeouts} dl_transport={download_host_cache_hits}/{download_probe_promotion_hits}/{download_low_speed_aborts} probe_admission={download_probe_quarantine_hits}/{download_probe_candidate_exhaustions} qilin_discovery=fresh:{qilin_fresh_redirect_candidates} stale:{qilin_stale_host_only_candidates} degraded:{qilin_degraded_stage_d_activations} eta={eta}"
     );
 
     if let Some(batch_progress) = batch {
@@ -618,12 +661,9 @@ fn render_progress_summary(state: &CliProgressSummaryState) -> String {
             .map(format_summary_mebibytes)
             .unwrap_or_else(|| "-".to_string());
         summary.push_str(&format!(
-            " single={} speed={:.2}MB/s file={}",
-            format!(
-                "{}/{}",
-                format_summary_mebibytes(download_progress.bytes_downloaded),
-                total
-            ),
+            " single={}/{} speed={:.2}MB/s file={}",
+            format_summary_mebibytes(download_progress.bytes_downloaded),
+            total,
             download_progress.speed_bps as f64 / 1_048_576.0,
             trim_summary_path(&download_progress.path, 48),
         ));
@@ -684,9 +724,33 @@ fn render_final_progress_summary(state: &CliProgressSummaryState) -> String {
     let outlier_isolations = metrics
         .map(|snapshot| snapshot.outlier_isolations)
         .unwrap_or(0);
+    let download_host_cache_hits = metrics
+        .map(|snapshot| snapshot.download_host_cache_hits)
+        .unwrap_or(0);
+    let download_probe_promotion_hits = metrics
+        .map(|snapshot| snapshot.download_probe_promotion_hits)
+        .unwrap_or(0);
+    let download_low_speed_aborts = metrics
+        .map(|snapshot| snapshot.download_low_speed_aborts)
+        .unwrap_or(0);
+    let download_probe_quarantine_hits = metrics
+        .map(|snapshot| snapshot.download_probe_quarantine_hits)
+        .unwrap_or(0);
+    let download_probe_candidate_exhaustions = metrics
+        .map(|snapshot| snapshot.download_probe_candidate_exhaustions)
+        .unwrap_or(0);
+    let qilin_fresh_redirect_candidates = metrics
+        .map(|snapshot| snapshot.qilin_fresh_redirect_candidates)
+        .unwrap_or(0);
+    let qilin_stale_host_only_candidates = metrics
+        .map(|snapshot| snapshot.qilin_stale_host_only_candidates)
+        .unwrap_or(0);
+    let qilin_degraded_stage_d_activations = metrics
+        .map(|snapshot| snapshot.qilin_degraded_stage_d_activations)
+        .unwrap_or(0);
 
     let mut summary = format!(
-        "phase={phase} seen={visited} processed={processed} queue={queued} workers={active_workers}/{worker_target} node={node} req={requests}/{successful_requests}/{failed_requests} subtree={subtree_reroutes}/{subtree_quarantine_hits}/{off_winner_child_requests} tail={winner_host}/{slowest_circuit}/{late_throttles}/{outlier_isolations}"
+        "phase={phase} seen={visited} processed={processed} queue={queued} workers={active_workers}/{worker_target} node={node} req={requests}/{successful_requests}/{failed_requests} subtree={subtree_reroutes}/{subtree_quarantine_hits}/{off_winner_child_requests} dl_transport={download_host_cache_hits}/{download_probe_promotion_hits}/{download_low_speed_aborts} probe_admission={download_probe_quarantine_hits}/{download_probe_candidate_exhaustions} qilin_discovery=fresh:{qilin_fresh_redirect_candidates} stale:{qilin_stale_host_only_candidates} degraded:{qilin_degraded_stage_d_activations} tail={winner_host}/{slowest_circuit}/{late_throttles}/{outlier_isolations}"
     );
     if let Some(batch_progress) = batch {
         summary.push_str(&format!(
@@ -703,12 +767,9 @@ fn render_final_progress_summary(state: &CliProgressSummaryState) -> String {
             .map(format_summary_mebibytes)
             .unwrap_or_else(|| "-".to_string());
         summary.push_str(&format!(
-            " single={} speed={:.2}MB/s",
-            format!(
-                "{}/{}",
-                format_summary_mebibytes(download_progress.bytes_downloaded),
-                total
-            ),
+            " single={}/{} speed={:.2}MB/s",
+            format_summary_mebibytes(download_progress.bytes_downloaded),
+            total,
             download_progress.speed_bps as f64 / 1_048_576.0,
         ));
     }
@@ -1108,7 +1169,6 @@ mod tests {
             url: "http://example.onion".to_string(),
             output_dir: "/tmp/out".to_string(),
             circuits: None,
-            daemons: None,
             download: false,
             resume: false,
             resume_index: None,
@@ -1117,6 +1177,8 @@ mod tests {
             no_listing: false,
             no_sizes: false,
             no_stealth_ramp: false,
+            force_clearnet: false,
+            parallel_download: false,
         };
         let options = args.to_options();
         assert!(options.listing);
@@ -1159,6 +1221,14 @@ mod tests {
                 node_failovers: 1,
                 throttle_count: 2,
                 timeout_count: 3,
+                download_host_cache_hits: 5,
+                download_probe_promotion_hits: 2,
+                download_low_speed_aborts: 1,
+                download_probe_quarantine_hits: 4,
+                download_probe_candidate_exhaustions: 1,
+                qilin_fresh_redirect_candidates: 2,
+                qilin_stale_host_only_candidates: 17,
+                qilin_degraded_stage_d_activations: 1,
                 ..Default::default()
             }),
             batch_progress: Some(crate::telemetry_bridge::BridgeBatchProgress {
@@ -1176,6 +1246,7 @@ mod tests {
             last_rendered: None,
             last_final_rendered: None,
             last_emitted_at: None,
+            last_rss_emitted_at: None,
         };
 
         let rendered = render_progress_summary(&state);
@@ -1185,6 +1256,9 @@ mod tests {
         assert!(rendered.contains("failovers=1"));
         assert!(rendered.contains("429/503=2"));
         assert!(rendered.contains("timeouts=3"));
+        assert!(rendered.contains("dl_transport=5/2/1"));
+        assert!(rendered.contains("probe_admission=4/1"));
+        assert!(rendered.contains("qilin_discovery=fresh:2 stale:17 degraded:1"));
         assert!(rendered.contains("eta=90s"));
         assert!(rendered.contains("download=25/100 failed=1"));
         assert!(rendered.contains("speed=2.75MB/s"));
@@ -1225,6 +1299,14 @@ mod tests {
                 off_winner_child_requests: 0,
                 late_throttles: 2,
                 outlier_isolations: 1,
+                download_host_cache_hits: 9,
+                download_probe_promotion_hits: 4,
+                download_low_speed_aborts: 2,
+                download_probe_quarantine_hits: 7,
+                download_probe_candidate_exhaustions: 3,
+                qilin_fresh_redirect_candidates: 0,
+                qilin_stale_host_only_candidates: 23,
+                qilin_degraded_stage_d_activations: 1,
                 ..Default::default()
             }),
             batch_progress: Some(crate::telemetry_bridge::BridgeBatchProgress {
@@ -1242,6 +1324,7 @@ mod tests {
             last_rendered: None,
             last_final_rendered: None,
             last_emitted_at: None,
+            last_rss_emitted_at: None,
         };
 
         let rendered = render_final_progress_summary(&state);
@@ -1249,6 +1332,9 @@ mod tests {
         assert!(rendered.contains("phase=complete"));
         assert!(rendered.contains("req=87/79/8"));
         assert!(rendered.contains("subtree=3/2/0"));
+        assert!(rendered.contains("dl_transport=9/4/2"));
+        assert!(rendered.contains("probe_admission=7/3"));
+        assert!(rendered.contains("qilin_discovery=fresh:0 stale:23 degraded:1"));
         assert!(rendered.contains("tail=winnerqualit...n5.onion/c7:8450ms/2/1"));
         assert!(rendered.contains("download=250/2533 failed=3 speed=3.18MB/s bytes=194.0MB"));
     }
@@ -1276,6 +1362,7 @@ mod tests {
             last_rendered: None,
             last_final_rendered: None,
             last_emitted_at: None,
+            last_rss_emitted_at: None,
         };
 
         let rendered = render_progress_summary(&state);

@@ -93,12 +93,12 @@ fn main() -> anyhow::Result<()> {
                 sizes: true,
                 download: false,
                 circuits: Some(5),
-                daemons: Some(5),
                 agnostic_state: false,
                 resume: false,
                 resume_index: None,
             mega_password: None,
-                stealth_ramp: true,
+                stealth_ramp: true, parallel_download: false,
+            force_clearnet: false,
             };
             let frontier = Arc::new(CrawlerFrontier::new(
                 None,

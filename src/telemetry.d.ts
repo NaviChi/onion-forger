@@ -174,6 +174,30 @@ export interface IResourceMetricsFrame {
 
     /** ResourceMetricsFrame outlierIsolations */
     outlierIsolations?: (number|null);
+
+    /** ResourceMetricsFrame downloadHostCacheHits */
+    downloadHostCacheHits?: (number|null);
+
+    /** ResourceMetricsFrame downloadProbePromotionHits */
+    downloadProbePromotionHits?: (number|null);
+
+    /** ResourceMetricsFrame downloadLowSpeedAborts */
+    downloadLowSpeedAborts?: (number|null);
+
+    /** ResourceMetricsFrame downloadProbeQuarantineHits */
+    downloadProbeQuarantineHits?: (number|null);
+
+    /** ResourceMetricsFrame downloadProbeCandidateExhaustions */
+    downloadProbeCandidateExhaustions?: (number|null);
+
+    /** ResourceMetricsFrame qilinFreshRedirectCandidates */
+    qilinFreshRedirectCandidates?: (number|null);
+
+    /** ResourceMetricsFrame qilinStaleHostOnlyCandidates */
+    qilinStaleHostOnlyCandidates?: (number|null);
+
+    /** ResourceMetricsFrame qilinDegradedStageDActivations */
+    qilinDegradedStageDActivations?: (number|null);
 }
 
 /** Represents a ResourceMetricsFrame. */
@@ -247,6 +271,30 @@ export class ResourceMetricsFrame implements IResourceMetricsFrame {
 
     /** ResourceMetricsFrame outlierIsolations. */
     public outlierIsolations: number;
+
+    /** ResourceMetricsFrame downloadHostCacheHits. */
+    public downloadHostCacheHits: number;
+
+    /** ResourceMetricsFrame downloadProbePromotionHits. */
+    public downloadProbePromotionHits: number;
+
+    /** ResourceMetricsFrame downloadLowSpeedAborts. */
+    public downloadLowSpeedAborts: number;
+
+    /** ResourceMetricsFrame downloadProbeQuarantineHits. */
+    public downloadProbeQuarantineHits: number;
+
+    /** ResourceMetricsFrame downloadProbeCandidateExhaustions. */
+    public downloadProbeCandidateExhaustions: number;
+
+    /** ResourceMetricsFrame qilinFreshRedirectCandidates. */
+    public qilinFreshRedirectCandidates: number;
+
+    /** ResourceMetricsFrame qilinStaleHostOnlyCandidates. */
+    public qilinStaleHostOnlyCandidates: number;
+
+    /** ResourceMetricsFrame qilinDegradedStageDActivations. */
+    public qilinDegradedStageDActivations: number;
 
     /**
      * Creates a new ResourceMetricsFrame instance using the specified properties.
@@ -491,6 +539,9 @@ export interface IBatchProgressFrame {
 
     /** BatchProgressFrame activeCircuits */
     activeCircuits?: (number|null);
+
+    /** BatchProgressFrame speedMbps */
+    speedMbps?: (number|null);
 }
 
 /** Represents a BatchProgressFrame. */
@@ -519,6 +570,9 @@ export class BatchProgressFrame implements IBatchProgressFrame {
 
     /** BatchProgressFrame activeCircuits. */
     public activeCircuits?: (number|null);
+
+    /** BatchProgressFrame speedMbps. */
+    public speedMbps: number;
 
     /**
      * Creates a new BatchProgressFrame instance using the specified properties.
