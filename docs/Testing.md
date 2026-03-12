@@ -1,3 +1,16 @@
+## Phase 129D: Batch Progress Speed Telemetry Validation
+- **Date**: 2026-03-12
+- **Action**: Restored `speed_mbps` to the batch-progress protobuf frame, wired it through the Rust telemetry bridge, and regenerated the tracked frontend protobuf bindings.
+- **Validation Commands**:
+  - `./node_modules/.bin/pbjs -t static-module -w es6 -o src/telemetry.js src/telemetry.proto`
+  - `./node_modules/.bin/pbts -o src/telemetry.d.ts src/telemetry.js`
+  - `npm run build`
+  - `CARGO_TARGET_DIR=/tmp/crawli-telemetry-check cargo check --manifest-path src-tauri/Cargo.toml`
+- **Result**:
+  - The tracked frontend bindings `src/telemetry.js` and `src/telemetry.d.ts` were regenerated successfully from the updated schema.
+  - Frontend production build passed after the schema/binding update; Vite only emitted the pre-existing `@protobufjs/inquire` eval warning.
+  - Clean Rust compile validation passed in `3m29s`, confirming the backend telemetry structs and bridge remain in sync with the regenerated frontend decoder.
+
 ## Phase 129C: Windows Portable Reliability + Windows-Only Release Validation
 - **Date**: 2026-03-12
 - **Action**: Validated the Windows-portable fixes for unbuffered file I/O and privileged NT preallocation, then prepared a Windows-only `0.6.2` release path that pins automatic tag creation to the requested ref.

@@ -57,6 +57,7 @@ message BatchProgressFrame {
     string current_file = 4;
     uint64 downloaded_bytes = 5;
     optional uint32 active_circuits = 6;
+    double speed_mbps = 7;
 }
 
 message DownloadStatusFrame {

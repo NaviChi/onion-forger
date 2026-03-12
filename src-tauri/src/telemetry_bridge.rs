@@ -280,6 +280,7 @@ pub(crate) fn publish_batch_progress(app: &AppHandle, progress: BridgeBatchProgr
             current_file: progress.current_file.clone(),
             downloaded_bytes: progress.downloaded_bytes,
             active_circuits: progress.active_circuits.map(|value| value as u32),
+            speed_mbps: progress.speed_mbps,
         },
     );
 

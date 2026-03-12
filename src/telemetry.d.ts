@@ -189,6 +189,15 @@ export interface IResourceMetricsFrame {
 
     /** ResourceMetricsFrame downloadProbeCandidateExhaustions */
     downloadProbeCandidateExhaustions?: (number|null);
+
+    /** ResourceMetricsFrame qilinFreshRedirectCandidates */
+    qilinFreshRedirectCandidates?: (number|null);
+
+    /** ResourceMetricsFrame qilinStaleHostOnlyCandidates */
+    qilinStaleHostOnlyCandidates?: (number|null);
+
+    /** ResourceMetricsFrame qilinDegradedStageDActivations */
+    qilinDegradedStageDActivations?: (number|null);
 }
 
 /** Represents a ResourceMetricsFrame. */
@@ -277,6 +286,15 @@ export class ResourceMetricsFrame implements IResourceMetricsFrame {
 
     /** ResourceMetricsFrame downloadProbeCandidateExhaustions. */
     public downloadProbeCandidateExhaustions: number;
+
+    /** ResourceMetricsFrame qilinFreshRedirectCandidates. */
+    public qilinFreshRedirectCandidates: number;
+
+    /** ResourceMetricsFrame qilinStaleHostOnlyCandidates. */
+    public qilinStaleHostOnlyCandidates: number;
+
+    /** ResourceMetricsFrame qilinDegradedStageDActivations. */
+    public qilinDegradedStageDActivations: number;
 
     /**
      * Creates a new ResourceMetricsFrame instance using the specified properties.
@@ -521,6 +539,9 @@ export interface IBatchProgressFrame {
 
     /** BatchProgressFrame activeCircuits */
     activeCircuits?: (number|null);
+
+    /** BatchProgressFrame speedMbps */
+    speedMbps?: (number|null);
 }
 
 /** Represents a BatchProgressFrame. */
@@ -549,6 +570,9 @@ export class BatchProgressFrame implements IBatchProgressFrame {
 
     /** BatchProgressFrame activeCircuits. */
     public activeCircuits?: (number|null);
+
+    /** BatchProgressFrame speedMbps. */
+    public speedMbps: number;
 
     /**
      * Creates a new BatchProgressFrame instance using the specified properties.

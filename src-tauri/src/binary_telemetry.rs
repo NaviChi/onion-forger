@@ -132,6 +132,8 @@ pub struct BatchProgressFrame {
     pub downloaded_bytes: u64,
     #[prost(uint32, optional, tag = "6")]
     pub active_circuits: Option<u32>,
+    #[prost(double, tag = "7")]
+    pub speed_mbps: f64,
 }
 
 #[derive(Clone, PartialEq, Message)]

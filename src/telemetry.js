@@ -314,6 +314,9 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
      * @property {number|null} [downloadLowSpeedAborts] ResourceMetricsFrame downloadLowSpeedAborts
      * @property {number|null} [downloadProbeQuarantineHits] ResourceMetricsFrame downloadProbeQuarantineHits
      * @property {number|null} [downloadProbeCandidateExhaustions] ResourceMetricsFrame downloadProbeCandidateExhaustions
+     * @property {number|null} [qilinFreshRedirectCandidates] ResourceMetricsFrame qilinFreshRedirectCandidates
+     * @property {number|null} [qilinStaleHostOnlyCandidates] ResourceMetricsFrame qilinStaleHostOnlyCandidates
+     * @property {number|null} [qilinDegradedStageDActivations] ResourceMetricsFrame qilinDegradedStageDActivations
      */
 
     /**
@@ -539,6 +542,30 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
      */
     ResourceMetricsFrame.prototype.downloadProbeCandidateExhaustions = 0;
 
+    /**
+     * ResourceMetricsFrame qilinFreshRedirectCandidates.
+     * @member {number} qilinFreshRedirectCandidates
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.qilinFreshRedirectCandidates = 0;
+
+    /**
+     * ResourceMetricsFrame qilinStaleHostOnlyCandidates.
+     * @member {number} qilinStaleHostOnlyCandidates
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.qilinStaleHostOnlyCandidates = 0;
+
+    /**
+     * ResourceMetricsFrame qilinDegradedStageDActivations.
+     * @member {number} qilinDegradedStageDActivations
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.qilinDegradedStageDActivations = 0;
+
     // OneOf field names bound to virtual getters and setters
     let $oneOfFields;
 
@@ -636,6 +663,12 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             writer.uint32(/* id 25, wireType 0 =*/200).uint32(message.downloadProbeQuarantineHits);
         if (message.downloadProbeCandidateExhaustions != null && Object.hasOwnProperty.call(message, "downloadProbeCandidateExhaustions"))
             writer.uint32(/* id 26, wireType 0 =*/208).uint32(message.downloadProbeCandidateExhaustions);
+        if (message.qilinFreshRedirectCandidates != null && Object.hasOwnProperty.call(message, "qilinFreshRedirectCandidates"))
+            writer.uint32(/* id 27, wireType 0 =*/216).uint32(message.qilinFreshRedirectCandidates);
+        if (message.qilinStaleHostOnlyCandidates != null && Object.hasOwnProperty.call(message, "qilinStaleHostOnlyCandidates"))
+            writer.uint32(/* id 28, wireType 0 =*/224).uint32(message.qilinStaleHostOnlyCandidates);
+        if (message.qilinDegradedStageDActivations != null && Object.hasOwnProperty.call(message, "qilinDegradedStageDActivations"))
+            writer.uint32(/* id 29, wireType 0 =*/232).uint32(message.qilinDegradedStageDActivations);
         return writer;
     };
 
@@ -776,6 +809,18 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
                     message.downloadProbeCandidateExhaustions = reader.uint32();
                     break;
                 }
+            case 27: {
+                    message.qilinFreshRedirectCandidates = reader.uint32();
+                    break;
+                }
+            case 28: {
+                    message.qilinStaleHostOnlyCandidates = reader.uint32();
+                    break;
+                }
+            case 29: {
+                    message.qilinDegradedStageDActivations = reader.uint32();
+                    break;
+                }
             default:
                 reader.skipType(tag & 7);
                 break;
@@ -896,6 +941,15 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
         if (message.downloadProbeCandidateExhaustions != null && message.hasOwnProperty("downloadProbeCandidateExhaustions"))
             if (!$util.isInteger(message.downloadProbeCandidateExhaustions))
                 return "downloadProbeCandidateExhaustions: integer expected";
+        if (message.qilinFreshRedirectCandidates != null && message.hasOwnProperty("qilinFreshRedirectCandidates"))
+            if (!$util.isInteger(message.qilinFreshRedirectCandidates))
+                return "qilinFreshRedirectCandidates: integer expected";
+        if (message.qilinStaleHostOnlyCandidates != null && message.hasOwnProperty("qilinStaleHostOnlyCandidates"))
+            if (!$util.isInteger(message.qilinStaleHostOnlyCandidates))
+                return "qilinStaleHostOnlyCandidates: integer expected";
+        if (message.qilinDegradedStageDActivations != null && message.hasOwnProperty("qilinDegradedStageDActivations"))
+            if (!$util.isInteger(message.qilinDegradedStageDActivations))
+                return "qilinDegradedStageDActivations: integer expected";
         return null;
     };
 
@@ -984,6 +1038,12 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             message.downloadProbeQuarantineHits = object.downloadProbeQuarantineHits >>> 0;
         if (object.downloadProbeCandidateExhaustions != null)
             message.downloadProbeCandidateExhaustions = object.downloadProbeCandidateExhaustions >>> 0;
+        if (object.qilinFreshRedirectCandidates != null)
+            message.qilinFreshRedirectCandidates = object.qilinFreshRedirectCandidates >>> 0;
+        if (object.qilinStaleHostOnlyCandidates != null)
+            message.qilinStaleHostOnlyCandidates = object.qilinStaleHostOnlyCandidates >>> 0;
+        if (object.qilinDegradedStageDActivations != null)
+            message.qilinDegradedStageDActivations = object.qilinDegradedStageDActivations >>> 0;
         return message;
     };
 
@@ -1036,6 +1096,9 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             object.downloadLowSpeedAborts = 0;
             object.downloadProbeQuarantineHits = 0;
             object.downloadProbeCandidateExhaustions = 0;
+            object.qilinFreshRedirectCandidates = 0;
+            object.qilinStaleHostOnlyCandidates = 0;
+            object.qilinDegradedStageDActivations = 0;
         }
         if (message.processCpuPercent != null && message.hasOwnProperty("processCpuPercent"))
             object.processCpuPercent = options.json && !isFinite(message.processCpuPercent) ? String(message.processCpuPercent) : message.processCpuPercent;
@@ -1107,6 +1170,12 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             object.downloadProbeQuarantineHits = message.downloadProbeQuarantineHits;
         if (message.downloadProbeCandidateExhaustions != null && message.hasOwnProperty("downloadProbeCandidateExhaustions"))
             object.downloadProbeCandidateExhaustions = message.downloadProbeCandidateExhaustions;
+        if (message.qilinFreshRedirectCandidates != null && message.hasOwnProperty("qilinFreshRedirectCandidates"))
+            object.qilinFreshRedirectCandidates = message.qilinFreshRedirectCandidates;
+        if (message.qilinStaleHostOnlyCandidates != null && message.hasOwnProperty("qilinStaleHostOnlyCandidates"))
+            object.qilinStaleHostOnlyCandidates = message.qilinStaleHostOnlyCandidates;
+        if (message.qilinDegradedStageDActivations != null && message.hasOwnProperty("qilinDegradedStageDActivations"))
+            object.qilinDegradedStageDActivations = message.qilinDegradedStageDActivations;
         return object;
     };
 
@@ -1621,6 +1690,7 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
      * @property {string|null} [currentFile] BatchProgressFrame currentFile
      * @property {number|Long|null} [downloadedBytes] BatchProgressFrame downloadedBytes
      * @property {number|null} [activeCircuits] BatchProgressFrame activeCircuits
+     * @property {number|null} [speedMbps] BatchProgressFrame speedMbps
      */
 
     /**
@@ -1686,6 +1756,14 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
      */
     BatchProgressFrame.prototype.activeCircuits = null;
 
+    /**
+     * BatchProgressFrame speedMbps.
+     * @member {number} speedMbps
+     * @memberof BatchProgressFrame
+     * @instance
+     */
+    BatchProgressFrame.prototype.speedMbps = 0;
+
     // OneOf field names bound to virtual getters and setters
     let $oneOfFields;
 
@@ -1731,6 +1809,8 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
             writer.uint32(/* id 5, wireType 0 =*/40).uint64(message.downloadedBytes);
         if (message.activeCircuits != null && Object.hasOwnProperty.call(message, "activeCircuits"))
             writer.uint32(/* id 6, wireType 0 =*/48).uint32(message.activeCircuits);
+        if (message.speedMbps != null && Object.hasOwnProperty.call(message, "speedMbps"))
+            writer.uint32(/* id 7, wireType 1 =*/57).double(message.speedMbps);
         return writer;
     };
 
@@ -1791,6 +1871,10 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
                     message.activeCircuits = reader.uint32();
                     break;
                 }
+            case 7: {
+                    message.speedMbps = reader.double();
+                    break;
+                }
             default:
                 reader.skipType(tag & 7);
                 break;
@@ -1847,6 +1931,9 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
             if (!$util.isInteger(message.activeCircuits))
                 return "activeCircuits: integer expected";
         }
+        if (message.speedMbps != null && message.hasOwnProperty("speedMbps"))
+            if (typeof message.speedMbps !== "number")
+                return "speedMbps: number expected";
         return null;
     };
 
@@ -1902,6 +1989,8 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
                 message.downloadedBytes = new $util.LongBits(object.downloadedBytes.low >>> 0, object.downloadedBytes.high >>> 0).toNumber(true);
         if (object.activeCircuits != null)
             message.activeCircuits = object.activeCircuits >>> 0;
+        if (object.speedMbps != null)
+            message.speedMbps = Number(object.speedMbps);
         return message;
     };
 
@@ -1940,6 +2029,7 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
                 object.downloadedBytes = options.longs === String ? long.toString() : options.longs === Number ? long.toNumber() : long;
             } else
                 object.downloadedBytes = options.longs === String ? "0" : 0;
+            object.speedMbps = 0;
         }
         if (message.completed != null && message.hasOwnProperty("completed"))
             if (typeof message.completed === "number")
@@ -1968,6 +2058,8 @@ export const BatchProgressFrame = $root.BatchProgressFrame = (() => {
             if (options.oneofs)
                 object._activeCircuits = "activeCircuits";
         }
+        if (message.speedMbps != null && message.hasOwnProperty("speedMbps"))
+            object.speedMbps = options.json && !isFinite(message.speedMbps) ? String(message.speedMbps) : message.speedMbps;
         return object;
     };
 
