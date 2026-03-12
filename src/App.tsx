@@ -790,6 +790,11 @@ function App() {
   const [torStatus, setTorStatus] = useState<TorStatus | null>(null);
 
   const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadProgressEvent>>({});
+  // Phase 128B: Throttled download progress to prevent GUI crash during large batch downloads.
+  // Per-file progress is stored in a mutable ref and flushed to React state at most every 500ms.
+  const downloadProgressBufferRef = useRef<Record<string, DownloadProgressEvent>>({});
+  const downloadProgressFlushPending = useRef(false);
+  const downloadProgressLastFlush = useRef(0);
   const [crawlStatus, setCrawlStatus] = useState<CrawlStatusEvent>(INITIAL_CRAWL_STATUS);
   const [downloadBatchStatus, setDownloadBatchStatus] = useState<DownloadBatchStatus>(INITIAL_DOWNLOAD_BATCH_STATUS);
   const [resourceMetrics, setResourceMetrics] = useState<ResourceMetricsSnapshot>(INITIAL_RESOURCE_METRICS);
@@ -1405,11 +1410,17 @@ function App() {
           active_circuits: activeCircuitsValue,
         };
 
-        setDownloadProgress((prev) => ({
-          ...prev,
-          [displayPath]: normalizedPayload,
-        }));
-
+        // Phase 128B: Buffer per-file progress in ref (zero re-renders), flush to state every 500ms
+        downloadProgressBufferRef.current[displayPath] = normalizedPayload;
+        const progressNow = Date.now();
+        if (!downloadProgressFlushPending.current && progressNow - downloadProgressLastFlush.current > 500) {
+          downloadProgressFlushPending.current = true;
+          requestAnimationFrame(() => {
+            setDownloadProgress({ ...downloadProgressBufferRef.current });
+            downloadProgressLastFlush.current = Date.now();
+            downloadProgressFlushPending.current = false;
+          });
+        }
         const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
         const nextBytes = Math.max(previousBytes, bytesDownloaded);
         if (nextBytes > previousBytes) {
@@ -1637,20 +1648,34 @@ function App() {
           const displayPath = toDisplayPath(event.payload.path, roots);
           setLogs((l) => [...l.slice(-399), `[✓] Download finished: ${displayPath} (SHA256: ${event.payload.hash})`]);
           showToast("success", "Download Finished", `File saved and verified (${event.payload.hash})`);
-          setDownloadProgress((prev) => {
-            const p = prev[displayPath];
-            if (!p) return prev;
-            const completedBytes = p.total_bytes || p.bytes_downloaded;
-            const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
-            if (completedBytes > previousBytes) {
-              perFileDownloadedBytesRef.current[displayPath] = completedBytes;
-              aggregateDownloadBytesRef.current += completedBytes - previousBytes;
-            }
-            return {
-              ...prev,
-              [displayPath]: { ...p, bytes_downloaded: completedBytes, speed_bps: 0 },
-            };
-          });
+
+          // Phase 128B: Mark completed in buffer + aggregate tracking
+          const existingProgress = downloadProgressBufferRef.current[displayPath];
+          const completedBytes = existingProgress?.total_bytes || existingProgress?.bytes_downloaded || 0;
+          downloadProgressBufferRef.current[displayPath] = {
+            path: displayPath,
+            bytes_downloaded: completedBytes,
+            total_bytes: completedBytes > 0 ? completedBytes : null,
+            speed_bps: 0,
+          };
+
+          const previousBytes = perFileDownloadedBytesRef.current[displayPath] || 0;
+          if (completedBytes > previousBytes) {
+            perFileDownloadedBytesRef.current[displayPath] = completedBytes;
+            aggregateDownloadBytesRef.current += completedBytes - previousBytes;
+          }
+
+          // Throttled flush to React state
+          const now2 = Date.now();
+          if (!downloadProgressFlushPending.current && now2 - downloadProgressLastFlush.current > 500) {
+            downloadProgressFlushPending.current = true;
+            requestAnimationFrame(() => {
+              setDownloadProgress({ ...downloadProgressBufferRef.current });
+              downloadProgressLastFlush.current = Date.now();
+              downloadProgressFlushPending.current = false;
+            });
+          }
+
           setDownloadBatchStatus((prev) => ({
             ...prev,
             downloadedBytes: Math.max(prev.downloadedBytes, aggregateDownloadBytesRef.current),
@@ -1772,6 +1797,7 @@ function App() {
     setCrawlStartTime(Date.now());
     setCrawlElapsed(0);
     setDownloadProgress({});
+    downloadProgressBufferRef.current = {};
     setDownloadBatchStatus(INITIAL_DOWNLOAD_BATCH_STATUS);
     setLastCrawlResult(null);
     setDownloadResumePlan(null);

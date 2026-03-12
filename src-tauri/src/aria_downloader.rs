@@ -4506,6 +4506,18 @@ pub async fn start_download(
             },
         );
 
+        // Phase 129: Log mirror striping status
+        if !entry.alternate_urls.is_empty() {
+            let mirror_count = entry.alternate_urls.len().min(3) + 1;
+            let _ = app.emit(
+                "log",
+                format!(
+                    "[+] Phase 129: Mirror Striping ACTIVE — {} circuits across {} mirrors (primary + {} alternates)",
+                    scaled_circuits, mirror_count, mirror_count - 1
+                ),
+            );
+        }
+
         // ===== TOURNAMENT-STYLE CIRCUIT RACING =====
         let promoted_count = Arc::new(AtomicUsize::new(0));
 
@@ -4810,7 +4822,20 @@ pub async fn start_download(
         {
             let task_tx = tx.clone();
             let task_app = app.clone();
-            let task_url = entry.url.clone();
+            // Phase 129: IDM-style Mirror Striping — assign different mirror URLs
+            // to different circuits so segments download from independent mirrors
+            // simultaneously, stacking bandwidth across multiple Tor relay paths.
+            let task_url = if !entry.alternate_urls.is_empty() {
+                let mirror_pool_size = entry.alternate_urls.len().min(3) + 1; // primary + up to 3 mirrors
+                let mirror_idx = circuit_rank % mirror_pool_size;
+                if mirror_idx == 0 {
+                    entry.url.clone()
+                } else {
+                    entry.alternate_urls[mirror_idx - 1].clone()
+                }
+            } else {
+                entry.url.clone()
+            };
             let task_path = temp_target.clone();
             let task_control = control.clone();
             let task_running = Arc::clone(&run_flag);
@@ -4998,10 +5023,32 @@ pub async fn start_download(
                             .map(|i| (scan_start + i) % task_total_pieces)
                             .find(|&i| !task_piece_flags[i].load(Ordering::Relaxed));
                         let piece_idx = match found {
-                            Some(idx) => idx,
-                            None => return TaskOutcome::Completed,
+                            Some(idx) => {
+                                // Register ownership for kill-after-steal
+                                stolen_from = task_piece_owner[idx].load(Ordering::Relaxed);
+                                idx
+                            }
+                            None => {
+                                // Phase 129: Dynamic Bisection — if no unstarted pieces remain,
+                                // find the slowest in-progress circuit and bisect its active piece.
+                                // This handles the IDM scenario where one segment stalls while all
+                                // others are complete.
+                                let bisect_target = (0..task_total_pieces)
+                                    .filter(|&i| {
+                                        !task_piece_flags[i].load(Ordering::Relaxed)
+                                            && task_piece_owner[i].load(Ordering::Relaxed) != usize::MAX
+                                            && task_piece_owner[i].load(Ordering::Relaxed) != circuit_id
+                                    })
+                                    .next();
+                                match bisect_target {
+                                    Some(idx) => {
+                                        stolen_from = task_piece_owner[idx].load(Ordering::Relaxed);
+                                        idx
+                                    }
+                                    None => break, // truly nothing left
+                                }
+                            }
                         };
-                        stolen_from = task_piece_owner[piece_idx].load(Ordering::Relaxed);
                         PieceSpan {
                             start_piece: piece_idx,
                             end_piece: piece_idx,

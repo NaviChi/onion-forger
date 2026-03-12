@@ -1,9 +1,19 @@
+## Phase 129: Parallel Download + IDM-Style Acceleration Release Validation
+- **Date**: 2026-03-12
+- **Action**: Validated the Phase 128/129 crawl/download pipeline changes and bumped all release metadata to `0.6.1` before the GitHub Windows portable release cut.
+- **Validation Commands**:
+  - `npm run build`
+  - `CARGO_TARGET_DIR=/tmp/crawli-release-check-061 cargo check --manifest-path src-tauri/Cargo.toml`
+- **Result**:
+  - Frontend production build passed on the `0.6.1` metadata set. Vite completed successfully and only emitted the existing `@protobufjs/inquire` eval warning.
+  - Clean Rust compile validation passed in `4m12s` against a fresh target directory, which confirms the `src-tauri/src/lib.rs` parallel-download changes and the `src-tauri/src/aria_downloader.rs` mirror-striping/dynamic-bisection changes compile cleanly together.
+
 ## Phase 127: GitHub Release Workflow + Portable Packaging Validation
 - **Date**: 2026-03-12
 - **Action**: Added a shared Windows portable packaging script and updated both release workflows to call the same script.
 - **Validation Commands**:
   - `ruby -e 'require "yaml"; [".github/workflows/release.yml", ".github/workflows/release-windows-portable.yml"].each { |p| YAML.safe_load(File.read(p), aliases: true); }; puts "workflow yaml parse ok"'`
-  - `pwsh -NoLogo -NoProfile -File packaging/windows/package-portable.ps1 -Tag v0.6.0`
+  - `pwsh -NoLogo -NoProfile -File packaging/windows/package-portable.ps1 -Tag v0.6.1`
 - **Result**:
   - Workflow YAML files parse successfully after the release edits.
   - `pwsh` is not installed in this macOS environment (`command not found`), so executable-level validation of `package-portable.ps1` must run on `windows-latest` CI or a Windows host.

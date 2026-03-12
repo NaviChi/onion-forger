@@ -1521,6 +1521,113 @@ async fn start_crawl(
     let mut final_instability_reasons = Vec::new();
     let mut retry_count_used = 0usize;
 
+    // Phase 128: True parallel download — polls VFS and downloads files DURING the crawl
+    let parallel_download_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let parallel_download_handle: Option<tokio::task::JoinHandle<()>> = if options.parallel_download && options.download {
+        let pd_vfs = vfs.clone();
+        let pd_app = app.clone();
+        let pd_output = output_root.clone();
+        let pd_target_dir = target_paths.target_dir.clone();
+        let pd_cancel = parallel_download_cancel.clone();
+        let pd_circuits = options.circuits.unwrap_or(8).max(1).min(6); // Moderate budget during crawl
+        let pd_is_onion = url_targets_onion(&url) && !options.force_clearnet;
+
+        app.emit(
+            "crawl_log",
+            "[PARALLEL] ⚡ Parallel download consumer armed. Will stream files during crawl.".to_string(),
+        )
+        .unwrap_or_default();
+
+        Some(tokio::spawn(async move {
+            use tauri::Emitter;
+            // Phase 128B: Reduced from 30s to 15s — Qilin entries appear within seconds
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let mut downloaded_paths = std::collections::HashSet::<String>::new();
+            let mut batch_round = 0u32;
+
+            while !pd_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let all_entries = match pd_vfs.iter_entries().await {
+                    Ok(e) => e,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                let mut new_files: Vec<adapters::FileEntry> = all_entries
+                    .into_iter()
+                    .filter(|e| {
+                        matches!(e.entry_type, adapters::EntryType::File)
+                            && !e.raw_url.is_empty()
+                            && (e.raw_url.starts_with("http://") || e.raw_url.starts_with("https://"))
+                            && !downloaded_paths.contains(&e.path)
+                    })
+                    .collect();
+
+                if new_files.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                    continue;
+                }
+
+                // Phase 129: IDM-style intelligent download scheduling — sort by size
+                // Small files first for fast completion + rapid progress feedback,
+                // then large files benefit from multi-segment download.
+                new_files.sort_by_key(|e| e.size_bytes.unwrap_or(u64::MAX));
+
+                batch_round += 1;
+                let batch_size = new_files.len();
+                for e in &new_files {
+                    downloaded_paths.insert(e.path.clone());
+                }
+
+                let _ = pd_app.emit(
+                    "crawl_log",
+                    format!(
+                        "[PARALLEL] ⚡ Download batch #{}: {} new files (cumulative: {})",
+                        batch_round, batch_size, downloaded_paths.len()
+                    ),
+                );
+
+                // Repin Qilin URLs to preferred storage hosts if route summary exists
+                let _ = maybe_repin_qilin_entries_from_context(
+                    &mut new_files,
+                    Some(pd_target_dir.as_path()),
+                    &pd_app,
+                );
+
+                match scaffold_download(
+                    &new_files,
+                    &pd_output,
+                    &pd_app,
+                    pd_circuits,
+                    pd_is_onion,
+                )
+                .await
+                {
+                    Ok(count) => {
+                        let _ = pd_app.emit(
+                            "crawl_log",
+                            format!("[PARALLEL] ⚡ Batch #{} complete: {} items", batch_round, count),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = pd_app.emit(
+                            "crawl_log",
+                            format!("[PARALLEL] Batch #{} error: {}", batch_round, e),
+                        );
+                    }
+                }
+
+                if pd_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        }))
+    } else {
+        None
+    };
+
     for attempt_idx in 0..=retry_budget {
         if attempt_idx > 0 {
             retry_count_used = attempt_idx;
@@ -1594,6 +1701,9 @@ async fn start_crawl(
         final_attempt_result = Some(attempt_result);
         break;
     }
+
+    // Phase 128: Signal parallel download consumer to stop after crawl completes
+    parallel_download_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let final_attempt_result = final_attempt_result.ok_or_else(|| {
         "No crawl attempt result was produced for baseline evaluation.".to_string()
@@ -1696,74 +1806,35 @@ async fn start_crawl(
 
     let mut auto_download_started = false;
 
-    // Phase 119: Parallel Download — stream entries to download engine during crawl
-    if options.parallel_download && !authoritative_entries.is_empty() {
-        let para_entries = authoritative_entries.clone();
-        let para_output_root = output_root.clone();
-        let para_app = app.clone();
-        let para_url = url.clone();
-        let para_force_clearnet = options.force_clearnet;
-        let circuits = options.circuits.unwrap_or(8).max(1);
-        let is_onion = url_targets_onion(&para_url) && !para_force_clearnet;
-
+    // Phase 128: Wait for parallel download consumer to finish its current batch
+    if let Some(handle) = parallel_download_handle {
         app.emit(
             "crawl_log",
-            format!(
-                "[OPSEC] ⚡ Parallel Download engaged: streaming {} entries to download engine in real-time.",
-                para_entries.len()
-            ),
+            "[PARALLEL] Waiting for parallel download consumer to finish current batch...".to_string(),
         )
         .unwrap_or_default();
-
-        // Fire-and-forget background download — runs concurrently with any auto_download
-        tokio::spawn(async move {
-            // Build a lightweight resume plan for the parallel batch
-            let target_paths_result = target_state::target_paths(&para_output_root, &para_url);
-            if let Ok(target_paths) = target_paths_result {
-                let failure_records =
-                    target_state::load_failure_manifest(&target_paths.failure_manifest_path)
-                        .unwrap_or_default();
-                if let Ok(resume_build) = target_state::build_download_resume_plan(
-                    &target_paths.target_identity.target_key,
-                    &para_entries,
-                    &failure_records,
-                    &para_output_root,
-                    &target_paths.failure_manifest_path,
-                ) {
-                    if !resume_build.plan.all_items_skipped {
-                        let _ = para_app.emit("download_resume_plan", resume_build.plan.clone());
-                        match scaffold_download_from_entries_with_plan(
-                            &para_entries,
-                            &resume_build.ordered_entries,
-                            &target_paths,
-                            &para_output_root,
-                            &para_app,
-                            circuits,
-                            is_onion,
-                        )
-                        .await
-                        {
-                            Ok(count) => {
-                                let _ = para_app.emit(
-                                    "crawl_log",
-                                    format!("[OPSEC] ⚡ Parallel Mirror complete. {} items.", count),
-                                );
-                            }
-                            Err(e) => {
-                                let _ = para_app.emit(
-                                    "crawl_log",
-                                    format!("[ERROR] Parallel Mirror failed: {}", e),
-                                );
-                            }
-                        }
-                    }
-                }
+        match handle.await {
+            Ok(_) => {
+                auto_download_started = true;
+                app.emit(
+                    "crawl_log",
+                    "[PARALLEL] ⚡ Parallel download consumer finished.".to_string(),
+                )
+                .unwrap_or_default();
             }
-        });
-        auto_download_started = true;
+            Err(e) => {
+                app.emit(
+                    "crawl_log",
+                    format!("[PARALLEL] Consumer task error: {}", e),
+                )
+                .unwrap_or_default();
+            }
+        }
     }
 
-    if auto_download && !auto_download_started {
+    // Phase 128: Auto download runs as post-crawl final sweep.
+    // Resume plan naturally skips files already downloaded by the parallel consumer.
+    if auto_download {
         let failure_records =
             target_state::load_failure_manifest(&target_paths.failure_manifest_path)
                 .map_err(|e| e.to_string())?;
