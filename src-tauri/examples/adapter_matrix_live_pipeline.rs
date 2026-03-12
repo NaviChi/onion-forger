@@ -155,7 +155,8 @@ fn build_batch_files(entries: &[FileEntry], output_root: &Path) -> Vec<BatchFile
                 }
                 if entry.raw_url.starts_with("http://") || entry.raw_url.starts_with("https://") {
                     batch_files.push(BatchFileEntry {
-                        url: entry.raw_url.clone(),
+                        url: entry.raw_url.clone(), // Assuming 'url' in instruction was a typo and meant entry.raw_url
+                        alternate_urls: Vec::new(),
                         path: full_path.to_string_lossy().to_string(),
                         size_hint: entry.size_bytes,
                         jwt_exp: entry.jwt_exp,
@@ -249,12 +250,12 @@ async fn run_single_adapter(
         sizes: true,
         download: true,
         circuits: Some(250),
-        daemons: Some(16),
         resume: false,
         agnostic_state: false,
         resume_index: None,
         mega_password: None,
-        stealth_ramp: true,
+        stealth_ramp: true, parallel_download: false,
+            force_clearnet: false,
     };
     let daemon_count = if is_onion {
         active_ports.len().max(1)

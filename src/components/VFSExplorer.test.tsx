@@ -47,23 +47,34 @@ describe('VFSExplorer', () => {
         });
     });
 
-    it('loads children and renders a node', async () => {
+    it('keeps nested files out of the root layer until their folder is expanded', async () => {
         mockInvoke.mockImplementation(async (command, args) => {
             if (command === 'get_vfs_children' && args.parentPath === '') {
                 return [
+                    { path: '\\folder1\\file1.txt', entry_type: 'File', size_bytes: 1024, raw_url: 'http://test.loc' },
                     { path: '/folder1', entry_type: 'Folder', size_bytes: null, raw_url: '' },
+                ];
+            }
+            if (command === 'get_vfs_children' && (args.parentPath === 'folder1' || args.parentPath === '/folder1')) {
+                return [
                     { path: '/folder1/file1.txt', entry_type: 'File', size_bytes: 1024, raw_url: 'http://test.loc' }
                 ];
             }
             return [];
         });
 
-        const { getByText } = render(
+        const { getByText, queryByText, getByTestId } = render(
             <VFSExplorer triggerRefresh={1} onDownload={vi.fn()} downloadProgress={{}} />
         );
 
         await waitFor(() => {
             expect(getByText('folder1')).toBeInTheDocument();
+        });
+        expect(queryByText('file1.txt')).not.toBeInTheDocument();
+
+        fireEvent.click(getByTestId(`vfs-toggle-${encodeURIComponent('folder1')}`));
+
+        await waitFor(() => {
             expect(getByText('file1.txt')).toBeInTheDocument();
         });
     });
@@ -73,7 +84,7 @@ describe('VFSExplorer', () => {
             if (command === 'get_vfs_children') {
                 if (args.parentPath === '') {
                     return [{ path: '/folder1', entry_type: 'Folder', size_bytes: null, raw_url: '' }];
-                } else if (args.parentPath === '/folder1') {
+                } else if (args.parentPath === 'folder1' || args.parentPath === '/folder1') {
                     return [{ path: '/folder1/child.txt', entry_type: 'File', size_bytes: null, raw_url: '' }];
                 }
             }
@@ -90,7 +101,7 @@ describe('VFSExplorer', () => {
             expect(getByText('folder1')).toBeInTheDocument();
         });
 
-        fireEvent.click(getByTestId(`vfs-toggle-${encodeURIComponent('/folder1')}`));
+        fireEvent.click(getByTestId(`vfs-toggle-${encodeURIComponent('folder1')}`));
 
         await waitFor(() => {
             expect(getByText('child.txt')).toBeInTheDocument();
@@ -137,9 +148,9 @@ describe('VFSExplorer', () => {
             expect(getByText('test.zip')).toBeInTheDocument();
         });
 
-        const dlButton = getByTestId(`vfs-download-${encodeURIComponent('/test.zip')}`);
+        const dlButton = getByTestId(`vfs-download-${encodeURIComponent('test.zip')}`);
         fireEvent.click(dlButton);
-        expect(onDownload).toHaveBeenCalledWith('http://foo', '/test.zip');
+        expect(onDownload).toHaveBeenCalledWith('http://foo', 'test.zip');
     });
 
 });

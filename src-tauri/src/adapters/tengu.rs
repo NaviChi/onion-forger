@@ -117,8 +117,8 @@ impl CrawlerAdapter for TenguAdapter {
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
-        let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let queue = Arc::new(crate::spillover::SpilloverQueue::new());
+        let all_discovered_entries = Arc::new(crate::spillover::SpilloverList::new());
 
         queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
@@ -152,138 +152,173 @@ impl CrawlerAdapter for TenguAdapter {
             }
         });
 
-        let max_concurrent = frontier.recommended_listing_workers();
+        // Phase 119: work-stealing with inverted retry queue
+        let retry_q = Arc::new(crate::work_stealing::new_retry_queue());
+        let max_concurrent = frontier.recommended_listing_workers().min(12);
         let mut workers = tokio::task::JoinSet::new();
 
-        for _ in 0..max_concurrent {
+        for worker_idx in 0..max_concurrent {
             let f = frontier.clone();
             let q_clone = queue.clone();
             let ui_tx_clone = ui_tx.clone();
             let discovered_ref = all_discovered_entries.clone();
             let pending_clone = pending.clone();
+            let rq = retry_q.clone();
 
             workers.spawn(async move {
-                let mut idle_sleep_ms: u64 = 50;
-                let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
+                // Phase 126: Per-worker HS health tracking
+                use crate::circuit_health::CircuitHealth;
+                let health = CircuitHealth::new();
+                let mut consecutive_all_dead: u32 = 0;
+                let mut request_count: u32 = 0;
+
                 loop {
                     if f.is_cancelled() {
                         return;
                     }
 
-                    let next_url = match q_clone.pop() {
-                        Some(url) => {
-                            idle_sleep_ms = 50;
-                            url
+                    // Work-stealing: primary queue first, then retry queue
+                    let (next_url, retry_attempt) = if let Some(url) = q_clone.pop() {
+                        (url, 0u8)
+                    } else if let Some((url, attempt)) =
+                        crate::work_stealing::try_pop_retry(&rq)
+                    {
+                        (url, attempt)
+                    } else {
+                        if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0
+                            && rq.is_empty()
+                        {
+                            break;
                         }
-                        None => {
-                            if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms))
-                                .await;
-                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
-                            continue;
-                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
                     };
+
+                    let is_primary = retry_attempt == 0;
+
+                    // Phase 126: CUSUM graduated backoff
+                    request_count += 1;
+                    if request_count > 2 && health.cusum_triggered() {
+                        consecutive_all_dead += 1;
+                        let backoff_secs = 2u64.pow(consecutive_all_dead.min(4));
+                        println!(
+                            "[Tengu W{} BACKOFF] CUSUM triggered — sleeping {}s (cycle {})",
+                            worker_idx, backoff_secs, consecutive_all_dead
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        health.reset_cusum();
+                    }
 
                     let _permit = f.politeness_semaphore.acquire().await.ok();
                     let (cid, client) = f.get_client();
-
-                    let delay = f.scorer.yield_delay(cid);
-                    if delay > std::time::Duration::ZERO {
-                        tokio::time::sleep(delay).await;
-                    }
-
                     let start_time = std::time::Instant::now();
-                    let mut bytes_downloaded = 0;
-                    let (mut fetch_success, mut html) = (false, None);
 
-                    for attempt in 0..4 {
-                        let (retry_cid, retry_client) = if attempt == 0 {
-                            (cid, client.clone())
-                        } else {
-                            f.get_client()
-                        };
+                    // Phase 126: Adaptive timeout from EWMA latency
+                    let timeout_ms = if request_count <= 2 { 20_000u64 } else { health.adaptive_ttfb_ms().min(20_000) };
+                    let req = client.get(&next_url).send();
+                    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), req).await {
+                        Ok(Ok(resp)) => {
+                            let status = resp.status().as_u16();
 
-                        if let Ok(Ok(resp)) = tokio::time::timeout(
-                            std::time::Duration::from_secs(45),
-                            retry_client.get(&next_url).send(),
-                        )
-                        .await
-                        {
-                            if let Some(delay) =
-                                ddos_guard.record_response_legacy(resp.status().as_u16())
-                            {
-                                tokio::time::sleep(delay).await;
-                            }
-                            if resp.status().is_success() {
-                                if let Ok(Ok(body)) = tokio::time::timeout(
-                                    std::time::Duration::from_secs(45),
-                                    resp.text(),
-                                )
-                                .await
-                                {
-                                    bytes_downloaded += body.len() as u64;
-                                    html = Some(body);
-                                    fetch_success = true;
-                                    f.record_success(
-                                        retry_cid,
-                                        bytes_downloaded,
-                                        start_time.elapsed().as_millis() as u64,
-                                    );
-                                    break;
+                            if status == 404 {
+                                f.record_failure(cid);
+                                health.record_failure();
+                                if is_primary {
+                                    pending_clone
+                                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                                 }
-                            } else if resp.status().as_u16() == 404 {
-                                f.record_failure(retry_cid);
-                                break;
+                                continue;
+                            }
+
+                            if !resp.status().is_success() {
+                                f.record_failure(cid);
+                                health.record_failure();
+                                let action = crate::work_stealing::classify_http_status(status);
+                                crate::work_stealing::handle_failure(
+                                    &rq,
+                                    next_url,
+                                    retry_attempt,
+                                    action,
+                                );
+                                if is_primary {
+                                    pending_clone
+                                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                continue;
+                            }
+
+                            // Success path
+                            if let Ok(Ok(body_bytes)) = tokio::time::timeout(
+                                std::time::Duration::from_secs(20),
+                                resp.bytes(),
+                            )
+                            .await
+                            {
+                                let body = String::from_utf8_lossy(&body_bytes).into_owned();
+                                let bytes_downloaded = body.len() as u64;
+                                let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                                f.record_success(
+                                    cid,
+                                    bytes_downloaded,
+                                    elapsed_ms,
+                                );
+                                health.record_success();
+                                health.record_latency(elapsed_ms as f32);
+                                consecutive_all_dead = 0;
+
+                                if f.active_options.listing {
+                                    let base_url_clone = next_url.clone();
+                                    let (spawned_entries,) =
+                                        tokio::task::spawn_blocking(move || {
+                                            (parse_tengu_listing(&body, &base_url_clone),)
+                                        })
+                                        .await
+                                        .unwrap_or_default();
+
+                                    let mut new_files = Vec::new();
+                                    for entry in spawned_entries {
+                                        if entry.entry_type == EntryType::Folder {
+                                            if f.mark_visited(&entry.raw_url) {
+                                                pending_clone.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                                q_clone.push(entry.raw_url.clone());
+                                            }
+                                        }
+                                        new_files.push(entry);
+                                    }
+
+                                    for file in &new_files {
+                                        let _ = ui_tx_clone.send(file.clone()).await;
+                                    }
+
+                                    if !new_files.is_empty() {
+                                        for nf in new_files {
+                                            discovered_ref.push(nf);
+                                        }
+                                    }
+                                }
+                            } else {
+                                f.record_failure(cid);
+                                health.record_failure();
+                                crate::work_stealing::requeue_with_backoff(
+                                    &rq, next_url, retry_attempt, 3,
+                                );
                             }
                         }
-                        f.record_failure(retry_cid);
-                    }
-
-                    if !fetch_success {
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        continue;
-                    }
-
-                    let Some(html) = html else {
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        continue;
-                    };
-
-                    if !f.active_options.listing {
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        continue;
-                    }
-
-                    let base_url_clone = next_url.clone();
-                    let (spawned_entries,) = tokio::task::spawn_blocking(move || {
-                        (parse_tengu_listing(&html, &base_url_clone),)
-                    })
-                    .await
-                    .unwrap_or_default();
-
-                    let mut new_files = Vec::new();
-                    for entry in spawned_entries {
-                        if entry.entry_type == EntryType::Folder {
-                            if f.mark_visited(&entry.raw_url) {
-                                pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                q_clone.push(entry.raw_url.clone());
-                            }
+                        _ => {
+                            f.record_failure(cid);
+                            health.record_failure();
+                            crate::work_stealing::requeue_with_backoff(
+                                &rq, next_url, retry_attempt, 3,
+                            );
                         }
-                        new_files.push(entry);
                     }
 
-                    for file in &new_files {
-                        let _ = ui_tx_clone.send(file.clone()).await;
+                    if is_primary {
+                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     }
-
-                    if !new_files.is_empty() {
-                        let mut lock = discovered_ref.lock().await;
-                        lock.extend(new_files);
-                    }
-
-                    pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }
@@ -291,8 +326,8 @@ impl CrawlerAdapter for TenguAdapter {
         while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
-        let mut final_results = all_discovered_entries.lock().await;
-        Ok(final_results.drain(..).collect())
+        let final_results = all_discovered_entries.drain_all();
+        Ok(final_results)
     }
 
     fn name(&self) -> &'static str {

@@ -9,12 +9,12 @@ async fn main() -> Result<()> {
         sizes: true,
         download: false,
         circuits: Some(60),
-        daemons: Some(1),
         agnostic_state: false,
         resume: false,
         resume_index: None,
         mega_password: None,
-        stealth_ramp: true,
+        stealth_ramp: true, parallel_download: false,
+            force_clearnet: false,
     };
 
     let frontier = CrawlerFrontier::new(

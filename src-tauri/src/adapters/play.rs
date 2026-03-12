@@ -27,8 +27,8 @@ impl CrawlerAdapter for PlayAdapter {
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
-        let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let queue = Arc::new(crate::spillover::SpilloverQueue::new());
+        let all_discovered_entries = Arc::new(crate::spillover::SpilloverList::new());
 
         queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
@@ -142,8 +142,9 @@ impl CrawlerAdapter for PlayAdapter {
                                 }
                                 if status.is_success() {
                                     f.seed_manager.report_success().await;
-                                    match resp.text().await {
-                                        Ok(body) => {
+                                    match resp.bytes().await {
+                                        Ok(body_bytes) => {
+                                            let body = String::from_utf8_lossy(&body_bytes).into_owned();
                                             bytes_downloaded += body.len() as u64;
                                             body
                                         }
@@ -259,8 +260,9 @@ impl CrawlerAdapter for PlayAdapter {
                     }
 
                     if !new_files.is_empty() {
-                        let mut lock = discovered_ref.lock().await;
-                        lock.extend(new_files);
+                        for nf in new_files {
+                            discovered_ref.push(nf);
+                        }
                     }
 
                     // Decrement the active task in our custom closure
@@ -272,8 +274,8 @@ impl CrawlerAdapter for PlayAdapter {
         while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
-        let mut final_results = all_discovered_entries.lock().await;
-        Ok(final_results.drain(..).collect())
+        let final_results = all_discovered_entries.drain_all();
+        Ok(final_results)
     }
 
     fn name(&self) -> &'static str {

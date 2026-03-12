@@ -115,7 +115,7 @@ impl DdosGuard {
             // Success path — reset throttle streak
             if self.consecutive_throttles > 0 {
                 // Graduated decay: don't instantly reset, decay by half
-                self.consecutive_throttles = self.consecutive_throttles / 2;
+                self.consecutive_throttles /= 2;
             }
 
             // Inter-request spacing: enforce minimum + EKF-weighted jitter

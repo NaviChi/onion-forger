@@ -7,6 +7,13 @@ export const UI_TEST_IDS = {
   onionModeButton: "btn-onion",
   resourceMetricsCard: "resource-metrics-card",
   resourceProcessCpu: "resource-process-cpu",
+  presetSelector: "preset-selector",
+  presetLow: "preset-low",
+  presetBalanced: "preset-balanced",
+  presetPerformance: "preset-performance",
+  patientRetryPanel: "patient-retry-panel",
+  patientRetryStats: "patient-retry-stats",
+  patientRetryRoundsLog: "patient-retry-rounds-log",
 } as const;
 
 export const NATIVE_WEBVIEW_SMOKE_TEST_IDS = [

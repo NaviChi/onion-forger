@@ -19,18 +19,24 @@ pub struct CrawlOptions {
     pub sizes: bool,
     pub download: bool,
     pub circuits: Option<usize>,
-    pub daemons: Option<usize>,
     #[serde(default)]
     pub agnostic_state: bool,
     #[serde(default)]
     pub resume: bool,
     #[serde(default)]
     pub resume_index: Option<String>,
+    #[serde(default)]
+    pub force_clearnet: bool,
     /// Optional password for Mega.nz password-protected links (#P! format)
     #[serde(default)]
     pub mega_password: Option<String>,
     #[serde(default)]
     pub stealth_ramp: bool,
+    /// Phase 119: Download files in parallel while the crawl is still running.
+    /// Unlike `download` (which waits for crawl completion), this streams
+    /// discovered files to the download engine in real-time.
+    #[serde(default)]
+    pub parallel_download: bool,
 }
 
 impl Default for CrawlOptions {
@@ -40,12 +46,13 @@ impl Default for CrawlOptions {
             sizes: true,
             download: false,
             circuits: Some(120),
-            daemons: Some(4),
-            agnostic_state: true, // Phase 67N: domain-agnostic dedup for safe multi-node rotation
+            agnostic_state: true,
             resume: false,
             resume_index: None,
+            force_clearnet: false,
             mega_password: None,
             stealth_ramp: true,
+            parallel_download: false,
         }
     }
 }
@@ -53,7 +60,7 @@ impl Default for CrawlOptions {
 /// The central Brain for the Distributed Crawler
 pub struct CrawlerFrontier {
     pub target_url: String,
-    pub num_daemons: usize,
+    pub num_clients: usize,
     pub is_onion: bool,
 
     // The Tor Swarm holding active Daemons (will be cleaned up on Drop)
@@ -66,7 +73,7 @@ pub struct CrawlerFrontier {
 
     // Persistent Connection Pooling
     pub http_clients: Vec<crate::arti_client::ArtiClient>,
-    pub client_daemon_map: Vec<usize>,
+    pub client_slot_map: Vec<usize>,
     pub client_counter: AtomicUsize,
 
     // Advanced Politeness Throttle
@@ -135,10 +142,9 @@ fn env_usize(name: &str) -> Option<usize> {
 
 fn build_onion_clients(
     arti_clients: &[crate::tor_native::SharedTorClient],
-    num_daemons: usize,
 ) -> (Vec<crate::arti_client::ArtiClient>, Vec<usize>) {
     let mut clients = Vec::with_capacity(arti_clients.len());
-    let mut client_daemon_map = Vec::with_capacity(arti_clients.len());
+    let mut client_slot_map = Vec::with_capacity(arti_clients.len());
 
     for (idx, shared_client) in arti_clients.iter().enumerate() {
         let tor_client_arc = shared_client.read().unwrap().clone();
@@ -146,10 +152,10 @@ fn build_onion_clients(
         let client =
             crate::arti_client::ArtiClient::new((*tor_client_arc).clone(), Some(isolation_token));
         clients.push(client);
-        client_daemon_map.push(idx % num_daemons.max(1));
+        client_slot_map.push(idx % arti_clients.len().max(1));
     }
 
-    (clients, client_daemon_map)
+    (clients, client_slot_map)
 }
 
 impl CrawlerFrontier {
@@ -165,9 +171,9 @@ impl CrawlerFrontier {
             return self.http_clients.len();
         }
 
-        let (clients, client_daemon_map) = build_onion_clients(arti_clients, self.num_daemons);
+        let (clients, client_slot_map) = build_onion_clients(arti_clients);
         self.http_clients = clients;
-        self.client_daemon_map = client_daemon_map;
+        self.client_slot_map = client_slot_map;
         self.client_counter.store(0, Ordering::Relaxed);
         self.http_clients.len()
     }
@@ -175,16 +181,14 @@ impl CrawlerFrontier {
     pub fn new(
         app: Option<tauri::AppHandle>,
         target_url: String,
-        mut num_daemons: usize,
+        num_clients: usize,
         is_onion: bool,
         _active_ports: Vec<u16>,
         arti_clients: Vec<crate::tor_native::SharedTorClient>,
         options: CrawlOptions,
         target_paths: Option<crate::target_state::TargetPaths>,
     ) -> Self {
-        if num_daemons == 0 {
-            num_daemons = 4;
-        }
+        let num_clients = num_clients.max(1);
 
         let total_circuits = options.circuits.unwrap_or(120);
         let worker_cap = crate::resource_governor::recommend_frontier_worker_cap(
@@ -195,14 +199,14 @@ impl CrawlerFrontier {
         )
         .clamp(8, 180);
         let mut clients = Vec::new();
-        let mut client_daemon_map = Vec::new();
+        let mut client_slot_map = Vec::new();
 
         if is_onion {
-            (clients, client_daemon_map) = build_onion_clients(&arti_clients, num_daemons);
+            (clients, client_slot_map) = build_onion_clients(&arti_clients);
         } else {
-            for daemon_idx in 0..num_daemons.max(1) {
+            for slot_idx in 0..num_clients {
                 clients.push(crate::arti_client::ArtiClient::new_clearnet());
-                client_daemon_map.push(daemon_idx);
+                client_slot_map.push(slot_idx);
             }
         }
 
@@ -210,7 +214,7 @@ impl CrawlerFrontier {
             if app.is_none() {
                 for idx in 0..total_circuits.max(1) {
                     clients.push(crate::arti_client::ArtiClient::new_clearnet());
-                    client_daemon_map.push(idx % num_daemons.max(1));
+                    client_slot_map.push(idx % num_clients);
                 }
             } else {
                 panic!("Could not initialize Tor clients for runtime bootstrap.");
@@ -333,27 +337,27 @@ impl CrawlerFrontier {
         });
 
         let bbr_max = total_circuits.max(1);
-        // Cold-start below the ceiling so hostile/high-latency targets do not begin fully oversubscribed.
+        // Phase 117: BBR cold-start uses client count instead of legacy num_daemons
         let default_bbr_initial = if is_onion {
-            num_daemons.max(1)
+            clients.len().max(1)
         } else {
-            num_daemons.max(1).saturating_mul(2)
+            clients.len().max(1).saturating_mul(2)
         };
         let bbr_initial = env_usize("CRAWLI_BBR_INITIAL")
             .unwrap_or(default_bbr_initial)
             .clamp(1, bbr_max);
 
-        let scorer_capacity = total_circuits.max(client_daemon_map.len()).max(1);
+        let scorer_capacity = total_circuits.max(client_slot_map.len()).max(1);
 
         Self {
             target_url: target_url.clone(),
-            num_daemons,
+            num_clients,
             is_onion,
             swarm_guard: None, // swarm_guard is typically set after `new` in an async context
             visited_bloom: Mutex::new(bloom),
             visited_hashes: Arc::new(hashes),
             http_clients: clients,
-            client_daemon_map,
+            client_slot_map,
             client_counter: AtomicUsize::new(0),
             politeness_semaphore: Arc::new(Semaphore::new(worker_cap)),
             max_worker_permits: worker_cap,
@@ -604,10 +608,10 @@ impl CrawlerFrontier {
             let g = guard.lock().await;
             if let Some(swarm) = &g.native_swarm {
                 let daemon_idx = self
-                    .client_daemon_map
+                    .client_slot_map
                     .get(cid)
                     .copied()
-                    .unwrap_or_else(|| cid % self.num_daemons.max(1));
+                    .unwrap_or_else(|| cid % self.num_clients.max(1));
                 if let Err(_e) = swarm.isolate_circuit(daemon_idx).await {
                     // Phase 49: Isolation failed — blacklist this circuit for 60s
                     self.circuit_blacklist

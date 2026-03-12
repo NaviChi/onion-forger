@@ -131,8 +131,8 @@ impl CrawlerAdapter for IncRansomAdapter {
         .unwrap_or_default();
 
         // 1. Setup lock-free worker pool task queue
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
-        let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let queue = Arc::new(crate::spillover::SpilloverQueue::new());
+        let all_discovered_entries = Arc::new(crate::spillover::SpilloverList::new());
 
         // Pending counter: tracks items that are either queued OR actively being processed.
         // A worker decrements this only AFTER it has finished processing AND enqueued any
@@ -312,10 +312,9 @@ impl CrawlerAdapter for IncRansomAdapter {
 
                                             // Flush partial results to IPC batcher
                                             if !new_files.is_empty() {
-                                                let mut locked = discovered_ref.lock().await;
                                                 for file in new_files {
                                                     let _ = ui_tx_clone.send(file.clone()).await;
-                                                    locked.push(file);
+                                                    discovered_ref.push(file);
                                                 }
                                             }
 
@@ -345,8 +344,8 @@ impl CrawlerAdapter for IncRansomAdapter {
         while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
-        let mut final_results = all_discovered_entries.lock().await;
-        Ok(final_results.drain(..).collect())
+        let final_results = all_discovered_entries.drain_all();
+        Ok(final_results)
     }
 
     fn name(&self) -> &'static str {

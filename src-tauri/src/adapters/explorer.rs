@@ -95,7 +95,8 @@ impl CrawlerAdapter for ExplorerAdapter {
         // Mode 3: CMS Redirect Mode handled by checking if reqwest natively followed a 302
         let _is_cms_redirect = final_url != current_url && final_url.contains("uuid=");
 
-        let body = resp.text().await?;
+        let body_bytes = resp.bytes().await?;
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
         frontier.record_success(
             cid,
             body.len() as u64,
@@ -241,7 +242,8 @@ impl CrawlerAdapter for ExplorerAdapter {
                 let start = std::time::Instant::now();
                 if let Ok(resp) = client.get(&url_to_probe).send().await {
                     let probe_final_url = resp.url().to_string();
-                    if let Ok(text) = resp.text().await {
+                    if let Ok(text_bytes) = resp.bytes().await {
+                        let text = String::from_utf8_lossy(&text_bytes).into_owned();
                         frontier_clone.record_success(
                             cid,
                             text.len() as u64,
@@ -257,9 +259,11 @@ impl CrawlerAdapter for ExplorerAdapter {
             });
         }
 
-        while let Some(res) = speculative_joinset.join_next().await {
-            match res {
-                Ok(Some((winning_url, text))) => {
+        // Phase 126C: Hard outer deadline to handle Arti cancellation-safety issue
+        let spec_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match tokio::time::timeout_at(spec_deadline, speculative_joinset.join_next()).await {
+                Ok(Some(Ok(Some((winning_url, text))))) => {
                     // Mission Accomplished: A probe found structure!
                     // Abort all other flights instantly to save Tor bandwidth and WAF reputation
                     speculative_joinset.abort_all();
@@ -298,7 +302,12 @@ impl CrawlerAdapter for ExplorerAdapter {
                     }
                     return Ok(entries);
                 }
-                _ => continue,
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => {
+                    speculative_joinset.abort_all();
+                    break;
+                }
             }
         }
 

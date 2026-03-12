@@ -10,8 +10,5 @@ async fn test_reqwest_coexistence() {
     let _req12 = client_12.get("https://example.com").build().unwrap();
 
     // If we reach here, Rust linked both distinct HTTP/hyper stacks correctly.
-    assert!(
-        true,
-        "Both versions of reqwest co-exist and build successfully"
-    );
+    println!("Both versions of reqwest co-exist and build successfully");
 }

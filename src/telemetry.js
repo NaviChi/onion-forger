@@ -309,6 +309,11 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
      * @property {string|null} [slowestCircuit] ResourceMetricsFrame slowestCircuit
      * @property {number|null} [lateThrottles] ResourceMetricsFrame lateThrottles
      * @property {number|null} [outlierIsolations] ResourceMetricsFrame outlierIsolations
+     * @property {number|null} [downloadHostCacheHits] ResourceMetricsFrame downloadHostCacheHits
+     * @property {number|null} [downloadProbePromotionHits] ResourceMetricsFrame downloadProbePromotionHits
+     * @property {number|null} [downloadLowSpeedAborts] ResourceMetricsFrame downloadLowSpeedAborts
+     * @property {number|null} [downloadProbeQuarantineHits] ResourceMetricsFrame downloadProbeQuarantineHits
+     * @property {number|null} [downloadProbeCandidateExhaustions] ResourceMetricsFrame downloadProbeCandidateExhaustions
      */
 
     /**
@@ -494,6 +499,46 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
      */
     ResourceMetricsFrame.prototype.outlierIsolations = 0;
 
+    /**
+     * ResourceMetricsFrame downloadHostCacheHits.
+     * @member {number} downloadHostCacheHits
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadHostCacheHits = 0;
+
+    /**
+     * ResourceMetricsFrame downloadProbePromotionHits.
+     * @member {number} downloadProbePromotionHits
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadProbePromotionHits = 0;
+
+    /**
+     * ResourceMetricsFrame downloadLowSpeedAborts.
+     * @member {number} downloadLowSpeedAborts
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadLowSpeedAborts = 0;
+
+    /**
+     * ResourceMetricsFrame downloadProbeQuarantineHits.
+     * @member {number} downloadProbeQuarantineHits
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadProbeQuarantineHits = 0;
+
+    /**
+     * ResourceMetricsFrame downloadProbeCandidateExhaustions.
+     * @member {number} downloadProbeCandidateExhaustions
+     * @memberof ResourceMetricsFrame
+     * @instance
+     */
+    ResourceMetricsFrame.prototype.downloadProbeCandidateExhaustions = 0;
+
     // OneOf field names bound to virtual getters and setters
     let $oneOfFields;
 
@@ -581,6 +626,16 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             writer.uint32(/* id 20, wireType 0 =*/160).uint32(message.lateThrottles);
         if (message.outlierIsolations != null && Object.hasOwnProperty.call(message, "outlierIsolations"))
             writer.uint32(/* id 21, wireType 0 =*/168).uint32(message.outlierIsolations);
+        if (message.downloadHostCacheHits != null && Object.hasOwnProperty.call(message, "downloadHostCacheHits"))
+            writer.uint32(/* id 22, wireType 0 =*/176).uint32(message.downloadHostCacheHits);
+        if (message.downloadProbePromotionHits != null && Object.hasOwnProperty.call(message, "downloadProbePromotionHits"))
+            writer.uint32(/* id 23, wireType 0 =*/184).uint32(message.downloadProbePromotionHits);
+        if (message.downloadLowSpeedAborts != null && Object.hasOwnProperty.call(message, "downloadLowSpeedAborts"))
+            writer.uint32(/* id 24, wireType 0 =*/192).uint32(message.downloadLowSpeedAborts);
+        if (message.downloadProbeQuarantineHits != null && Object.hasOwnProperty.call(message, "downloadProbeQuarantineHits"))
+            writer.uint32(/* id 25, wireType 0 =*/200).uint32(message.downloadProbeQuarantineHits);
+        if (message.downloadProbeCandidateExhaustions != null && Object.hasOwnProperty.call(message, "downloadProbeCandidateExhaustions"))
+            writer.uint32(/* id 26, wireType 0 =*/208).uint32(message.downloadProbeCandidateExhaustions);
         return writer;
     };
 
@@ -701,6 +756,26 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
                     message.outlierIsolations = reader.uint32();
                     break;
                 }
+            case 22: {
+                    message.downloadHostCacheHits = reader.uint32();
+                    break;
+                }
+            case 23: {
+                    message.downloadProbePromotionHits = reader.uint32();
+                    break;
+                }
+            case 24: {
+                    message.downloadLowSpeedAborts = reader.uint32();
+                    break;
+                }
+            case 25: {
+                    message.downloadProbeQuarantineHits = reader.uint32();
+                    break;
+                }
+            case 26: {
+                    message.downloadProbeCandidateExhaustions = reader.uint32();
+                    break;
+                }
             default:
                 reader.skipType(tag & 7);
                 break;
@@ -806,6 +881,21 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
         if (message.outlierIsolations != null && message.hasOwnProperty("outlierIsolations"))
             if (!$util.isInteger(message.outlierIsolations))
                 return "outlierIsolations: integer expected";
+        if (message.downloadHostCacheHits != null && message.hasOwnProperty("downloadHostCacheHits"))
+            if (!$util.isInteger(message.downloadHostCacheHits))
+                return "downloadHostCacheHits: integer expected";
+        if (message.downloadProbePromotionHits != null && message.hasOwnProperty("downloadProbePromotionHits"))
+            if (!$util.isInteger(message.downloadProbePromotionHits))
+                return "downloadProbePromotionHits: integer expected";
+        if (message.downloadLowSpeedAborts != null && message.hasOwnProperty("downloadLowSpeedAborts"))
+            if (!$util.isInteger(message.downloadLowSpeedAborts))
+                return "downloadLowSpeedAborts: integer expected";
+        if (message.downloadProbeQuarantineHits != null && message.hasOwnProperty("downloadProbeQuarantineHits"))
+            if (!$util.isInteger(message.downloadProbeQuarantineHits))
+                return "downloadProbeQuarantineHits: integer expected";
+        if (message.downloadProbeCandidateExhaustions != null && message.hasOwnProperty("downloadProbeCandidateExhaustions"))
+            if (!$util.isInteger(message.downloadProbeCandidateExhaustions))
+                return "downloadProbeCandidateExhaustions: integer expected";
         return null;
     };
 
@@ -884,6 +974,16 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             message.lateThrottles = object.lateThrottles >>> 0;
         if (object.outlierIsolations != null)
             message.outlierIsolations = object.outlierIsolations >>> 0;
+        if (object.downloadHostCacheHits != null)
+            message.downloadHostCacheHits = object.downloadHostCacheHits >>> 0;
+        if (object.downloadProbePromotionHits != null)
+            message.downloadProbePromotionHits = object.downloadProbePromotionHits >>> 0;
+        if (object.downloadLowSpeedAborts != null)
+            message.downloadLowSpeedAborts = object.downloadLowSpeedAborts >>> 0;
+        if (object.downloadProbeQuarantineHits != null)
+            message.downloadProbeQuarantineHits = object.downloadProbeQuarantineHits >>> 0;
+        if (object.downloadProbeCandidateExhaustions != null)
+            message.downloadProbeCandidateExhaustions = object.downloadProbeCandidateExhaustions >>> 0;
         return message;
     };
 
@@ -931,6 +1031,11 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             object.offWinnerChildRequests = 0;
             object.lateThrottles = 0;
             object.outlierIsolations = 0;
+            object.downloadHostCacheHits = 0;
+            object.downloadProbePromotionHits = 0;
+            object.downloadLowSpeedAborts = 0;
+            object.downloadProbeQuarantineHits = 0;
+            object.downloadProbeCandidateExhaustions = 0;
         }
         if (message.processCpuPercent != null && message.hasOwnProperty("processCpuPercent"))
             object.processCpuPercent = options.json && !isFinite(message.processCpuPercent) ? String(message.processCpuPercent) : message.processCpuPercent;
@@ -992,6 +1097,16 @@ export const ResourceMetricsFrame = $root.ResourceMetricsFrame = (() => {
             object.lateThrottles = message.lateThrottles;
         if (message.outlierIsolations != null && message.hasOwnProperty("outlierIsolations"))
             object.outlierIsolations = message.outlierIsolations;
+        if (message.downloadHostCacheHits != null && message.hasOwnProperty("downloadHostCacheHits"))
+            object.downloadHostCacheHits = message.downloadHostCacheHits;
+        if (message.downloadProbePromotionHits != null && message.hasOwnProperty("downloadProbePromotionHits"))
+            object.downloadProbePromotionHits = message.downloadProbePromotionHits;
+        if (message.downloadLowSpeedAborts != null && message.hasOwnProperty("downloadLowSpeedAborts"))
+            object.downloadLowSpeedAborts = message.downloadLowSpeedAborts;
+        if (message.downloadProbeQuarantineHits != null && message.hasOwnProperty("downloadProbeQuarantineHits"))
+            object.downloadProbeQuarantineHits = message.downloadProbeQuarantineHits;
+        if (message.downloadProbeCandidateExhaustions != null && message.hasOwnProperty("downloadProbeCandidateExhaustions"))
+            object.downloadProbeCandidateExhaustions = message.downloadProbeCandidateExhaustions;
         return object;
     };
 

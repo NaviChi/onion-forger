@@ -2,8 +2,9 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { ChevronRight, ChevronDown, Folder, FileIcon, DownloadCloud } from 'lucide-react';
 import { VibeLoader } from './VibeLoader';
-import { VFS_FIXTURE_ENTRIES, fixtureParentPath, isVfsFixtureMode, normalizeVfsPath } from "../fixtures/vfsFixture";
+import { VFS_FIXTURE_ENTRIES, isVfsFixtureMode } from "../fixtures/vfsFixture";
 import { invokeCommand, isTauriRuntime as getIsTauriRuntime } from "../platform/tauriClient";
+import { isDirectTreeChild, normalizeTreePath } from "../utils/vfsPath";
 
 export type EntryType = 'File' | 'Folder';
 
@@ -299,10 +300,10 @@ export function VFSExplorer({
 
     const loadChildren = async (parentPath: string, depth: number) => {
         if (isFixtureMode) {
-            const parent = normalizeVfsPath(parentPath);
+            const parent = normalizeTreePath(parentPath);
             const children = VFS_FIXTURE_ENTRIES
-                .filter((entry) => fixtureParentPath(entry.path) === parent)
-                .map((entry) => ({ ...entry, path: normalizeVfsPath(entry.path) }))
+                .map((entry) => ({ ...entry, path: normalizeTreePath(entry.path) }))
+                .filter((entry) => isDirectTreeChild(parent, entry.path))
                 .sort((a, b) => {
                     if (a.entry_type !== b.entry_type) {
                         return a.entry_type === "Folder" ? -1 : 1;
@@ -365,7 +366,18 @@ export function VFSExplorer({
                 }));
             }
 
-            const children = await invokeCommand<FileEntry[]>("get_vfs_children", { parentPath });
+            const children = (await invokeCommand<FileEntry[]>("get_vfs_children", { parentPath }))
+                .map((child) => ({
+                    ...child,
+                    path: normalizeTreePath(child.path),
+                }))
+                .filter((child) => isDirectTreeChild(parentPath, child.path))
+                .sort((a, b) => {
+                    if (a.entry_type !== b.entry_type) {
+                        return a.entry_type === "Folder" ? -1 : 1;
+                    }
+                    return a.path.localeCompare(b.path);
+                });
 
             setNodes(prev => {
                 const next = { ...prev };

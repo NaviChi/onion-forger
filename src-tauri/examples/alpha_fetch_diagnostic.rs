@@ -19,7 +19,6 @@ async fn main() -> Result<()> {
     let opts = CrawlOptions {
         listing: true,
         circuits: Some(5),
-        daemons: Some(1),
         resume: false,
         ..Default::default()
     };

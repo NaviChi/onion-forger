@@ -203,8 +203,8 @@ impl CrawlerAdapter for AlphaLockerAdapter {
     ) -> anyhow::Result<Vec<FileEntry>> {
         use tauri::Emitter;
 
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
-        let all_discovered_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let queue = Arc::new(crate::spillover::SpilloverQueue::new());
+        let all_discovered_entries = Arc::new(crate::spillover::SpilloverList::new());
 
         queue.push(current_url.to_string());
         frontier.mark_visited(current_url);
@@ -238,7 +238,9 @@ impl CrawlerAdapter for AlphaLockerAdapter {
             }
         });
 
-        let max_concurrent = frontier.recommended_listing_workers();
+        // Phase 119: work-stealing with inverted retry queue
+        let retry_q = Arc::new(crate::work_stealing::new_retry_queue());
+        let max_concurrent = frontier.recommended_listing_workers().min(12);
         let mut workers = tokio::task::JoinSet::new();
 
         for _ in 0..max_concurrent {
@@ -247,188 +249,184 @@ impl CrawlerAdapter for AlphaLockerAdapter {
             let ui_tx_clone = ui_tx.clone();
             let discovered_ref = all_discovered_entries.clone();
             let pending_clone = pending.clone();
+            let rq = retry_q.clone();
 
             workers.spawn(async move {
-                let mut idle_sleep_ms: u64 = 50;
-                let mut ddos_guard = crate::adapters::qilin_ddos_guard::DdosGuard::new();
                 loop {
                     if f.is_cancelled() {
                         return;
                     }
 
-                    let next_url = match q_clone.pop() {
-                        Some(url) => {
-                            idle_sleep_ms = 50;
-                            url
+                    // Work-stealing: primary queue first, then retry queue
+                    let (next_url, retry_attempt) = if let Some(url) = q_clone.pop() {
+                        (url, 0u8)
+                    } else if let Some((url, attempt)) =
+                        crate::work_stealing::try_pop_retry(&rq)
+                    {
+                        (url, attempt)
+                    } else {
+                        if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0
+                            && rq.is_empty()
+                        {
+                            break;
                         }
-                        None => {
-                            if pending_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms))
-                                .await;
-                            idle_sleep_ms = std::cmp::min(idle_sleep_ms * 2, 800);
-                            continue;
-                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
                     };
+
+                    let is_primary = retry_attempt == 0;
 
                     let _permit = f.politeness_semaphore.acquire().await.ok();
                     let (cid, client) = f.get_client();
 
-                    let delay = f.scorer.yield_delay(cid);
-                    if delay > std::time::Duration::ZERO {
-                        tokio::time::sleep(delay).await;
-                    }
-
                     let start_time = std::time::Instant::now();
-                    let mut bytes_downloaded = 0;
-                    let (mut fetch_success, mut html) = (false, None);
 
-                    // Retry loop with circuit rotation
-                    for attempt in 0..4 {
-                        let (retry_cid1, retry_client1) = if attempt == 0 {
-                            (cid, client.clone())
-                        } else {
-                            f.get_client()
-                        };
-                        let (retry_cid2, retry_client2) = f.get_client();
+                    // Single-attempt fetch with 20s timeout (was 45s × 4 retries)
+                    let req = client.get(&next_url).send();
+                    let fetch_result =
+                        tokio::time::timeout(std::time::Duration::from_secs(20), req).await;
 
-                        let next_url_clone1 = next_url.clone();
-                        let next_url_clone2 = next_url.clone();
+                    match fetch_result {
+                        Ok(Ok(resp)) => {
+                            let status = resp.status().as_u16();
 
-                        let req1 = Box::pin(async move {
-                            let res = tokio::time::timeout(
-                                std::time::Duration::from_secs(45),
-                                retry_client1.get(&next_url_clone1).send(),
+                            if status == 404 {
+                                f.record_failure(cid);
+                                if is_primary {
+                                    pending_clone
+                                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                continue;
+                            }
+
+                            if !resp.status().is_success() {
+                                f.record_failure(cid);
+                                let action = crate::work_stealing::classify_http_status(status);
+                                crate::work_stealing::handle_failure(
+                                    &rq,
+                                    next_url,
+                                    retry_attempt,
+                                    action,
+                                );
+                                if is_primary {
+                                    pending_clone
+                                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                continue;
+                            }
+
+                            // Success path
+                            if let Ok(Ok(body_bytes)) = tokio::time::timeout(
+                                std::time::Duration::from_secs(20),
+                                resp.bytes(),
                             )
-                            .await;
-                            (retry_cid1, res)
-                        });
-
-                        let req2 = Box::pin(async move {
-                            let res = tokio::time::timeout(
-                                std::time::Duration::from_secs(45),
-                                retry_client2.get(&next_url_clone2).send(),
-                            )
-                            .await;
-                            (retry_cid2, res)
-                        });
-
-                        let (winner_cid, fetch_result) =
-                            match futures::future::select(req1, req2).await {
-                                futures::future::Either::Left((res, _)) => res,
-                                futures::future::Either::Right((res, _)) => res,
-                            };
-
-                        if let Ok(Ok(resp)) = fetch_result {
-                            if let Some(delay) =
-                                ddos_guard.record_response_legacy(resp.status().as_u16())
+                            .await
                             {
-                                tokio::time::sleep(delay).await;
-                            }
-                            if resp.status().is_success() {
-                                if let Ok(Ok(body)) = tokio::time::timeout(
-                                    std::time::Duration::from_secs(45),
-                                    resp.text(),
-                                )
-                                .await
-                                {
-                                    bytes_downloaded += body.len() as u64;
-                                    html = Some(body);
-                                    fetch_success = true;
-                                    f.record_success(
-                                        winner_cid,
-                                        bytes_downloaded,
-                                        start_time.elapsed().as_millis() as u64,
-                                    );
-                                    break;
+                                let body = String::from_utf8_lossy(&body_bytes).into_owned();
+                                let bytes_downloaded = body.len() as u64;
+                                f.record_success(
+                                    cid,
+                                    bytes_downloaded,
+                                    start_time.elapsed().as_millis() as u64,
+                                );
+
+                                if f.active_options.listing {
+                                    let base_url_clone = next_url.clone();
+                                    let html_clone = body.clone();
+                                    let spawned_entries =
+                                        tokio::task::spawn_blocking(move || {
+                                            parse_alphalocker_listing(
+                                                &html_clone,
+                                                &base_url_clone,
+                                            )
+                                        })
+                                        .await
+                                        .unwrap_or_default();
+
+                                    let mut new_files = Vec::new();
+                                    for entry in spawned_entries {
+                                        if entry.entry_type == EntryType::Folder {
+                                            if f.mark_visited(&entry.raw_url) {
+                                                pending_clone.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                                q_clone.push(entry.raw_url.clone());
+                                            }
+                                        }
+                                        new_files.push(entry);
+                                    }
+
+                                    // Size probes (keep but with reduced timeout)
+                                    if f.active_options.sizes {
+                                        for nf in new_files.iter_mut() {
+                                            if nf.entry_type == EntryType::File
+                                                && nf.size_bytes.is_none()
+                                            {
+                                                let (hcid, hclient) = f.get_client();
+                                                if let Ok(Ok(size_resp)) =
+                                                    tokio::time::timeout(
+                                                        std::time::Duration::from_secs(8),
+                                                        hclient
+                                                            .get(&nf.raw_url)
+                                                            .header("Range", "bytes=0-0")
+                                                            .send(),
+                                                    )
+                                                    .await
+                                                {
+                                                    nf.size_bytes = size_resp
+                                                        .headers()
+                                                        .get("content-range")
+                                                        .and_then(|v| v.to_str().ok())
+                                                        .and_then(|s| s.split('/').last())
+                                                        .and_then(|s| s.parse::<u64>().ok())
+                                                        .or_else(|| {
+                                                            size_resp
+                                                                .headers()
+                                                                .get("content-length")
+                                                                .and_then(|v| v.to_str().ok())
+                                                                .and_then(|s| {
+                                                                    s.parse::<u64>().ok()
+                                                                })
+                                                        });
+                                                    f.record_success(hcid, 0, 0);
+                                                } else {
+                                                    f.record_failure(hcid);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    for file in &new_files {
+                                        let _ = ui_tx_clone.send(file.clone()).await;
+                                    }
+
+                                    if !new_files.is_empty() {
+                                        for nf in new_files {
+                                            discovered_ref.push(nf);
+                                        }
+                                    }
                                 }
-                            } else if resp.status().as_u16() == 404 {
-                                f.record_failure(winner_cid);
-                                break;
+                            } else {
+                                // Body read timeout → requeue
+                                f.record_failure(cid);
+                                crate::work_stealing::requeue_with_backoff(
+                                    &rq, next_url, retry_attempt, 3,
+                                );
                             }
                         }
-                        f.record_failure(winner_cid);
-                    }
-
-                    if !fetch_success {
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        continue;
-                    }
-
-                    let Some(html) = html else {
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        continue;
-                    };
-
-                    if !f.active_options.listing {
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        continue;
-                    }
-
-                    // Parse off-thread Phase 73 HFT DOM Preheating
-                    let base_url_clone = next_url.clone();
-                    let html_clone = html.clone();
-                    let spawned_entries = tokio::task::spawn_blocking(move || {
-                        parse_alphalocker_listing(&html_clone, &base_url_clone)
-                    })
-                    .await
-                    .unwrap_or_default();
-
-                    let mut new_files = Vec::new();
-                    for entry in spawned_entries {
-                        if entry.entry_type == EntryType::Folder {
-                            if f.mark_visited(&entry.raw_url) {
-                                pending_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                q_clone.push(entry.raw_url.clone());
-                            }
-                        }
-                        new_files.push(entry);
-                    }
-
-                    // Merge HEAD Size Probes into First GET (Kill Redundant Requests)
-                    if f.active_options.sizes {
-                        for nf in new_files.iter_mut() {
-                            if nf.entry_type == EntryType::File && nf.size_bytes.is_none() {
-                                let (hcid, hclient) = f.get_client();
-                                if let Ok(Ok(size_resp)) = tokio::time::timeout(
-                                    std::time::Duration::from_secs(10),
-                                    hclient.get(&nf.raw_url).header("Range", "bytes=0-0").send(),
-                                )
-                                .await
-                                {
-                                    nf.size_bytes = size_resp
-                                        .headers()
-                                        .get("content-range")
-                                        .and_then(|v| v.to_str().ok())
-                                        .and_then(|s| s.split('/').last())
-                                        .and_then(|s| s.parse::<u64>().ok())
-                                        .or_else(|| {
-                                            size_resp
-                                                .headers()
-                                                .get("content-length")
-                                                .and_then(|v| v.to_str().ok())
-                                                .and_then(|s| s.parse::<u64>().ok())
-                                        });
-                                    f.record_success(hcid, 0, 0);
-                                } else {
-                                    f.record_failure(hcid);
-                                }
-                            }
+                        _ => {
+                            // Timeout or connection error → requeue
+                            f.record_failure(cid);
+                            crate::work_stealing::requeue_with_backoff(
+                                &rq, next_url, retry_attempt, 3,
+                            );
                         }
                     }
 
-                    // Send to IPC batcher
-                    for file in &new_files {
-                        let _ = ui_tx_clone.send(file.clone()).await;
+                    if is_primary {
+                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     }
-
-                    if !new_files.is_empty() {
-                        let mut lock = discovered_ref.lock().await;
-                        lock.extend(new_files);
-                    }
-
-                    pending_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }
@@ -436,8 +434,8 @@ impl CrawlerAdapter for AlphaLockerAdapter {
         while workers.join_next().await.is_some() {}
 
         drop(ui_tx);
-        let mut final_results = all_discovered_entries.lock().await;
-        Ok(final_results.drain(..).collect())
+        let final_results = all_discovered_entries.drain_all();
+        Ok(final_results)
     }
 
     fn name(&self) -> &'static str {

@@ -1,0 +1,299 @@
+/* ═══════════════════════════════════════════════════════════════
+   PatientRetryPanel.css — Phase 116 Patient Retry Dashboard
+   ═══════════════════════════════════════════════════════════════ */
+
+.patient-retry-panel {
+  background: linear-gradient(135deg, rgba(30, 30, 46, 0.95), rgba(20, 20, 34, 0.98));
+  border: 1px solid rgba(255, 165, 0, 0.25);
+  border-radius: 12px;
+  padding: 0;
+  overflow: hidden;
+  grid-column: 1 / -1;
+  transition: border-color 0.4s ease, box-shadow 0.4s ease;
+}
+
+.patient-retry-panel--active {
+  border-color: rgba(255, 165, 0, 0.45);
+  box-shadow: 0 0 24px rgba(255, 165, 0, 0.08), inset 0 0 30px rgba(255, 165, 0, 0.02);
+  animation: retryPulse 3s ease-in-out infinite;
+}
+
+.patient-retry-panel--success {
+  border-color: rgba(34, 197, 94, 0.5);
+  box-shadow: 0 0 24px rgba(34, 197, 94, 0.1);
+  animation: none;
+}
+
+@keyframes retryPulse {
+  0%, 100% { box-shadow: 0 0 24px rgba(255, 165, 0, 0.08); }
+  50% { box-shadow: 0 0 32px rgba(255, 165, 0, 0.15), 0 0 8px rgba(255, 165, 0, 0.05) inset; }
+}
+
+/* ── Header ── */
+.retry-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  background: rgba(255, 165, 0, 0.06);
+  border-bottom: 1px solid rgba(255, 165, 0, 0.12);
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.retry-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.retry-header-icon {
+  color: #ffa500;
+  opacity: 0.9;
+}
+
+.retry-header-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: rgba(255, 255, 255, 0.88);
+  text-transform: uppercase;
+}
+
+.retry-header-right {
+  font-size: 0.72rem;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+/* ── Badges ── */
+.retry-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.retry-badge--active {
+  background: rgba(255, 165, 0, 0.18);
+  color: #ffa500;
+  border: 1px solid rgba(255, 165, 0, 0.3);
+  animation: badgePulse 2s ease-in-out infinite;
+}
+
+.retry-badge--success {
+  background: rgba(34, 197, 94, 0.18);
+  color: #22c55e;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.retry-badge--cancelled {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+.retry-badge--exhausted {
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+@keyframes badgePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+/* ── Countdown Bar ── */
+.countdown-track {
+  position: relative;
+  height: 26px;
+  background: rgba(0, 0, 0, 0.25);
+  border-bottom: 1px solid rgba(255, 165, 0, 0.08);
+  overflow: hidden;
+}
+
+.countdown-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: linear-gradient(90deg, rgba(255, 165, 0, 0.15), rgba(255, 165, 0, 0.08));
+  transition: width 1s linear;
+}
+
+.countdown-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: rgba(255, 165, 0, 0.7);
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+/* ── Stats Row ── */
+.retry-stats-row {
+  display: flex;
+  gap: 2px;
+  padding: 12px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  flex-wrap: wrap;
+}
+
+.retry-stat {
+  display: flex;
+  flex-direction: column;
+  min-width: 80px;
+  flex: 1;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 6px;
+}
+
+.retry-stat-label {
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.35);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.retry-stat-value {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.8);
+  font-family: 'JetBrains Mono', monospace;
+  margin-top: 2px;
+}
+
+.retry-stat-value--success {
+  color: #22c55e;
+}
+
+.retry-stat-value--danger {
+  color: #ef4444;
+}
+
+/* ── Rounds Audit Log ── */
+.retry-rounds-log {
+  padding: 8px 16px 12px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.retry-rounds-header {
+  display: grid;
+  grid-template-columns: 60px 90px 100px 1fr 90px;
+  gap: 8px;
+  padding: 4px 0 6px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.3);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-family: 'JetBrains Mono', monospace;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.retry-round-row {
+  display: grid;
+  grid-template-columns: 60px 90px 100px 1fr 90px;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 0.72rem;
+  color: rgba(255, 255, 255, 0.6);
+  font-family: 'JetBrains Mono', monospace;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+  transition: background 0.2s ease;
+}
+
+.retry-round-row:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.retry-round-row--success {
+  color: #22c55e;
+  background: rgba(34, 197, 94, 0.04);
+}
+
+.retry-round-row--failed {
+  color: rgba(239, 68, 68, 0.7);
+}
+
+.retry-round-row--probing {
+  color: rgba(255, 165, 0, 0.8);
+}
+
+.retry-round-row--waiting {
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.retry-round-num {
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.retry-round-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+}
+
+.retry-round-nodes {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.retry-round-result {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.retry-round-time {
+  color: rgba(255, 255, 255, 0.35);
+  font-size: 0.68rem;
+}
+
+/* ── Status Icons ── */
+.retry-icon { flex-shrink: 0; }
+.retry-icon--waiting { color: rgba(255, 255, 255, 0.4); }
+.retry-icon--probing { color: #ffa500; animation: spin 1.5s linear infinite; }
+.retry-icon--success { color: #22c55e; }
+.retry-icon--failed { color: #ef4444; }
+.retry-icon--timeout { color: #f59e0b; }
+.retry-icon--cancelled { color: #6b7280; }
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* ── Scrollbar ── */
+.retry-rounds-log::-webkit-scrollbar {
+  width: 6px;
+}
+
+.retry-rounds-log::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.retry-rounds-log::-webkit-scrollbar-thumb {
+  background: rgba(255, 165, 0, 0.15);
+  border-radius: 3px;
+}
+
+.retry-rounds-log::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 165, 0, 0.3);
+}

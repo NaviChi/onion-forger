@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { UI_TEST_IDS } from '../src/test/selectors';
 
 test.describe('Crawli React Application', () => {
 
@@ -18,8 +19,8 @@ test.describe('Crawli React Application', () => {
             await expect(urlInput).toBeEditable();
         }
 
-        await expect(page.getByTestId('resource-metrics-card')).toBeVisible();
-        await expect(page.getByTestId('resource-process-cpu')).toContainText('CPU 0.0%');
+        await expect(page.getByTestId(UI_TEST_IDS.resourceMetricsCard)).toBeVisible();
+        await expect(page.getByTestId(UI_TEST_IDS.resourceProcessCpu)).toContainText('CPU 0.0%');
     });
 
     test('mocked crawl execution handles missing Tauri IPC gracefully', async ({ page }) => {
@@ -41,8 +42,8 @@ test.describe('Crawli React Application', () => {
     test('fixture mode renders live operator telemetry', async ({ page }) => {
         await page.goto('/?fixture=vfs');
 
-        await expect(page.getByTestId('resource-metrics-card')).toBeVisible();
-        await expect(page.getByTestId('resource-process-cpu')).toContainText('CPU 18.4%');
+        await expect(page.getByTestId(UI_TEST_IDS.resourceMetricsCard)).toBeVisible();
+        await expect(page.getByTestId(UI_TEST_IDS.resourceProcessCpu)).toContainText('CPU 18.4%');
         await expect(page.getByTestId('resource-process-memory')).toContainText('RSS 412.0 MB');
         await expect(page.getByTestId('resource-worker-metrics')).toContainText('Vanguard: Active (Heatmap Enabled) | Circuits 9/12');
         await expect(page.getByTestId('resource-node-metrics')).toContainText('192.168.1.100');

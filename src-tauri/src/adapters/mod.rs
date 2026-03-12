@@ -382,6 +382,17 @@ impl AdapterRegistry {
             regex::RegexSet::new(&regex_patterns).unwrap_or_else(|_| regex::RegexSet::empty());
         registry.regex_adapter_map = regex_adapter_map;
 
+        // Phase 117: Wire up known_domains() → domain_cache so adapters with
+        // registered domains get instant O(1) matching without a JSON file.
+        for (id, adapter) in &registry.adapters {
+            for domain in adapter.known_domains() {
+                registry
+                    .domain_cache
+                    .entry(domain.to_string())
+                    .or_insert_with(|| id.clone());
+            }
+        }
+
         registry
     }
 

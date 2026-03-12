@@ -181,23 +181,90 @@ async function isLocatorDisabled(locator) {
 
 async function ensureDynamicControlVisible(page, item) {
   const tid = item.testId || "";
-  if (
-    tid !== "support-popover" &&
-    tid !== "btn-support-close" &&
-    !tid.startsWith("adapter-row-")
-  ) {
+  if (tid === "support-popover" || tid === "btn-support-close" || tid.startsWith("adapter-row-")) {
+    const popover = page.locator('[data-testid="support-popover"]').first();
+    if ((await popover.count()) > 0) return;
+
+    const supportButton = page.locator('[data-testid="btn-support"]').first();
+    if ((await supportButton.count()) === 0) return;
+    if (await isLocatorDisabled(supportButton)) return;
+
+    await supportButton.click({ timeout: 5000, force: true });
+    await page.waitForTimeout(200);
     return;
   }
 
-  const popover = page.locator('[data-testid="support-popover"]').first();
-  if ((await popover.count()) > 0) return;
+  if (
+    tid === "btn-azure-close" ||
+    tid === "btn-azure-tab-intranet" ||
+    tid === "btn-azure-tab-storage" ||
+    tid === "input-azure-intranet-port" ||
+    tid === "chk-azure-managed-identity" ||
+    tid === "sel-azure-region" ||
+    tid.startsWith("input-azure-") ||
+    tid.startsWith("btn-azure-")
+  ) {
+    const azureButton = page.locator('[data-testid="azure-connectivity-btn"]').first();
+    const azureClose = page.locator('[data-testid="btn-azure-close"]').first();
+    if ((await azureClose.count()) === 0) {
+      if ((await azureButton.count()) === 0) return;
+      if (await isLocatorDisabled(azureButton)) return;
 
-  const supportButton = page.locator('[data-testid="btn-support"]').first();
-  if ((await supportButton.count()) === 0) return;
-  if (await isLocatorDisabled(supportButton)) return;
+      await azureButton.click({ timeout: 5000, force: true });
+      await page.waitForTimeout(200);
+    }
 
-  await supportButton.click({ timeout: 5000, force: true });
-  await page.waitForTimeout(200);
+    const storageControls = new Set([
+      "btn-azure-tab-storage",
+      "chk-azure-managed-identity",
+      "input-azure-subscription-id",
+      "input-azure-tenant-id",
+      "input-azure-client-id",
+      "input-azure-client-secret",
+      "input-azure-resource-group",
+      "input-azure-storage-account",
+      "input-azure-container-name",
+      "sel-azure-region",
+      "input-azure-size-gb",
+      "btn-azure-test-connection",
+      "btn-azure-configure",
+      "btn-azure-storage-disable",
+      "btn-azure-storage-enable",
+    ]);
+    const intranetControls = new Set([
+      "btn-azure-tab-intranet",
+      "input-azure-intranet-port",
+      "btn-azure-intranet-stop",
+      "btn-azure-intranet-start",
+    ]);
+
+    if (storageControls.has(tid)) {
+      const storageTab = page.locator('[data-testid="btn-azure-tab-storage"]').first();
+      if ((await storageTab.count()) > 0) {
+        await storageTab.click({ timeout: 5000, force: true });
+        await page.waitForTimeout(150);
+      }
+    } else if (intranetControls.has(tid)) {
+      const intranetTab = page.locator('[data-testid="btn-azure-tab-intranet"]').first();
+      if ((await intranetTab.count()) > 0) {
+        await intranetTab.click({ timeout: 5000, force: true });
+        await page.waitForTimeout(150);
+      }
+    }
+    return;
+  }
+
+  if (tid === "btn-hex-close" || tid === "btn-hex-turbo-bypass") {
+    const hexClose = page.locator('[data-testid="btn-hex-close"]').first();
+    if ((await hexClose.count()) > 0) return;
+
+    const hexButton = page.locator('[data-testid="btn-hex-view"]').first();
+    if ((await hexButton.count()) === 0) return;
+    if (await isLocatorDisabled(hexButton)) return;
+
+    await hexButton.click({ timeout: 5000, force: true });
+    await page.waitForTimeout(200);
+  }
 }
 
 function interactionPriority(item) {
@@ -205,12 +272,49 @@ function interactionPriority(item) {
   if (tid === "support-popover") return 2;
   if (tid.startsWith("adapter-row-")) return 4;
   if (tid === "btn-support-close") return 5;
+  if (tid === "input-mega-password") return 9;
+  if (tid === "chk-force-clearnet") return 11;
+  if (tid === "btn-hex-turbo-bypass") return 62;
+  if (tid === "btn-hex-close") return 63;
+  if (tid === "azure-connectivity-btn") return 64;
+  if (
+    tid === "btn-azure-tab-intranet" ||
+    tid === "btn-azure-tab-storage" ||
+    tid === "input-azure-intranet-port" ||
+    tid === "chk-azure-managed-identity" ||
+    tid === "sel-azure-region" ||
+    tid.startsWith("input-azure-") ||
+    tid === "btn-azure-intranet-stop" ||
+    tid === "btn-azure-intranet-start" ||
+    tid === "btn-azure-test-connection" ||
+    tid === "btn-azure-configure" ||
+    tid === "btn-azure-storage-disable" ||
+    tid === "btn-azure-storage-enable"
+  ) {
+    return 65;
+  }
+  if (tid === "btn-azure-close") return 66;
   // Run crawl-state mutators last; they can temporarily hide/disable other controls.
   // Keep Support toggle latest in pass 1 so popover controls are discoverable in pass 2.
   if (tid === "btn-support") return 95;
   if (tid === "btn-start-queue" || tid === "btn-resume") return 80;
   if (tid === "btn-cancel") return 90;
   return 10;
+}
+
+async function seedConditionalCoverage(page, discovered, state) {
+  if (!state.megaPasswordSeeded && !discovered.has("tid:input-mega-password")) {
+    const megaButton = page.locator('[data-testid="btn-mega"]').first();
+    const targetInput = page.locator('[data-testid="input-target-url"]').first();
+    if ((await megaButton.count()) > 0 && (await targetInput.count()) > 0) {
+      if (!(await isLocatorDisabled(megaButton))) {
+        await megaButton.click({ timeout: 5000, force: true });
+        await targetInput.fill("https://mega.nz/folder/demo#P!fixture-password");
+        await page.waitForTimeout(200);
+      }
+    }
+    state.megaPasswordSeeded = true;
+  }
 }
 
 async function collectClickableInventory(page) {
@@ -292,10 +396,11 @@ async function collectClickableInventory(page) {
 
 async function runOverlayIntegrity() {
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
+  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   const results = [];
   const tested = new Set();
   const discovered = new Map();
+  const coverageState = { megaPasswordSeeded: false };
 
   try {
     await page.goto(BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -309,6 +414,7 @@ async function runOverlayIntegrity() {
     let safety = 0;
     while (passesWithoutNew < 2 && safety < 12) {
       safety += 1;
+      await seedConditionalCoverage(page, discovered, coverageState);
       const inventory = await collectClickableInventory(page);
       let newCount = 0;
 

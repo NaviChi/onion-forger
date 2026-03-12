@@ -1,5 +1,152 @@
 # Lessons Learned Whitepaper
 
+## 2026-03-12 (Phase 127: GitHub Release Hardening)
+- **PR-REL-127-001:** Do not duplicate Windows portable packaging logic across workflows. Maintain one checked-in script (`packaging/windows/package-portable.ps1`) and invoke it from all release workflows to keep artifact composition deterministic.
+- **PR-REL-127-002:** Windows-only release workflows must never delete all release assets by default. Cleanup logic must target stale Windows installer files only, otherwise Linux/macOS assets can be accidentally removed.
+- **LESSON-REL-127-001:** Reusable packaging scripts reduce drift risk and simplify release hotfixes; a single script update now patches both `release.yml` and `release-windows-portable.yml` behaviors.
+
+## 2026-03-12 (Phase 126C: Full JoinSet Cancellation-Safety Audit — CRITICAL)
+- **PR-ARTI-CANCEL-SAFETY-126C-001 (CRITICAL):** `tokio::time::timeout(N, arti_client.get(url).send())` does NOT reliably cancel the Arti future. When the timeout fires, the inner Arti `.send()` future is dropped, but Arti's internal connection state keeps the JoinSet task alive. This means `JoinSet::join_next().await` hangs FOREVER. **FIX:** Always wrap JoinSet collection loops with a hard outer `tokio::time::timeout_at(deadline, joinset.join_next())` + `abort_all()` on deadline expiry. This applies to ALL places in the codebase where Arti futures are joined.
+- **PR-ARTI-CANCEL-SAFETY-126C-002 (HIGH):** `explorer.rs` and `universal_explorer.rs` had JoinSet collection loops with NO timeout at all — not even an inner one. These were the highest-risk patterns because any Arti future hang would block the adapter indefinitely with zero fallback.
+- **PR-SEARCH-PROBE-ORDERING-126C-001:** The Phase 123 search probe block ran BEFORE worker spawning. When search probes hung, workers NEVER started — the entire crawl was blocked. Always ensure blocking pre-worker operations have hard time bounds.
+- **PR-SEED-PROBE-CLEANUP-126C-001:** `for h in probe_handles { h.await; }` for seed probe cleanup can also hang if remaining probes (the losers) are stuck on Arti connections. Added 35s hard deadline.
+- **LESSON-JOINSET-AUDIT-126C-001:** Full codebase audit identified 7 vulnerable patterns across 6 files: `dragonforce.rs` (2), `qilin.rs` (1), `qilin_nodes.rs` (1), `explorer.rs` (1), `universal_explorer.rs` (1), `aria_downloader.rs` (1). All fixed with hard outer `timeout_at` deadlines set to inner_timeout + 15s buffer (or 60s for patterns with no inner timeout). `multipath.rs` worker JoinSet was LOW risk (self-terminating via cancel flag + chunk exhaustion) and left unchanged.
+- **LESSON-QILIN-BENCHMARK-126C-001:** Qilin live test with `f0668431-ee3f-3570-99cb-ea7d9c0691c6` produced 2,484 entries (2,263 files + 221 folders) in 54.56s, 222/222 folders parsed (100% verification), 231MB RSS, zero hangs. First test failure was operator error (`--no-listing` flag disabled entry parsing).
+
+## 2026-03-12 (Phase 126B: Cross-Adapter CUSUM Rollout + Arti Audit)
+- **PR-CUSUM-ROLLOUT-126B-001:** When rolling CUSUM to adapters that use `f.get_client()` (single client per request) instead of `MultiClientPool` (pre-built slots), use per-WORKER CircuitHealth instead of per-SLOT. Each worker tracks its own EWMA/CUSUM state because it cycles through different circuits via the frontier's round-robin allocation.
+- **PR-LOCKBIT-RACING-126B-001:** LockBit's dual-circuit racing pattern (`futures::future::select`) requires that BOTH race legs use the same `race_timeout_ms` value. If one leg has a different timeout, the `select` winner may be biased. Keep both timeouts synchronized.
+- **PR-ARTI-VERSION-126B-001:** `arti-client 0.40` is pre-1.0 Arti. Arti 2.0.0 introduced breaking changes to configuration APIs. Upgrade requires testing for API compatibility, but gains Counter Galois Onion encryption (faster), circuit padding (stealth), and OpenTelemetry support (debugging).
+- **LESSON-HS-EXTENDED-OUTAGE-126B-001:** DragonForce HS `fsguestuctexqqaoxuahuydfa6ovxuhtng66pgyr5gqcrsi7qgchpkad.onion` was continuously offline for 40+ minutes during this session. Code changes CANNOT be validated by live benchmark when the HS is down. Always maintain Phase 125's 9,379-entry benchmark as the comparison baseline. Live re-test required when HS recovers.
+
+## 2026-03-12 (Phase 126: CircuitHealth Extraction + CUSUM Backoff + Adaptive TTFB)
+- **PR-MODULE-EXTRACT-126-001:** When extracting a struct to a shared module, ensure the module has comprehensive unit tests covering all public API methods. CircuitHealth: 8 tests covering initial state, CUSUM triggers after 4 failures, CUSUM drain on success, TTFB convergence, TTFB high latency, reset, all_slots_dead, and best_slot.
+- **PR-BACKOFF-126-001:** Graduated backoff MUST reset the counter on ANY healthy condition change — not just on successful requests. In `dragonforce.rs`, the counter resets in both the `else` branch (no repin needed = healthy request) and when `all_slots_dead()` returns false (at least one slot recovered).
+- **PR-ADAPTIVE-DL-126-001:** When wiring adaptive timeouts into existing download infrastructure, use per-request adaptation (not per-batch). The download worker already had `task_first_byte_timeout` as a batch-level constant — we replaced the usage site with `adaptive_first_byte_timeout(&url, is_onion)` per URL while keeping the batch constant for logging.
+- **LESSON-HS-TIMING-126-001:** DragonForce HS (`fsguestuctexqqaoxuahuydfa6ovxuhtng66pgyr5gqcrsi7qgchpkad.onion`) went fully offline between Phase 125 benchmark (9,379 entries in ~8 min) and Phase 126 test (0 entries, workers stuck in 45s initial timeouts). HS availability is the dominant bottleneck — code optimizations are complete.
+
+## 2026-03-12 (Phase 125: Full CLI Benchmark + Nine-Agent Audit)
+- **PR-BENCHMARK-125-001:** Standalone benchmark examples are NOT valid for comparing adapter-level optimizations. The Phase 124 standalone test showed 1,176 entries (0.8× baseline) while the full CLI adapter test showed 9,379 entries (6.5× baseline). Standalone tests create fresh clients per request, don't use EWMA/CUSUM, don't exercise multi-probe bootstrap, and don't have pre-built connection pools. **ALWAYS benchmark through the full CLI adapter for meaningful comparisons.**
+- **PR-CUSUM-BACKOFF-125-001:** When ALL circuit slots have EWMA score = 0.00 (network-wide HS degradation), CUSUM fires on every single request across all workers. This causes rapid slot cycling with no productive outcome. **Fix needed:** Implement graduated backoff (2s→4s→8s→16s) when all slots are dead. This saves ~50% of timeout budget during HS outages.
+- **PR-CUSUM-RESET-125-001:** CUSUM reset after repin should happen on the NEW circuit's entry, not the old circuit's entry. Old circuit's CUSUM is already irrelevant once the worker moves.
+- **PR-TTFB-CONVERGENCE-125-001:** Adaptive TTFB converges to the 5s floor (from 25s) within ~10 successful requests, confirming α=0.2 EWMA is appropriate. The floor at 5s is correct for DragonForce fsguest (0.3-0.8s typical latency), and the 3× multiplier plus 5s floor prevents false timeouts on 1-2s occasional spikes.
+- **LESSON-CLI-BENCHMARK-125-001:** The full CLI adapter test with CUSUM+EWMA+adaptive TTFB produced 8× more entries than the standalone test under the same Tor conditions. The key difference: the adapter recovers from degradation bursts by cycling to healthy circuits via CUSUM, while the standalone test has no circuit awareness.
+- **LESSON-IDM-125-001:** IDM-style `HostCapabilityState.first_byte_ewma_ms` is tracked in `aria_downloader.rs` but NOT used for adaptive download timeouts. The download path still uses fixed timeouts from `batch_swarm_first_byte_timeout()`. Wiring this in would bring adaptive TTFB benefits to the download side.
+
+## 2026-03-12 (Phase 124: P0-P3 + CUSUM Optimization Suite)
+- **PR-HEADERS-124-P0-001:** ArtiClient request headers MUST use `&'static str` slices, not `Vec<(String, String)>`. Every `generate_base_headers()` call was allocating 3 heap objects (Vec + 2 Strings) per request. With ~3,500 requests/crawl, this wasted ~10,500 allocations. Fix: `const UA_POOL` + `Vec<(&'static str, &'static str)>` that borrows static memory. Dynamic headers (caller `.header()`, `.json()`) now use a separate `dynamic_headers: Vec<(String, String)>`.
+- **PR-HTTP2-124-P3-001:** HTTP/2 initial window sizes MUST be tuned for Tor's BDP. Default `INITIAL_WINDOW_SIZE` (65KB) causes flow-control stalls on 300KB+ directory pages over 500ms-RTT circuits. Fix: `http2_initial_stream_window_size(262_144)` (256KB) + `http2_initial_connection_window_size(1_048_576)` (1MB), matching the measured BDP of ~312KB (5 Mbps × 500ms).
+- **PR-UA-124-P3-001:** User-Agent rotation pool expanded from 3→10 entries covering Chrome/Firefox/Safari/Edge on Windows/macOS/Linux with 2025-2026 version strings. This improves anonymity against UA correlation fingerprinting with zero runtime cost (static strings).
+- **PR-CUSUM-124-FUTURE-001:** CUSUM (Cumulative Sum) change-point detection MUST be implemented alongside periodic health checks. Fixed 15-request polling misses sudden circuit degradation for up to 14 requests. One-sided CUSUM with threshold=2.0 and drift=0.15 detects ~3 consecutive failures immediately. Circuit repin fires on CUSUM trigger OR periodic check (whichever comes first). Total additional overhead: 1 `AtomicU32` per circuit (4 bytes).
+- **PR-TTFB-124-P1-001:** Adaptive TTFB MUST replace fixed 25s timeout on warm circuits. After EWMA latency converges (α=0.2, ~5 observations), timeout becomes `max(3 × ewma_latency_ms, 5000ms)` capped at 25000ms. A circuit averaging 500ms latency drops to ~5s timeout (5× faster failure detection). Cold circuits (no data) retain the conservative 25s ceiling.
+- **PR-SPAWN-124-P2-001:** `spawn_blocking` MUST be size-gated: skip for response bodies <4KB. The Tokio blocking task scheduler costs ~5-10µs per spawn. For small API responses (<4KB), `from_utf8_lossy()` completes in ~1-2µs. The size gate saves ~5µs per small response. At 70% small-response ratio across ~3,500 requests, this saves ~12ms per crawl — insignificant alone but consistent with the "squeeze every cycle" principle.
+- **LESSON-P0-HEADERS-124-001:** March 12, 2026 build confirmed zero-alloc headers compile cleanly. `generate_base_headers()` returns `Vec<(&'static str, &'static str)>` borrowed from static memory. Dynamic caller headers (`.header("Connection", "keep-alive")`) go into the separate `dynamic_headers` vec, cleanly separating hot-path static data from cold-path dynamic data.
+- **LESSON-CUSUM-124-001:** CUSUM reset MUST happen after a repin, on the NEW circuit, not the old one. Resetting on the old circuit is correct for its bookkeeping, but the new circuit starts with CUSUM=0 (fresh `AtomicU32`) so no explicit reset is needed there.
+- **LESSON-P2-SIZEGATE-124-001:** DragonForce probe responses and small directory listings are typically <4KB. The size gate saves the largest percentage of overhead on these small responses where the relative spawn cost is highest.
+
+## 2026-03-12 (Phase 123: Global resp.bytes() Migration + ?search= Tree Flattening)
+- **PR-BYTES-123-001:** `resp.text().await` is BANNED project-wide. Every HTTP response body read MUST use `resp.bytes().await` + `String::from_utf8_lossy()`. The `text()` method performs charset detection and validation on the async executor — blocking tokio for ~0.5ms/page on 20KB+ HTML and potentially much longer on malformed multi-MB responses. `bytes()` returns raw bytes immediately; decoding happens outside the async runtime.
+- **PR-BYTES-123-002:** When the original code used `resp.text().await.unwrap_or_default()`, the idiomatic replacement is `String::from_utf8_lossy(&resp.bytes().await.unwrap_or_default()).into_owned()`. When it used `resp.text().await.ok()`, use `resp.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned()).ok()`. Both preserve the original error-handling semantics.
+- **PR-SEARCH-123-001:** After initial seed probe succeeds, always probe for search/list APIs that could flatten the entire tree in a single request. DragonForce Next.js SPAs may expose `/api/search`, `/api/files?recursive=true`, or `/api/list?search=*` endpoints that return the full directory tree as JSON. A single successful probe saves minutes of recursive BFS crawling.
+- **PR-SEARCH-123-002:** Search probes MUST be time-bounded (20s), fire concurrently across different circuits, and use abort-on-first-win to minimize Tor bandwidth waste. If all probes fail or return non-JSON, fall through to normal BFS with zero penalty.
+- **LESSON-BYTES-123-001:** Total migration covered 21 call sites across 10 adapters. The mechanical pattern is identical everywhere — `resp.text()` → `resp.bytes()` + `from_utf8_lossy()`. This uniformity makes it easy to grep-verify compliance: `rg '.text\(\).await'` should return zero results.
+
+## 2026-03-12 (Phase 122: Nine-Agent Optimization Implementation)
+- **PR-POOL-122-001:** Never destroy hyper connection pools on circuit rotation. Pre-build one `ArtiClient` per pool slot at crawl start and swap the index on rotation instead of constructing a new client. Previous behavior called `ArtiClient::new()` on every failure, discarding the 90s keep-alive pool and 32-slot idle cache. Fix: `Arc<Vec<ArtiClient>>` pre-built before workers start.
+- **PR-EWMA-122-001:** Use EWMA (α=0.3) for circuit health scoring, not binary counters. Binary `s/(s+f)` treats all history equally — a circuit bad for 100 requests that recovers in the last 10 scores identically to long-term mediocrity. EWMA converges in ~7 observations and uses a single `AtomicU32` via CAS (saving 4 bytes/circuit over 2× `AtomicU32`).
+- **PR-BODY-122-001:** Move `resp.text()` into `spawn_blocking` by calling `resp.bytes()` on the async executor and decoding with `String::from_utf8_lossy()` inside the blocking task. This frees ~0.5ms per page from the Tokio executor for 20KB+ HTML pages. The `native_arti_integration.md` Rule 1 states to always use `bytes()` + `spawn_blocking` for large responses.
+- **PR-KEEPALIVE-122-001:** Set `Connection: keep-alive` header on ALL worker requests, not just seed probes. Without this, Tor circuit TCP connections may be closed prematurely by guards that default to `Connection: close` on plain HTTP/1.1.
+- **PR-REPIN-122-001:** Workers should periodically (every 15 requests) check EWMA scores and repin to a better circuit if current score drops below 0.3 or a peer is 1.5× better. This prevents workers from staying stuck on degrading circuits purely through inertia.
+- **LESSON-POOL-122-001:** March 12, 2026 test confirmed pre-built ArtiClient pool initializes all 8 slots before workers start (0ms overhead — slots already seeded). Workers swap index in O(1) instead of rebuilding hyper pool (~2-4s saved per rotation).
+- **LESSON-BYTES-122-001:** `String::from_utf8_lossy()` produces identical parse results to `String::from_utf8()` for valid UTF-8 HTML. The lossy variant is safer (replaces invalid bytes with `\u{fffd}` instead of erroring) and runs inside the blocking thread pool.
+
+## 2026-03-12 (Phase 121C: ArtiClient TTFB Timeout Fix)
+- **PR-TTFB-121C-001:** ArtiClient TTFB timeout MUST be URL-aware for Tor Hidden Services. A hardcoded 10s inner timeout kills 45% of initial `.onion` connections (HS descriptor lookup alone takes 5-15s). Auto-detect `.onion` URLs → 25s, clearnet → 10s.
+- **PR-TTFB-121C-002:** Inner transport timeouts must NEVER be shorter than outer adapter timeouts. If `ArtiClient.send()` timeouts at 10s but the adapter wraps it in a 45s timeout, the inner layer fires first and the outer layer never helps.
+- **PR-TTFB-121C-003:** Always provide explicit timeout override methods (`.ttfb_timeout_secs(N)`) for special cases. Some adapters may need 30s+ for first-contact probes against cold HS nodes.
+- **PR-DEBUG-121C-001:** Remove verbose raw HTML debug prints before production runs. Dumping 4KB of raw HTML per page parse flooded 5.2MB of noise into terminal output over a 5-minute crawl (1,294 pages × 4KB).
+- **LESSON-TTFB-121C-001:** The March 12, 2026 live test confirmed zero "TTFB Timeout" errors on warm fsguest crawling after raising to 25s. Response times averaged 0.5s — the timeout was only needed for initial HS descriptor resolution.
+- **LESSON-TTFB-121C-002:** All 11 adapters benefit from this fix without any code changes because they all go through `ArtiClient::send()`. This is the power of fixing infrastructure-layer issues vs adapter-specific workarounds.
+
+## 2026-03-12 (Phase 121: Multi-Probe Seed Bootstrap + Circuit Health Scoring)
+- **PR-SEED-121-001:** Never rely on a single worker to fetch the seed URL. Race N (≤4) concurrent probes across different circuits. First success wins, losers cancel. This cuts bootstrap from ~40s to ~12s.
+- **PR-HEALTH-121-001:** Track circuit health with atomic success/failure counters per circuit slot. Use Bayesian ratio s/(s+f) to prefer circuits with higher success rates. Unknown circuits score 0.5 (neutral prior).
+- **PR-DEADCODE-121-001:** Remove unreachable code immediately after refactoring. The Phase 119 `consecutive_failures >= 2` block was dead after Phase 120B introduced per-failure rotation, but persisted as 5 unused assignment sites.
+- **LESSON-BOOTSTRAP-121-001:** The March 12, 2026 test showed 3,518 entries discovered in 5 minutes (2.4× over Phase 120B's 1,444) with 4 workers active vs 1. The bottleneck was queue starvation (only 1 worker had the seed URL), not adapter logic.
+
+## 2026-03-11 (Phase 113: VFS Path Canonicalization + Direct-Child Guard)
+- **PR-VFS-113-001:** Logical VFS paths must be canonicalized independently from operator filesystem paths. A crawled tree path like `folder\child\file.txt` is VFS metadata, not a Windows disk path, and must be normalized before storage/query so the tree renderer can reason about hierarchy correctly.
+- **PR-VFS-113-002:** The tree UI must reject non-direct descendants returned for the current layer. Even if the backend leaks a malformed deep child into a parent query, the renderer should not flatten that node into the visible layer.
+- **PR-VFS-113-003:** Validate Windows filesystem/output-root behavior separately from logical VFS path behavior. Both use “paths,” but they solve different problems and must not be coupled accidentally.
+- **LESSON-VFS-113-001:** The March 11, 2026 VFS flattening bug was not an explorer layout issue. The real fault was mixed `/` vs `\` logical separators inside persisted `FileEntry.path` values, which caused only some nested files to appear at the root while others still behaved correctly.
+- **LESSON-VFS-113-002:** Fixing only the frontend would have hidden the symptom but left malformed VFS data in storage. The durable repair required backend canonicalization plus a frontend direct-child guard.
+
+## 2026-03-11 (Phase 112: In-Output Support Root Simplification)
+- **PR-PATH-112-001:** Support artifacts must live under the operator-selected output root. A sibling hidden support root creates Windows-specific anchor failures without enough operational value to justify the extra path indirection.
+- **PR-PATH-112-002:** If an operation uses only one real support directory, the error surface should describe only that one directory. Preferred/fallback error wording makes operator debugging harder when the fallback path is the only path they actually care about.
+- **LESSON-PATH-112-001:** The March 11, 2026 follow-up Windows `Start Queue` failure proved that partial hardening was not enough. Even after fixing `\\?\` display and support-key sanitization, the sibling-root policy itself still created too many Windows edge cases; collapsing the design to an in-output support root removed that class of failure.
+
+## 2026-03-11 (Phase 111: Windows Support-Path Hardening)
+- **PR-PATH-111-001:** Never derive Windows support-directory names from raw extended-length device paths. Normalize `\\?\` / `\\?\UNC\` first, then sanitize to an allowlist, or illegal characters like `?` can leak into generated directory names.
+- **PR-PATH-111-002:** Do not place the hidden sibling support root at a Windows drive/share root when the selected output directory is directly under that root. In that layout, support artifacts belong inside the selected output folder, not at `X:\.onionforge_support\...`.
+- **PR-PATH-111-003:** Operator-facing logs and GUI error text must never expose raw Windows device syntax. Preserve the long-path form for filesystem operations, but strip it before serializing paths into user-visible messages.
+- **LESSON-PATH-111-001:** The March 11, 2026 Windows `Failed to create preferred support directory \\?\\X:\\...` regression was not just a permissions issue. The backend was still generating the support key from the raw device path and still treating `X:\Exports` as eligible for the sibling-root layout, which combined into invalid child names plus confusing drive-root targets.
+
+## 2026-03-11 (Phase 110: Support Directory Fallback Hardening)
+- **PR-PATH-110-001:** Do not assume the parent of the selected output root is writable just because the selected output root itself is writable. Hidden sibling support roots need a fallback path.
+- **PR-PATH-110-002:** Support-artifact path selection must be centralized. Crawl startup, direct downloads, scaffold downloads, and target-state persistence all need to resolve the same effective support root or they will drift into mixed-state failures.
+- **LESSON-PATH-110-001:** The March 11, 2026 `Failed to create support directory` error was caused by a writable output directory paired with a blocked parent-side hidden support anchor. Falling back to `output_root/.onionforge_support/<support_key>/` preserves startup reliability without giving up the preferred sibling-root layout when it is available.
+
+## 2026-03-11 (Phase 109: Hidden Hex Virtualizer + Click-Through Stability)
+- **PR-GUI-109-001:** Hidden modal components must not instantiate heavyweight virtualization while closed. If a dialog is not visible, its expensive hooks should not exist in the render tree at all.
+- **PR-GUI-109-002:** Toast/status overlays should be pointer-transparent by default. Informational UI must not sit in the click path of operator controls after an error is raised.
+- **PR-GUI-109-003:** Shared option objects in hot control bars need functional state updates, not object-spread writes from stale closures.
+- **LESSON-GUI-109-001:** The March 11, 2026 jsdom heap failure was caused by the closed Hex viewer still mounting a virtualized `256,000,000`-row disk surface. Moving that work behind an open-only boundary removed the `~4 GB` worker OOM and restored fast interaction tests.
+- **LESSON-GUI-109-002:** After the Hex viewer fix and toast click-through hardening, the full browser-mounted `App.tsx` fixture could again mount and interact normally in Chromium. The validated path toggled crawl options, raised the expected browser-only environment error on `Start Queue`, and preserved `.main-workspace` geometry exactly across the interaction.
+
+## 2026-03-11 (Phase 108: Overlay Integrity Audit + Browser App Fixture Boundary)
+- **PR-GUI-108-001:** Keep the preview shell as the canonical Playwright overlay gate until the forced browser-mounted `App.tsx` surface survives headless Chromium mount. A debug override is useful; replacing the stable gate with it is not.
+- **PR-GUI-108-002:** Any modal or diagnostic surface expected to participate in overlay/native smoke work must expose stable test ids for its interactive controls. Text-only or class-only selectors are not sufficient for deterministic reopen/retry logic.
+- **LESSON-GUI-108-001:** The March 11, 2026 supported preview-shell overlay audit passed cleanly at `32/32` controls with no geometry regressions, so the current Playwright contract remains healthy on the intended browser fixture surface.
+- **LESSON-GUI-108-002:** The March 11, 2026 forced full-app browser fixture still crashed Chromium before `.app-container` mounted. That is a real testing-surface blocker, not an overlay-layout regression inside the supported preview shell.
+
+## 2026-03-11 (Phase 102: Probe Admission Telemetry + Cooldown Escalation)
+- **PR-TRANSPORT-102-001:** Probe-stage admission failures must be counted in shared telemetry, not left as raw timeout lines. If the operator cannot see quarantine hits and full candidate exhaustion in the summary plane, first-wave admission collapse looks identical to a generic stalled batch.
+- **PR-TRANSPORT-102-002:** Productive-host memory must decay after repeated connect failures. A host that succeeded earlier in the session must not remain “productive” forever once it starts failing the first wave repeatedly.
+- **PR-TRANSPORT-102-003:** Full candidate-set exhaustion needs its own explicit log/metric branch. “All three hosts already degraded” is a different failure class from “one probe timed out.”
+- **LESSON-TRANSPORT-102-001:** The March 11, 2026 quick exact-target CLI replay proved the new counters are wired end to end. The summary surfaced `probe_admission=1/1` immediately after the first file exhausted all three candidates.
+- **LESSON-TRANSPORT-102-002:** Stricter cooldown changed visibility and host prioritization, but not useful work yet. The same quick replay then reached `quarantined_candidates=3/3` on the very next file, which means the next engineering target is exhausted-set fallback strategy, not another generic concurrency increase.
+
+## 2026-03-11 (Phase 101: IDM Transport Audit + Qilin Probe Admission Hardening)
+- **PR-TRANSPORT-101-001:** Copy IDM's host-specific exception behavior, not just its aggression. The useful pattern is server-aware connection policy and fast exceptions for weak hosts, not blind global widening.
+- **PR-TRANSPORT-101-002:** Qilin/onion probe failures must quarantine degraded hosts before the transfer scheduler sees them. If connect/timeouts are only handled after admission, the micro/small first wave is already wasted.
+- **PR-TRANSPORT-101-003:** After probe-stage host selection, alternate-host order must be reseeded for transfer-time failover. Reusing stale pre-probe alternate order throws away the information just learned by probing.
+- **LESSON-TRANSPORT-101-001:** Official IDM documentation reinforced the same conclusion as the libcurl/aria2 audit: mature downloaders win on scheduler policy and per-host exceptions more than on language or raw socket count.
+- **LESSON-TRANSPORT-101-002:** The March 11, 2026 “rustc hang” was stale-process and artifact-lock contention, not a dead compiler. After clearing the stale Crawli-only `cargo`/`rustc` jobs, `rustc -vV` returned immediately and the workspace rebuilt normally.
+- **LESSON-TRANSPORT-101-003:** The correct validation surface on macOS is `crawli-cli`, not the GUI `crawli` binary. The console binary works, but even a tiny `detect-input-mode` call still pays about `11.8s` of startup tax because it is linked against the full Tauri desktop stack.
+- **LESSON-TRANSPORT-101-004:** The rebuilt exact-target replay proved the new probe quarantine/rotation code is live without improving useful work yet. `GET Range` timeouts widened from `8s` to `12s` to `16s`, `Probe rotation` and `Probe routing` fired, `dl_transport` rose to `18/0/0`, and payload bytes still stayed at `0`.
+- **LESSON-TRANSPORT-101-005:** Concurrency must remain frozen even after the rebuild succeeds. The blocker is now purely first-wave admission quality, not the toolchain, not stale processes, and not missing alternate-host rotation.
+
+## 2026-03-10 (Phase 100: Active Host Cap + Comparative Downloader Research)
+- **PR-TRANSPORT-100-001:** Do not blame language before transport policy. The March 10, 2026 comparison across libcurl, aria2, wget2, and reqwest/hyper showed that the practical speed gap comes mostly from host-pressure control, host memory, and progress-sensitive aborts, not from "C vs Rust" alone.
+- **PR-TRANSPORT-100-002:** A real downloader-side active per-host cap must exist independently of idle pool sizing. Host-local overcommit is a scheduler problem, not a pool-configuration problem.
+- **PR-TRANSPORT-100-003:** Clearnet and onion host caps must stay traffic-class aware. A clearnet-safe ceiling can be dramatically higher than a rotating hidden-service-safe ceiling on the same machine.
+- **LESSON-TRANSPORT-100-001:** The active per-host cap did not hurt the direct path when tuned correctly. The March 10, 2026 clean direct regression run stayed strong at `394.59 Mbps` with `host_cap=32`.
+- **LESSON-TRANSPORT-100-002:** The exact-target Qilin replay proved the current onion bottleneck is still pre-transfer admission. Even with `host_cap_ceiling=4` and visible transport-counter movement (`dl_transport=18/0/0`), the batch produced `0` payload bytes because repeated `GET Range` probe timeouts and `client error (Connect)` failures killed the first wave before useful work began.
+- **LESSON-TRANSPORT-100-003:** Concurrency must remain frozen until the onion path shows non-zero useful work under the new host-pressure regime. Wider lane counts are not justified while probe-stage admission is still failing.
+
+## 2026-03-10 (Phase 99: Libcurl Transport Reverse-Engineering Audit)
+- **PR-TRANSPORT-099-001:** Do not confuse `pool_max_idle_per_host` with an active per-host transfer cap. Libcurl's `CURLMOPT_MAX_HOST_CONNECTIONS` limits live host pressure; idle-pool sizing alone does not.
+- **PR-TRANSPORT-099-002:** A successful ranged probe should be promotable into the first transfer whenever practical. Paying for `GET Range 0-0` and then starting a second transfer request wastes one request and one RTT on the hot path.
+- **PR-TRANSPORT-099-003:** Blanket `Connection: close` in downloader hot paths is anti-libcurl behavior. Use conditional keep-alive based on traffic class and host quality instead of disabling reuse everywhere.
+- **PR-TRANSPORT-099-004:** Downloader host memory must be explicit and shared. Persist non-sensitive transport facts per host: range support, validator type, connect/first-byte medians, safe parallelism cap, and degraded/quarantine state.
+- **PR-TRANSPORT-099-005:** Fixed wall-clock timeouts are too blunt for dynamic transport paths. Add low-speed limit/time semantics so slow-but-productive transfers are not treated the same as dead transfers.
+- **LESSON-TRANSPORT-099-003:** The first useful libcurl-style wins in Crawli came from transport intelligence, not wider concurrency. After the Phase 99 tranche landed, the backend compiled cleanly, `124` library tests passed, and the new counters flowed through CLI, protobuf, and UI without needing any concurrency increase.
+- **LESSON-TRANSPORT-099-004:** Probe promotion is safe only when it is bounded. The implemented path keeps probe seeding confined to micro/small swarm lanes and a configurable cache budget, preventing the probe path from turning into an unbounded hidden prefetch.
+- **LESSON-TRANSPORT-099-005:** Onion keep-alive needs earned trust. Clearnet reuse can stay on by default, but onion reuse should only remain hot for hosts that have accumulated productive successes without repeated low-speed aborts.
+- **LESSON-TRANSPORT-099-001:** Crawli already matches libcurl in some important areas: pooled clients, HTTP/2 on the Tor path, and production-path ranged probing. The remaining transport gains are mostly about reuse and admission intelligence, not simply opening more circuits.
+- **LESSON-TRANSPORT-099-002:** The most expensive current anti-libcurl pattern found on March 10, 2026 is the explicit `Connection: close` header in the batch small-file swarm and tournament probe paths. That destroys keep-alive reuse exactly where a proven productive host should start getting cheaper.
+
 ## 2026-03-10 (Phase 97: Browser Preview Render Audit + Preview Shell Split)
 - **PR-GUI-097-001:** Browser/Playwright preview must not depend on remote fonts or other network-only shell assets to reach `load`. The March 10 render audit showed that Google Fonts `@import` calls alone were enough to make the headless preview path look broken even on a healthy local dev server.
 - **PR-GUI-097-002:** Do not mount the full native Tauri operator tree in browser preview. A deterministic browser preview shell should be selected at bootstrap time so Playwright can validate the GUI without importing native bridge code.
@@ -432,6 +579,32 @@ We rolled out the complete military-grade predictive pacing suite inside `qilin_
 ## Network Requests & Size Probing Optimization
 *   **Merge `HEAD` probes**: Do not make secondary or standalone `HEAD` requests to ascertain `Content-Length`. Instead, initiate an initial HTTP connection employing standard `GET` requests with header modifiers (`Range: bytes=0-0` or `bytes=0-1`) explicitly. Processing `Content-Range` logic inherently circumvents double-striking targets. Eliminates half of the connection handshake burden on aggressive proxy layers natively.
 
+### Phase 98A: Native Smoke + Direct Benchmark Hardening (2026-03-10)
+* **Root Cause:** The first native-webview smoke runner waited behind the normal Tauri startup path, which auto-bootstraps an onion swarm in `setup`. That made a supposedly narrow GUI mount check depend on expensive network bootstrap before the smoke window could stabilize.
+* **Solution:** Added a dedicated smoke-mode fast path keyed off `CRAWLI_NATIVE_SMOKE_REPORT_PATH`. In smoke mode, the backend exposes a minimal IPC contract and bypasses automatic startup Tor bootstrap so the real Tauri shell can mount without phantom-pool warmup noise.
+* **Prevention Rule:** PR-NATIVE-SMOKE-001: Native GUI smoke passes must bypass heavyweight crawler/bootstrap side effects. A mount check that waits on Tor/bootstrap is not a smoke test; it is an integration soak disguised as one.
+* **Root Cause:** The first direct benchmark read logical temp-file size from a preallocated sparse file and therefore reported impossible throughput.
+* **Solution:** Direct benchmark accounting now derives bytes from persisted piece state or actual allocated blocks when state is unavailable.
+* **Prevention Rule:** PR-DIRECT-BENCH-001: Download benchmarks must never use logical file length on preallocated temp files as transferred bytes. Use persisted progress state or physical allocation metrics only.
+* **Root Cause:** Qilin download repinning was willing to bulk-force saved URLs onto one preferred host too early, which risked collapsing the first wave onto a weak winner.
+* **Solution:** Repinning now requires stronger subtree proof, caps host concentration, and rotates alternates deterministically per file path.
+* **Prevention Rule:** PR-QILIN-DOWNLOAD-001: Route memory may bias early download admission, but it must not overwhelm host diversity before useful completions confirm the winner.
+
+### Phase 98B: Production-Probe Benchmark Parity (2026-03-10)
+* **Root Cause:** The direct benchmark previously used a standalone `HEAD` path, while the production downloader uses a `GET Range` probe with `Content-Range` parsing and resume-validator extraction. That made the benchmark’s metadata plane diverge from production even after the byte-accounting bug was fixed.
+* **Solution:** `direct_download_benchmark.rs` now consumes `aria_downloader::probe_target(...)` directly and prints the resulting `content_length`, range-mode decision, and validator signal.
+* **Prevention Rule:** PR-BENCH-PARITY-001: Performance harnesses must consume the same probe and budgeting path as production. A benchmark that measures a sibling code path will drift and eventually lie.
+
+### Phase 98C: Qilin Probe-Stage Collapse Before Repin (2026-03-10)
+* **Root Cause:** The exact-target host-capped repin rerun still reached zero payload progress because the initial `GET Range` probe stage timed out repeatedly before any productive transfer completed. That means post-probe host-balancing logic never had a chance to engage.
+* **Solution:** Treat initial-probe success as the next true bottleneck. Any further Qilin download optimization should target probe-stage alternate-host remap, probe-budget shaping, or seed diversification before it targets post-probe repin.
+* **Prevention Rule:** PR-QILIN-PROBE-001: Do not attribute zero-byte onion download failures to post-probe routing logic unless at least one productive probe succeeded. Fix the earliest collapsing stage first.
+
+### Phase 98D: Graded Probe Budgets Need Host Quarantine Too (2026-03-10)
+* **Root Cause:** Graded probe budgets alone improved the timeout envelope (`8s -> 12s` observed live) but still produced zero payload bytes on the exact-target rerun. The run then fell into repeated `client error (Connect)` failures during the same probe stage.
+* **Solution:** The next probe-stage fix must combine graded budgets with degraded-host quarantine or alternate-cursor rotation, because simply waiting longer on the same weak first-wave hosts is insufficient.
+* **Prevention Rule:** PR-QILIN-PROBE-002: Never widen onion probe budgets without also giving the scheduler a way to abandon degraded hosts quickly. More patience on the same bad host is not the same as better admission.
+
 
 ## Phase 76D: HS Rendezvous Cold-Start Hardening
 
@@ -447,3 +620,8 @@ We rolled out the complete military-grade predictive pacing suite inside `qilin_
 ### Phase 77F: Qilin Top-3 Performance Execution
 - **PR-77F-001 (Inverted Queues):** Clear deeper paths and retries before fetching new root/shallow paths to prevent long tail stalls.
 - **PR-77F-002 (Circuit Pinning):** Spray concurrent workers across multiple mirror endpoints natively instead of shifting the entire proxy rotation on failover.
+
+
+### Phase 107.5: Scaling Memory Caps
+**Problem:** Massive directory iterations generated Vec blobs larger than max RSS physical sizes resulting in memory OOM faults.
+**Solution:** Engineered spillover.rs wrapping Sled KV engine as a native drop-in proxy for all adapters, utilizing sled::Db::generate_id for strictly ordered key retention and persistence across crawler reboots (Qilin Snapshot Resumption).

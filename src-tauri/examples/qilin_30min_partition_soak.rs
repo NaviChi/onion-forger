@@ -38,12 +38,12 @@ async fn main() -> Result<()> {
         sizes: true,
         download: true, // ← Phase 76C: THIS activates traffic separation
         circuits: Some(CIRCUITS),
-        daemons: Some(1),
         agnostic_state: true,
         resume: false,
         resume_index: None,
         mega_password: None,
-        stealth_ramp: true,
+        stealth_ramp: true, parallel_download: false,
+            force_clearnet: false,
     };
 
     println!("=======================================================");

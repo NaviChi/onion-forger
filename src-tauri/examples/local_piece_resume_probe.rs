@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
         app.handle().clone(),
         BatchFileEntry {
             url: url.clone(),
+            alternate_urls: Vec::new(),
             path: output_path.clone(),
             size_hint: None,
             jwt_exp: None,
@@ -106,7 +107,8 @@ async fn main() -> Result<()> {
     aria_downloader::start_download(
         app.handle().clone(),
         BatchFileEntry {
-            url,
+            url: url.clone(),
+            alternate_urls: Vec::new(),
             path: output_path.clone(),
             size_hint: None,
             jwt_exp: None,

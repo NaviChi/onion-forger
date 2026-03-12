@@ -1,7 +1,5 @@
 use anyhow::Result;
 use crawli_lib::runtime_metrics::RuntimeTelemetry;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {

@@ -5,6 +5,7 @@ pub mod azure_connectivity;
 pub mod bbr;
 pub mod bft_quorum;
 pub mod binary_telemetry;
+pub mod circuit_health;
 mod cli;
 pub mod db;
 pub mod frontier;
@@ -22,6 +23,8 @@ pub mod resource_governor;
 pub mod runtime_metrics;
 pub mod scorer;
 pub mod speculative_prefetch;
+pub mod spillover;
+pub mod work_stealing;
 pub mod subtree_heatmap;
 pub mod target_state;
 pub mod telemetry_bridge;
@@ -82,6 +85,70 @@ pub struct AppState {
     /// Phase 53: Azure connectivity state (only compiled with `--features azure`)
     #[cfg(feature = "azure")]
     pub azure: tokio::sync::Mutex<azure_connectivity::AzureConnectivityState>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeWebviewSmokeConfig {
+    enabled: bool,
+    report_path: Option<String>,
+    auto_exit: bool,
+    wait_ms: u64,
+    expected_test_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeWebviewSmokeResult {
+    mounted: bool,
+    title: String,
+    href: String,
+    is_tauri_runtime: bool,
+    expected_test_ids: Vec<String>,
+    found_test_ids: Vec<String>,
+    missing_test_ids: Vec<String>,
+    reported_at_epoch_ms: u64,
+}
+
+fn native_webview_smoke_expected_test_ids() -> Vec<String> {
+    vec![
+        "toolbar".to_string(),
+        "input-target-url".to_string(),
+        "btn-start-queue".to_string(),
+        "btn-load-target".to_string(),
+        "resource-metrics-card".to_string(),
+    ]
+}
+
+fn native_webview_smoke_report_path() -> Option<std::path::PathBuf> {
+    std::env::var("CRAWLI_NATIVE_SMOKE_REPORT_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn native_webview_smoke_enabled() -> bool {
+    native_webview_smoke_report_path().is_some()
+}
+
+fn native_webview_smoke_auto_exit() -> bool {
+    std::env::var("CRAWLI_NATIVE_SMOKE_AUTO_EXIT")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn native_webview_smoke_wait_ms() -> u64 {
+    std::env::var("CRAWLI_NATIVE_SMOKE_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(12_000)
+        .clamp(1_000, 60_000)
 }
 
 impl Default for AppState {
@@ -311,14 +378,28 @@ fn support_key_for_path(path: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
+    let normalized_path = path_utils::normalize_windows_device_path(path);
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    normalized_path.hash(&mut hasher);
     let hash = hasher.finish();
 
-    let mut base = path
-        .trim_start_matches('/')
-        .replace(['/', '\\'], "_")
-        .replace(':', "_");
+    let mut base = String::with_capacity(normalized_path.len());
+    let mut pending_separator = false;
+    for ch in normalized_path.trim_start_matches(['/', '\\']).chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => {
+                base.push(ch);
+                pending_separator = false;
+            }
+            _ => {
+                if !pending_separator {
+                    base.push('_');
+                    pending_separator = true;
+                }
+            }
+        }
+    }
+    base = base.trim_matches('_').to_string();
     if base.is_empty() {
         base = "root".to_string();
     }
@@ -333,55 +414,38 @@ fn support_key_for_path(path: &str) -> String {
 pub(crate) fn support_artifact_dir_for_output_root(
     output_root: &std::path::Path,
 ) -> std::path::PathBuf {
-    let anchor = output_root.parent().unwrap_or(output_root);
-    anchor
-        .join(".onionforge_support")
-        .join(support_key_for_path(&output_root.to_string_lossy()))
-}
-
-pub(crate) fn fallback_support_artifact_dir_for_output_root(
-    output_root: &std::path::Path,
-) -> std::path::PathBuf {
     output_root
         .join(".onionforge_support")
-        .join(support_key_for_path(&output_root.to_string_lossy()))
+        .join(support_key_for_path(&path_utils::display_path(output_root)))
 }
 
 pub(crate) struct SupportArtifactDirResolution {
     pub path: std::path::PathBuf,
     pub used_fallback: bool,
     pub fallback_reason: Option<String>,
+    pub note: Option<String>,
 }
 
 pub(crate) fn ensure_support_artifact_dir_for_output_root(
     output_root: &std::path::Path,
 ) -> std::io::Result<SupportArtifactDirResolution> {
-    let preferred = support_artifact_dir_for_output_root(output_root);
-    match std::fs::create_dir_all(&preferred) {
-        Ok(()) => Ok(SupportArtifactDirResolution {
-            path: preferred,
-            used_fallback: false,
-            fallback_reason: None,
-        }),
-        Err(preferred_err) => {
-            let fallback = fallback_support_artifact_dir_for_output_root(output_root);
-            match std::fs::create_dir_all(&fallback) {
-                Ok(()) => Ok(SupportArtifactDirResolution {
-                    path: fallback,
-                    used_fallback: true,
-                    fallback_reason: Some(preferred_err.to_string()),
-                }),
-                Err(fallback_err) => Err(std::io::Error::new(
-                    fallback_err.kind(),
-                    format!(
-                        "failed to create preferred support dir '{}' ({preferred_err}); fallback '{}' also failed ({fallback_err})",
-                        preferred.display(),
-                        fallback.display()
-                    ),
-                )),
-            }
-        }
-    }
+    let support_dir = support_artifact_dir_for_output_root(output_root);
+    std::fs::create_dir_all(&support_dir).map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed to create support dir '{}' ({err})",
+                path_utils::display_path(&support_dir)
+            ),
+        )
+    })?;
+
+    Ok(SupportArtifactDirResolution {
+        path: support_dir,
+        used_fallback: false,
+        fallback_reason: None,
+        note: None,
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -475,7 +539,23 @@ fn ranked_qilin_download_hosts(entries: &[adapters::FileEntry]) -> Vec<String> {
     ranked.into_iter().map(|(host, _)| host).collect()
 }
 
-fn build_qilin_alternate_urls(raw_url: &str, ranked_hosts: &[String]) -> Vec<String> {
+fn stable_rotation_index(key: &str, len: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+
+    if len <= 1 {
+        return 0;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % len
+}
+
+fn build_qilin_alternate_urls(
+    raw_url: &str,
+    ranked_hosts: &[String],
+    rotation_key: &str,
+) -> Vec<String> {
     let Some(current_host) = reqwest::Url::parse(raw_url)
         .ok()
         .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
@@ -484,17 +564,24 @@ fn build_qilin_alternate_urls(raw_url: &str, ranked_hosts: &[String]) -> Vec<Str
     };
 
     let mut seen = std::collections::HashSet::<String>::new();
-    let mut alternates = Vec::new();
+    let mut candidate_hosts = Vec::new();
     for host in ranked_hosts {
         let normalized = host.to_ascii_lowercase();
         if normalized == current_host || !seen.insert(normalized.clone()) {
             continue;
         }
-        if let Some(rewritten) = rewrite_qilin_seed_host(raw_url, &normalized) {
-            alternates.push(rewritten);
-        }
+        candidate_hosts.push(normalized);
     }
-    alternates
+
+    if candidate_hosts.len() > 1 {
+        let rotation = stable_rotation_index(rotation_key, candidate_hosts.len());
+        candidate_hosts.rotate_left(rotation);
+    }
+
+    candidate_hosts
+        .into_iter()
+        .filter_map(|host| rewrite_qilin_seed_host(raw_url, &host))
+        .collect()
 }
 
 fn build_batch_file_entry(
@@ -507,7 +594,7 @@ fn build_batch_file_entry(
         path: safe_target,
         size_hint: entry.size_bytes,
         jwt_exp: entry.jwt_exp,
-        alternate_urls: build_qilin_alternate_urls(&entry.raw_url, ranked_hosts),
+        alternate_urls: build_qilin_alternate_urls(&entry.raw_url, ranked_hosts, &entry.path),
     }
 }
 
@@ -654,14 +741,17 @@ async fn execute_crawl_attempt(
     let timer = crate::timer::CrawlTimer::new(app.clone());
     timer.emit_log(&format!("[System] Bootstrapping Target: {}", url));
 
-    let is_onion = url_targets_onion(url);
+    let is_onion = url_targets_onion(url) && !options.force_clearnet;
     let support_resolution = ensure_support_artifact_dir_for_output_root(output_root)
         .map_err(|e| format!("Failed to create support directory: {e}"))?;
     let support_dir = support_resolution.path;
+    if let Some(note) = support_resolution.note.as_deref() {
+        timer.emit_log(&format!("[PATH] {note}"));
+    }
     if support_resolution.used_fallback {
         timer.emit_log(&format!(
             "[PATH] Support artifact root fallback engaged: {}",
-            support_dir.display()
+            path_utils::display_path(&support_dir)
         ));
         if let Some(reason) = support_resolution.fallback_reason.as_deref() {
             timer.emit_log(&format!(
@@ -694,18 +784,16 @@ async fn execute_crawl_attempt(
         }
 
         if !pre_warmed {
-            timer.emit_log("[Tor Swarm] No pre-warmed swarm found. Cleaning stale daemons...");
+            timer.emit_log("[Tor Swarm] No pre-warmed swarm found. Cleaning up...");
             tor::cleanup_stale_tor_daemons();
             timer.emit_log("[Tor Swarm] Bootstrapping new native Arti cluster...");
             println!("[Crawli Bootstrap] starting tor bootstrap for {}", url);
 
-            let target_daemons = options
-                .daemons
-                .unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 })
-                .max(1);
+            // Phase 117: Hardcoded to 8 clients — MultiClientPool caps at 8 anyway
+            let target_clients = 8usize;
             match tor::bootstrap_tor_cluster_for_traffic(
                 app.clone(),
-                target_daemons,
+                target_clients,
                 0,
                 tor::SwarmTrafficClass::OnionService,
             )
@@ -713,7 +801,7 @@ async fn execute_crawl_attempt(
             {
                 Ok((guard, ports)) => {
                     timer.emit_log(&format!(
-                        "[Tor Swarm] Bootstrap complete: {} runtime, {} daemons active",
+                        "[Tor Swarm] Bootstrap complete: {} runtime, {} clients active",
                         guard.runtime_label(),
                         ports.len()
                     ));
@@ -732,19 +820,16 @@ async fn execute_crawl_attempt(
         }
     }
 
-    let daemon_count = if is_onion {
+    let client_count = if is_onion {
         arti_clients.len().max(1)
     } else {
-        options
-            .daemons
-            .unwrap_or(if cfg!(target_os = "windows") { 8 } else { 12 })
-            .max(1)
+        1 // Clearnet uses a single client
     };
 
     let mut frontier = frontier::CrawlerFrontier::new(
         Some(app.clone()),
         url.to_string(),
-        daemon_count,
+        client_count,
         is_onion,
         Vec::new(), // explicit ports removed, handled internally
         arti_clients,
@@ -752,9 +837,8 @@ async fn execute_crawl_attempt(
         Some(target_paths.clone()),
     );
     println!(
-        "[Crawli Bootstrap] frontier initialized: clients={} daemons={} onion={}",
+        "[Crawli Bootstrap] frontier initialized: clients={} onion={}",
         frontier.http_clients.len(),
-        frontier.num_daemons,
         frontier.is_onion
     );
     frontier.swarm_guard = swarm_guard_for_frontier;
@@ -1175,12 +1259,15 @@ async fn scaffold_download_from_entries_with_plan(
     tokio::fs::create_dir_all(&base).await?;
     let support_resolution = ensure_support_artifact_dir_for_output_root(&base)?;
     let support_dir = support_resolution.path;
+    if let Some(note) = support_resolution.note.as_deref() {
+        let _ = app.emit("crawl_log", format!("[PATH] {note}"));
+    }
     if support_resolution.used_fallback {
         let _ = app.emit(
             "crawl_log",
             format!(
                 "[PATH] Support artifacts fell back under output root: {}",
-                support_dir.display()
+                path_utils::display_path(&support_dir)
             ),
         );
     }
@@ -1608,7 +1695,75 @@ async fn start_crawl(
     .unwrap_or_default();
 
     let mut auto_download_started = false;
-    if auto_download {
+
+    // Phase 119: Parallel Download — stream entries to download engine during crawl
+    if options.parallel_download && !authoritative_entries.is_empty() {
+        let para_entries = authoritative_entries.clone();
+        let para_output_root = output_root.clone();
+        let para_app = app.clone();
+        let para_url = url.clone();
+        let para_force_clearnet = options.force_clearnet;
+        let circuits = options.circuits.unwrap_or(8).max(1);
+        let is_onion = url_targets_onion(&para_url) && !para_force_clearnet;
+
+        app.emit(
+            "crawl_log",
+            format!(
+                "[OPSEC] ⚡ Parallel Download engaged: streaming {} entries to download engine in real-time.",
+                para_entries.len()
+            ),
+        )
+        .unwrap_or_default();
+
+        // Fire-and-forget background download — runs concurrently with any auto_download
+        tokio::spawn(async move {
+            // Build a lightweight resume plan for the parallel batch
+            let target_paths_result = target_state::target_paths(&para_output_root, &para_url);
+            if let Ok(target_paths) = target_paths_result {
+                let failure_records =
+                    target_state::load_failure_manifest(&target_paths.failure_manifest_path)
+                        .unwrap_or_default();
+                if let Ok(resume_build) = target_state::build_download_resume_plan(
+                    &target_paths.target_identity.target_key,
+                    &para_entries,
+                    &failure_records,
+                    &para_output_root,
+                    &target_paths.failure_manifest_path,
+                ) {
+                    if !resume_build.plan.all_items_skipped {
+                        let _ = para_app.emit("download_resume_plan", resume_build.plan.clone());
+                        match scaffold_download_from_entries_with_plan(
+                            &para_entries,
+                            &resume_build.ordered_entries,
+                            &target_paths,
+                            &para_output_root,
+                            &para_app,
+                            circuits,
+                            is_onion,
+                        )
+                        .await
+                        {
+                            Ok(count) => {
+                                let _ = para_app.emit(
+                                    "crawl_log",
+                                    format!("[OPSEC] ⚡ Parallel Mirror complete. {} items.", count),
+                                );
+                            }
+                            Err(e) => {
+                                let _ = para_app.emit(
+                                    "crawl_log",
+                                    format!("[ERROR] Parallel Mirror failed: {}", e),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        auto_download_started = true;
+    }
+
+    if auto_download && !auto_download_started {
         let failure_records =
             target_state::load_failure_manifest(&target_paths.failure_manifest_path)
                 .map_err(|e| e.to_string())?;
@@ -1659,7 +1814,7 @@ async fn start_crawl(
                 ),
             )
             .unwrap_or_default();
-            let is_onion = url_targets_onion(&url);
+            let is_onion = url_targets_onion(&url) && !options.force_clearnet;
             match scaffold_download_from_entries_with_plan(
                 &authoritative_entries,
                 &resume_build.ordered_entries,
@@ -1874,28 +2029,48 @@ fn preferred_qilin_host_for_subtree(
     winner_host.map(|host| host.to_string())
 }
 
+#[cfg(test)]
 fn preferred_qilin_download_host_for_subtree(
     subtree: &str,
     routes_by_subtree: &std::collections::HashMap<String, PersistedQilinSubtreeRouteEntry>,
     winner_host: Option<&str>,
-    updated_at_epoch: u64,
 ) -> Option<String> {
     let mut cursor = Some(subtree);
     while let Some(candidate) = cursor {
         if let Some(route) = routes_by_subtree.get(candidate) {
-            if let Some(winner_host) = winner_host {
-                let route_age = updated_at_epoch.saturating_sub(route.last_success_epoch);
-                let should_prefer_winner = !winner_host.eq_ignore_ascii_case(&route.preferred_host)
-                    && (route.success_count < 2 || route_age > 120);
-                if should_prefer_winner {
-                    return Some(winner_host.to_string());
-                }
-            }
             return Some(route.preferred_host.clone());
         }
         cursor = candidate.rsplit_once('/').map(|(parent, _)| parent);
     }
     winner_host.map(|host| host.to_string())
+}
+
+fn should_repin_qilin_download_to_preferred_host(
+    route: &PersistedQilinSubtreeRouteEntry,
+    winner_host: Option<&str>,
+    updated_at_epoch: u64,
+) -> bool {
+    let route_age = updated_at_epoch.saturating_sub(route.last_success_epoch);
+    if route.success_count >= 4 && route_age <= 900 {
+        return true;
+    }
+
+    winner_host
+        .map(|winner| winner.eq_ignore_ascii_case(&route.preferred_host))
+        .unwrap_or(false)
+        && route.success_count >= 2
+        && route_age <= 180
+}
+
+fn balanced_qilin_repin_host_cap(total_files: usize, distinct_hosts: usize) -> usize {
+    if distinct_hosts <= 1 {
+        return total_files.max(1);
+    }
+
+    let average = total_files.div_ceil(distinct_hosts).max(1);
+    average
+        .saturating_add((average / 4).max(1))
+        .saturating_add(24)
 }
 
 fn maybe_repin_qilin_entries_from_context(
@@ -1920,26 +2095,73 @@ fn maybe_repin_qilin_entries_from_context(
             .into_iter()
             .map(|entry| (entry.subtree_key.clone(), entry))
             .collect();
+    let mut host_counts = std::collections::HashMap::<String, usize>::new();
+    let mut total_onion_files = 0usize;
+    for entry in entries.iter() {
+        if !matches!(entry.entry_type, adapters::EntryType::File)
+            || !url_targets_onion(&entry.raw_url)
+        {
+            continue;
+        }
+        if let Some(host) = reqwest::Url::parse(&entry.raw_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        {
+            *host_counts.entry(host).or_default() += 1;
+            total_onion_files = total_onion_files.saturating_add(1);
+        }
+    }
+    let host_cap = balanced_qilin_repin_host_cap(total_onion_files, host_counts.len().max(1));
 
     let mut rewrites = 0usize;
     for entry in entries.iter_mut() {
-        if !url_targets_onion(&entry.raw_url) {
+        if !matches!(entry.entry_type, adapters::EntryType::File)
+            || !url_targets_onion(&entry.raw_url)
+        {
             continue;
         }
         let Some(subtree_key) = subtree_key_for_qilin_download(&entry.raw_url) else {
             continue;
         };
-        let Some(preferred_host) = preferred_qilin_download_host_for_subtree(
-            &subtree_key,
-            &routes_by_subtree,
-            winner_host.as_deref(),
-            updated_at_epoch,
-        ) else {
+        let Some(route) = routes_by_subtree.get(&subtree_key).or_else(|| {
+            let mut cursor = subtree_key.rsplit_once('/').map(|(parent, _)| parent);
+            while let Some(candidate) = cursor {
+                if let Some(route) = routes_by_subtree.get(candidate) {
+                    return Some(route);
+                }
+                cursor = candidate.rsplit_once('/').map(|(parent, _)| parent);
+            }
+            None
+        }) else {
             continue;
         };
+        if !should_repin_qilin_download_to_preferred_host(
+            route,
+            winner_host.as_deref(),
+            updated_at_epoch,
+        ) {
+            continue;
+        }
+        let preferred_host = route.preferred_host.to_ascii_lowercase();
+        let Some(current_host) = reqwest::Url::parse(&entry.raw_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        else {
+            continue;
+        };
+        if preferred_host == current_host {
+            continue;
+        }
+        if host_counts.get(&preferred_host).copied().unwrap_or(0) >= host_cap {
+            continue;
+        }
         let Some(remapped) = rewrite_qilin_seed_host(&entry.raw_url, &preferred_host) else {
             continue;
         };
+        if let Some(count) = host_counts.get_mut(&current_host) {
+            *count = count.saturating_sub(1);
+        }
+        *host_counts.entry(preferred_host).or_default() += 1;
         entry.raw_url = remapped;
         rewrites = rewrites.saturating_add(1);
     }
@@ -1949,13 +2171,61 @@ fn maybe_repin_qilin_entries_from_context(
         let _ = app.emit(
             "crawl_log",
             format!(
-                "[Qilin Download] Repinned {} saved URLs using subtree route memory (winner host {}).",
-                rewrites, winner_host
+                "[Qilin Download] Repinned {} saved URLs using subtree route memory with host_cap={} (winner host {}).",
+                rewrites, host_cap, winner_host
             ),
         );
     }
 
     Ok(rewrites)
+}
+
+#[tauri::command]
+fn get_native_smoke_config() -> NativeWebviewSmokeConfig {
+    NativeWebviewSmokeConfig {
+        enabled: native_webview_smoke_enabled(),
+        report_path: native_webview_smoke_report_path()
+            .map(|path| path.to_string_lossy().to_string()),
+        auto_exit: native_webview_smoke_auto_exit(),
+        wait_ms: native_webview_smoke_wait_ms(),
+        expected_test_ids: native_webview_smoke_expected_test_ids(),
+    }
+}
+
+#[tauri::command]
+async fn report_native_smoke_result(
+    result: NativeWebviewSmokeResult,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let Some(report_path) = native_webview_smoke_report_path() else {
+        return Ok(());
+    };
+
+    if let Some(parent) = report_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let json = serde_json::to_vec_pretty(&result).map_err(|e| e.to_string())?;
+    tokio::fs::write(&report_path, json)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let _ = app.emit(
+        "log",
+        format!(
+            "[NATIVE_SMOKE] mounted={} missing={}",
+            result.mounted,
+            result.missing_test_ids.len()
+        ),
+    );
+
+    if native_webview_smoke_auto_exit() {
+        app.exit(0);
+    }
+
+    Ok(())
 }
 
 async fn scaffold_download(
@@ -1972,12 +2242,15 @@ async fn scaffold_download(
     tokio::fs::create_dir_all(&base).await?;
     let support_resolution = ensure_support_artifact_dir_for_output_root(&base)?;
     let support_dir = support_resolution.path;
+    if let Some(note) = support_resolution.note.as_deref() {
+        let _ = app.emit("crawl_log", format!("[PATH] {note}"));
+    }
     if support_resolution.used_fallback {
         let _ = app.emit(
             "crawl_log",
             format!(
                 "[PATH] Support artifacts fell back under output root: {}",
-                support_dir.display()
+                path_utils::display_path(&support_dir)
             ),
         );
     }
@@ -2299,20 +2572,30 @@ async fn run_single_download_blocking(
     let safe_target = path_utils::resolve_download_target_within_root(&output_root, &path)
         .map_err(|e| format!("Unsafe target path rejected: {e}"))?;
     let safe_target_str = safe_target.to_string_lossy().to_string();
+    let safe_target_display = path_utils::display_path(&safe_target);
 
     app.emit("log", format!("Initiating extraction for: {url}"))
         .ok();
     app.emit(
         "log",
-        format!("[PATH] Output root: {}", output_root.display()),
+        format!(
+            "[PATH] Output root: {}",
+            path_utils::display_path(&output_root)
+        ),
     )
     .ok();
     let support_resolution = ensure_support_artifact_dir_for_output_root(&output_root)
         .map_err(|e| format!("Failed to create support directory: {e}"))?;
     let support_dir = support_resolution.path;
+    if let Some(note) = support_resolution.note.as_deref() {
+        app.emit("log", format!("[PATH] {note}")).ok();
+    }
     app.emit(
         "log",
-        format!("[PATH] Support artifact dir: {}", support_dir.display()),
+        format!(
+            "[PATH] Support artifact dir: {}",
+            path_utils::display_path(&support_dir)
+        ),
     )
     .ok();
     if support_resolution.used_fallback {
@@ -2324,7 +2607,7 @@ async fn run_single_download_blocking(
     }
     app.emit(
         "log",
-        format!("[PATH] Resolved target path: {}", safe_target_str),
+        format!("[PATH] Resolved target path: {}", safe_target_display),
     )
     .ok();
 
@@ -2399,16 +2682,16 @@ fn stop_active_download(app: tauri::AppHandle) -> Result<bool, String> {
 
 pub(crate) async fn ensure_crawl_swarm(
     app: &tauri::AppHandle,
-    daemon_count: usize,
 ) -> Result<Arc<tokio::sync::Mutex<tor::TorProcessGuard>>, String> {
     let state = app.state::<AppState>();
     if let Some(existing) = state.crawl_swarm_guard.lock().await.clone() {
         return Ok(existing);
     }
 
+    // Phase 117: Hardcoded to 8 — MultiClientPool caps at 8 TorClients
     let (guard, _) = tor::bootstrap_tor_cluster_for_traffic(
         app.clone(),
-        daemon_count.max(1),
+        8,
         0,
         tor::SwarmTrafficClass::OnionService,
     )
@@ -2424,7 +2707,7 @@ async fn perform_pre_resolve_onion(url: &str, app: &tauri::AppHandle) -> Result<
         return Ok(());
     }
 
-    let guard_arc = ensure_crawl_swarm(app, 1).await?;
+    let guard_arc = ensure_crawl_swarm(app).await?;
     let guard = guard_arc.lock().await;
     let shared_client = guard
         .get_arti_clients()
@@ -2536,6 +2819,13 @@ fn run_gui() {
                 app.handle().clone(),
                 state.telemetry_bridge.clone(),
             );
+            if native_webview_smoke_enabled() {
+                let _ = app.emit(
+                    "log",
+                    "[NATIVE_SMOKE] startup bootstrap bypass enabled".to_string(),
+                );
+                return Ok(());
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
@@ -2569,6 +2859,8 @@ fn run_gui() {
             get_subtree_heatmap,
             open_folder_os,
             set_telemetry_enabled,
+            get_native_smoke_config,
+            report_native_smoke_result,
             crate::binary_telemetry::drain_telemetry_ring,
             detect_input_mode,
             get_system_profile,
@@ -2615,10 +2907,12 @@ pub fn run_cli() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_qilin_alternate_urls, preferred_qilin_download_host_for_subtree,
-        preferred_qilin_host_for_subtree, rewrite_qilin_seed_host,
+        balanced_qilin_repin_host_cap, build_qilin_alternate_urls,
+        preferred_qilin_download_host_for_subtree, preferred_qilin_host_for_subtree,
+        rewrite_qilin_seed_host, should_repin_qilin_download_to_preferred_host,
         split_qilin_download_seed_and_relative_path, subtree_key_for_qilin_download,
-        support_artifact_dir_for_output_root, url_targets_onion, PersistedQilinSubtreeRouteEntry,
+        support_artifact_dir_for_output_root, support_key_for_path, url_targets_onion,
+        PersistedQilinSubtreeRouteEntry,
     };
     use std::collections::HashMap;
 
@@ -2685,7 +2979,7 @@ mod tests {
     }
 
     #[test]
-    fn download_host_bias_prefers_fresh_winner_over_aged_subtree_host() {
+    fn download_host_bias_uses_subtree_preference_before_winner_fallback() {
         let mut routes = HashMap::new();
         routes.insert(
             "kent/Business%20Related".to_string(),
@@ -2701,22 +2995,52 @@ mod tests {
             "kent/Business%20Related/1%20and%201%20internet",
             &routes,
             Some("winner.onion"),
-            260,
         );
 
-        assert_eq!(preferred.as_deref(), Some("winner.onion"));
+        assert_eq!(preferred.as_deref(), Some("stale.onion"));
     }
 
     #[test]
-    fn support_artifact_dir_moves_outside_payload_root() {
+    fn strong_subtree_route_is_required_before_download_repin() {
+        let weak_route = PersistedQilinSubtreeRouteEntry {
+            subtree_key: "kent/Business%20Related".to_string(),
+            preferred_host: "winner.onion".to_string(),
+            success_count: 1,
+            last_success_epoch: 100,
+        };
+        assert!(!should_repin_qilin_download_to_preferred_host(
+            &weak_route,
+            Some("winner.onion"),
+            260,
+        ));
+
+        let strong_route = PersistedQilinSubtreeRouteEntry {
+            success_count: 4,
+            last_success_epoch: 250,
+            ..weak_route
+        };
+        assert!(should_repin_qilin_download_to_preferred_host(
+            &strong_route,
+            Some("winner.onion"),
+            260,
+        ));
+    }
+
+    #[test]
+    fn balanced_qilin_repin_cap_preserves_host_diversity() {
+        assert_eq!(balanced_qilin_repin_host_cap(1, 1), 1);
+        assert!(balanced_qilin_repin_host_cap(2_394, 3) < 1_100);
+    }
+
+    #[test]
+    fn support_artifact_dir_stays_inside_selected_output_root() {
         let output_root = std::path::Path::new("/tmp/onionforge/output");
         let support_dir = support_artifact_dir_for_output_root(output_root);
-        assert!(support_dir.starts_with("/tmp/onionforge/.onionforge_support"));
-        assert!(!support_dir.starts_with(output_root));
+        assert!(support_dir.starts_with(output_root.join(".onionforge_support")));
     }
 
     #[test]
-    fn support_artifact_dir_falls_back_inside_output_root_when_sibling_anchor_is_blocked() {
+    fn support_artifact_dir_ignores_blocked_sibling_anchor_and_uses_output_root() {
         let unique = format!(
             "onionforge-support-fallback-{}-{}",
             std::process::id(),
@@ -2733,13 +3057,27 @@ mod tests {
         std::fs::write(&blocked_anchor, b"blocked").unwrap();
 
         let resolution = super::ensure_support_artifact_dir_for_output_root(&output_root).unwrap();
-        assert!(resolution.used_fallback);
-        assert!(resolution.path.starts_with(output_root.join(".onionforge_support")));
+        assert!(!resolution.used_fallback);
+        assert!(resolution
+            .path
+            .starts_with(output_root.join(".onionforge_support")));
         assert!(resolution.path.is_dir());
-        assert!(resolution.fallback_reason.is_some());
+        assert!(resolution.fallback_reason.is_none());
+        assert!(resolution.note.is_none());
 
         let _ = std::fs::remove_file(&blocked_anchor);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn support_key_for_windows_device_path_removes_reserved_chars() {
+        let key = support_key_for_path(r"\\?\X:\Exports\Case 1");
+        assert!(key.starts_with("X_Exports_Case_1_"));
+        assert!(!key.contains('?'));
+        assert!(!key.contains(':'));
+        assert!(!key.contains('\\'));
+        assert!(!key.contains('/'));
+        assert!(!key.contains('*'));
     }
 
     #[test]
@@ -2753,18 +3091,17 @@ mod tests {
                 "hostb.onion".to_string(),
                 "hostc.onion".to_string(),
             ],
+            "kent/Bankrupcy/report.pdf",
         );
         assert_eq!(alternates.len(), 2);
-        assert_eq!(
-            alternates[0],
-            "http://hostb.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Bankrupcy/report.pdf"
-        );
-        assert_eq!(
-            alternates[1],
-            "http://hostc.onion/6749d00a-277a-4575-a398-2120f37889d6/kent/Bankrupcy/report.pdf"
-        );
+        assert!(alternates[0].contains("hostb.onion") || alternates[0].contains("hostc.onion"));
+        assert_ne!(alternates[0], alternates[1]);
+        assert!(alternates
+            .iter()
+            .all(|url| url.contains("/kent/Bankrupcy/report.pdf")));
     }
 }
 pub mod arti_client;
 pub mod arti_connector;
 pub mod seed_manager;
+mod sp_test;

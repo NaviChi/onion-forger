@@ -41,6 +41,9 @@ pub struct ResourceMetricsSnapshot {
     pub failed_requests: usize,
     pub fingerprint_latency_ms: u64,
     pub cached_route_hits: usize,
+    pub qilin_fresh_redirect_candidates: usize,
+    pub qilin_stale_host_only_candidates: usize,
+    pub qilin_degraded_stage_d_activations: usize,
     pub subtree_reroutes: usize,
     pub subtree_quarantine_hits: usize,
     pub off_winner_child_requests: usize,
@@ -50,6 +53,11 @@ pub struct ResourceMetricsSnapshot {
     pub slowest_circuit: Option<String>,
     pub late_throttles: usize,
     pub outlier_isolations: usize,
+    pub download_host_cache_hits: usize,
+    pub download_probe_promotion_hits: usize,
+    pub download_low_speed_aborts: usize,
+    pub download_probe_quarantine_hits: usize,
+    pub download_probe_candidate_exhaustions: usize,
 }
 
 #[derive(Clone, Default)]
@@ -83,6 +91,9 @@ pub struct RuntimeTelemetry {
     discovery_failed_requests: Arc<AtomicUsize>,
     fingerprint_latency_ms: Arc<std::sync::atomic::AtomicU64>,
     cached_route_hits: Arc<AtomicUsize>,
+    qilin_fresh_redirect_candidates: Arc<AtomicUsize>,
+    qilin_stale_host_only_candidates: Arc<AtomicUsize>,
+    qilin_degraded_stage_d_activations: Arc<AtomicUsize>,
     subtree_reroutes: Arc<AtomicUsize>,
     subtree_quarantine_hits: Arc<AtomicUsize>,
     off_winner_child_requests: Arc<AtomicUsize>,
@@ -90,6 +101,11 @@ pub struct RuntimeTelemetry {
     slowest_circuit: Arc<RwLock<Option<String>>>,
     late_throttles: Arc<AtomicUsize>,
     outlier_isolations: Arc<AtomicUsize>,
+    download_host_cache_hits: Arc<AtomicUsize>,
+    download_probe_promotion_hits: Arc<AtomicUsize>,
+    download_low_speed_aborts: Arc<AtomicUsize>,
+    download_probe_quarantine_hits: Arc<AtomicUsize>,
+    download_probe_candidate_exhaustions: Arc<AtomicUsize>,
 }
 
 impl RuntimeTelemetry {
@@ -109,11 +125,25 @@ impl RuntimeTelemetry {
         self.discovery_failed_requests.store(0, Ordering::Relaxed);
         self.fingerprint_latency_ms.store(0, Ordering::Relaxed);
         self.cached_route_hits.store(0, Ordering::Relaxed);
+        self.qilin_fresh_redirect_candidates
+            .store(0, Ordering::Relaxed);
+        self.qilin_stale_host_only_candidates
+            .store(0, Ordering::Relaxed);
+        self.qilin_degraded_stage_d_activations
+            .store(0, Ordering::Relaxed);
         self.subtree_reroutes.store(0, Ordering::Relaxed);
         self.subtree_quarantine_hits.store(0, Ordering::Relaxed);
         self.off_winner_child_requests.store(0, Ordering::Relaxed);
         self.late_throttles.store(0, Ordering::Relaxed);
         self.outlier_isolations.store(0, Ordering::Relaxed);
+        self.download_host_cache_hits.store(0, Ordering::Relaxed);
+        self.download_probe_promotion_hits
+            .store(0, Ordering::Relaxed);
+        self.download_low_speed_aborts.store(0, Ordering::Relaxed);
+        self.download_probe_quarantine_hits
+            .store(0, Ordering::Relaxed);
+        self.download_probe_candidate_exhaustions
+            .store(0, Ordering::Relaxed);
         if let Ok(mut host) = self.current_node_host.write() {
             *host = None;
         }
@@ -139,6 +169,14 @@ impl RuntimeTelemetry {
         if previous == 0 {
             self.active_circuits.store(0, Ordering::Relaxed);
             self.peak_active_circuits.store(0, Ordering::Relaxed);
+            self.download_host_cache_hits.store(0, Ordering::Relaxed);
+            self.download_probe_promotion_hits
+                .store(0, Ordering::Relaxed);
+            self.download_low_speed_aborts.store(0, Ordering::Relaxed);
+            self.download_probe_quarantine_hits
+                .store(0, Ordering::Relaxed);
+            self.download_probe_candidate_exhaustions
+                .store(0, Ordering::Relaxed);
             if let Ok(mut start) = self.session_start.write() {
                 if start.is_none() {
                     *start = Some(std::time::Instant::now());
@@ -277,6 +315,22 @@ impl RuntimeTelemetry {
         self.cached_route_hits.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn set_qilin_discovery_candidate_mix(
+        &self,
+        fresh_redirect_candidates: usize,
+        stale_host_only_candidates: usize,
+    ) {
+        self.qilin_fresh_redirect_candidates
+            .store(fresh_redirect_candidates, Ordering::Relaxed);
+        self.qilin_stale_host_only_candidates
+            .store(stale_host_only_candidates, Ordering::Relaxed);
+    }
+
+    pub fn record_qilin_degraded_stage_d_activation(&self) {
+        self.qilin_degraded_stage_d_activations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_subtree_reroute(&self) {
         self.subtree_reroutes.fetch_add(1, Ordering::Relaxed);
     }
@@ -308,6 +362,31 @@ impl RuntimeTelemetry {
 
     pub fn record_outlier_isolation(&self) {
         self.outlier_isolations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_download_host_cache_hit(&self) {
+        self.download_host_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_download_probe_promotion_hit(&self) {
+        self.download_probe_promotion_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_download_low_speed_abort(&self) {
+        self.download_low_speed_aborts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_download_probe_quarantine_hit(&self) {
+        self.download_probe_quarantine_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_download_probe_candidate_exhaustion(&self) {
+        self.download_probe_candidate_exhaustions
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Phase 76: Update throttle rate telemetry
@@ -397,6 +476,15 @@ impl RuntimeTelemetry {
                 + self.discovery_failed_requests.load(Ordering::Relaxed),
             fingerprint_latency_ms: self.fingerprint_latency_ms.load(Ordering::Relaxed),
             cached_route_hits: self.cached_route_hits.load(Ordering::Relaxed),
+            qilin_fresh_redirect_candidates: self
+                .qilin_fresh_redirect_candidates
+                .load(Ordering::Relaxed),
+            qilin_stale_host_only_candidates: self
+                .qilin_stale_host_only_candidates
+                .load(Ordering::Relaxed),
+            qilin_degraded_stage_d_activations: self
+                .qilin_degraded_stage_d_activations
+                .load(Ordering::Relaxed),
             subtree_reroutes: self.subtree_reroutes.load(Ordering::Relaxed),
             subtree_quarantine_hits: self.subtree_quarantine_hits.load(Ordering::Relaxed),
             off_winner_child_requests: self.off_winner_child_requests.load(Ordering::Relaxed),
@@ -408,6 +496,17 @@ impl RuntimeTelemetry {
                 .and_then(|summary| summary.clone()),
             late_throttles: self.late_throttles.load(Ordering::Relaxed),
             outlier_isolations: self.outlier_isolations.load(Ordering::Relaxed),
+            download_host_cache_hits: self.download_host_cache_hits.load(Ordering::Relaxed),
+            download_probe_promotion_hits: self
+                .download_probe_promotion_hits
+                .load(Ordering::Relaxed),
+            download_low_speed_aborts: self.download_low_speed_aborts.load(Ordering::Relaxed),
+            download_probe_quarantine_hits: self
+                .download_probe_quarantine_hits
+                .load(Ordering::Relaxed),
+            download_probe_candidate_exhaustions: self
+                .download_probe_candidate_exhaustions
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -575,5 +674,37 @@ mod tests {
         assert_eq!(snapshot.slowest_circuit.as_deref(), Some("c7:8450ms"));
         assert_eq!(snapshot.late_throttles, 1);
         assert_eq!(snapshot.outlier_isolations, 2);
+    }
+
+    #[test]
+    fn snapshot_includes_qilin_discovery_candidate_mix() {
+        let telemetry = RuntimeTelemetry::default();
+        telemetry.begin_crawl_session();
+        telemetry.set_qilin_discovery_candidate_mix(2, 17);
+        telemetry.record_qilin_degraded_stage_d_activation();
+
+        let snapshot = telemetry.build_snapshot(0.0, 0, 0, 0, 0);
+        assert_eq!(snapshot.qilin_fresh_redirect_candidates, 2);
+        assert_eq!(snapshot.qilin_stale_host_only_candidates, 17);
+        assert_eq!(snapshot.qilin_degraded_stage_d_activations, 1);
+    }
+
+    #[test]
+    fn download_probe_admission_counters_reset_and_snapshot() {
+        let telemetry = RuntimeTelemetry::default();
+        telemetry.begin_download_session();
+        telemetry.record_download_probe_quarantine_hit();
+        telemetry.record_download_probe_quarantine_hit();
+        telemetry.record_download_probe_candidate_exhaustion();
+
+        let snapshot = telemetry.build_snapshot(0.0, 0, 0, 0, 0);
+        assert_eq!(snapshot.download_probe_quarantine_hits, 2);
+        assert_eq!(snapshot.download_probe_candidate_exhaustions, 1);
+
+        telemetry.end_download_session();
+        telemetry.begin_download_session();
+        let reset_snapshot = telemetry.build_snapshot(0.0, 0, 0, 0, 0);
+        assert_eq!(reset_snapshot.download_probe_quarantine_hits, 0);
+        assert_eq!(reset_snapshot.download_probe_candidate_exhaustions, 0);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "crawli"
-version = "0.5.0"
+version = "0.6.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -22,6 +22,10 @@ path = "src/bin/adapter_benchmark.rs"
 [[bin]]
 name = "crawli-cli"
 path = "src/bin/crawli_cli.rs"
+
+[[bin]]
+name = "direct-download-benchmark"
+path = "src/bin/direct_download_benchmark.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

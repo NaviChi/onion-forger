@@ -267,6 +267,22 @@ pub fn ensure_long_path(path: PathBuf) -> PathBuf {
     path
 }
 
+/// Removes the Windows extended-length path prefix from display strings so logs
+/// and UI error messages show normal operator-facing paths.
+pub fn normalize_windows_device_path(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix("\\\\?\\UNC\\") {
+        return format!("\\\\{}", rest);
+    }
+    if let Some(rest) = raw.strip_prefix("\\\\?\\") {
+        return rest.to_string();
+    }
+    raw.to_string()
+}
+
+pub fn display_path(path: &Path) -> String {
+    normalize_windows_device_path(&path.to_string_lossy())
+}
+
 pub fn resolve_path_within_root(
     output_root: &Path,
     raw_path: &str,
@@ -462,5 +478,21 @@ mod tests {
         assert!(err.is_err());
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_normalize_windows_device_path_for_display() {
+        assert_eq!(
+            normalize_windows_device_path(r"\\?\X:\Exports\Case1"),
+            r"X:\Exports\Case1"
+        );
+        assert_eq!(
+            normalize_windows_device_path(r"\\?\UNC\server\share\Exports"),
+            r"\\server\share\Exports"
+        );
+        assert_eq!(
+            normalize_windows_device_path(r"X:\Exports\Case1"),
+            r"X:\Exports\Case1"
+        );
     }
 }

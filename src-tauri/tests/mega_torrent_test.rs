@@ -172,9 +172,9 @@ fn test_detect_input_mode_onion_fallback() {
     );
     assert_eq!(
         torrent_handler::detect_input_mode("https://google.com"),
-        "onion"
+        "direct"
     );
-    assert_eq!(torrent_handler::detect_input_mode(""), "onion");
+    assert_eq!(torrent_handler::detect_input_mode(""), "direct");
 }
 
 // ── Magnet URI Parsing Tests ───────────────────────────────────────

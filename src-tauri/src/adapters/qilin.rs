@@ -418,10 +418,7 @@ impl QilinRoutePlan {
         attempt: u8,
         app: Option<&AppHandle>,
     ) -> Option<String> {
-        let Some((failed_seed, subtree_key)) = split_qilin_seed_and_relative_path(failed_url)
-        else {
-            return None;
-        };
+        let (failed_seed, subtree_key) = split_qilin_seed_and_relative_path(failed_url)?;
         let required_attempts = match failure_kind {
             CrawlFailureKind::Throttle => 2, // Fast failover for 403/400 DDoS protection
             CrawlFailureKind::Timeout | CrawlFailureKind::Circuit => 4,
@@ -1991,10 +1988,43 @@ impl CrawlerAdapter for QilinAdapter {
             );
         }
 
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
+        let current_target_dir = state.current_target_dir.lock().await.clone();
+
+        let (queue_path, list_path) = if let Some(dir) = &current_target_dir {
+            let p = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&p).unwrap_or_default();
+            (Some(p.join("queue.sled")), Some(p.join("collected.sled")))
+        } else {
+            (None, None)
+        };
+
+        let queue = if let Some(p) = &queue_path {
+            Arc::new(crate::spillover::SpilloverQueue::new_persistent(p))
+        } else {
+            Arc::new(crate::spillover::SpilloverQueue::new())
+        };
+
+        let collected_entries = if let Some(p) = &list_path {
+            Arc::new(crate::spillover::SpilloverList::new_persistent(p))
+        } else {
+            Arc::new(crate::spillover::SpilloverList::new())
+        };
+
+        let mut resumed_crawl = false;
+        if !queue.is_empty() || !collected_entries.is_empty() {
+            resumed_crawl = true;
+            let _ = app.emit(
+                "log",
+                format!(
+                    "[Qilin] Phase 107 Resumption triggered: {} queued, {} collected",
+                    queue.len(),
+                    collected_entries.len()
+                ),
+            );
+        }
+
         let retry_queue = Arc::new(crossbeam_queue::SegQueue::<RetryPayload>::new());
         let degraded_retry_queue = Arc::new(crossbeam_queue::SegQueue::<RetryPayload>::new());
-        let collected_entries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let root_fetch_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let root_parse_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let child_queue_logged = Arc::new(AtomicUsize::new(0));
@@ -2247,28 +2277,41 @@ impl CrawlerAdapter for QilinAdapter {
                 .ok()
                 .flatten();
 
-                let resolved_node = if let Some(node) = fast_cached_node {
-                    timer.emit_log(&format!("[Qilin] Fast cached route hit: {}", node.host));
-                    Some(node)
-                } else {
-                    // Run prioritized discovery with strict ordering:
-                    // redirect target -> last known good -> top-ranked mirrors.
-                    let discovery_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(90),
-                        node_cache.discover_and_resolve_prioritized(
-                            current_url,
-                            uuid,
-                            &client,
-                            Some(&app),
+                    let resolved_node = if let Some(node) = fast_cached_node {
+                        timer.emit_log(&format!("[Qilin] Fast cached route hit: {}", node.host));
+                        Some(node)
+                    } else {
+                        let discovery_timeout_secs = 180;
+                        // Run prioritized discovery with strict ordering:
+                        // redirect target -> last known good -> top-ranked mirrors.
+                        let discovery_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(discovery_timeout_secs),
+                            node_cache.discover_and_resolve_prioritized(
+                                current_url,
+                                uuid,
+                                &client,
+                                Some(&app),
                         ),
                     )
                     .await;
                     match discovery_result {
                         Ok(node) => node,
                         Err(_) => {
-                            timer.emit_log("[Qilin] ⚠ Storage discovery timeout (90s). Falling back to direct mirrors...");
-                            println!("[Qilin Phase 30] ⚠ Global discovery timeout after 90s");
-                            let _ = app.emit("log", "[Qilin] Storage discovery timed out after 90s. Trying direct mirrors...".to_string());
+                            timer.emit_log(&format!(
+                                "[Qilin] ⚠ Storage discovery timeout ({}s). Falling back to validated direct listings...",
+                                discovery_timeout_secs
+                            ));
+                            println!(
+                                "[Qilin Phase 30] ⚠ Global discovery timeout after {}s",
+                                discovery_timeout_secs
+                            );
+                            let _ = app.emit(
+                                "log",
+                                format!(
+                                    "[Qilin] Storage discovery timed out after {}s. Trying validated direct listings...",
+                                    discovery_timeout_secs
+                                ),
+                            );
                             None
                         }
                     }
@@ -2318,51 +2361,35 @@ impl CrawlerAdapter for QilinAdapter {
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                    let mut retry_candidates: Vec<(String, String)> = node_cache
-                        .get_nodes(uuid)
-                        .await
+                    let cached_retry_nodes = node_cache.get_nodes(uuid).await;
+                    let skipped_host_only_candidates = cached_retry_nodes
+                        .iter()
+                        .filter(|node| {
+                            crate::adapters::qilin_nodes::QilinNodeCache::is_host_only_seed_node(
+                                uuid, node,
+                            )
+                        })
+                        .count();
+                    let retry_candidates: Vec<(String, String)> = cached_retry_nodes
+                        .into_iter()
+                        .filter(|node| {
+                            crate::adapters::qilin_nodes::QilinNodeCache::is_retryable_listing_node(
+                                uuid, node,
+                            )
+                        })
                         .into_iter()
                         .take(6)
-                        .map(|node| {
-                            let url = if node.url.is_empty() {
-                                format!("http://{}/{}/", node.host, uuid)
-                            } else {
-                                node.url
-                            };
-                            (node.host, url)
-                        })
+                        .map(|node| (node.host, node.url))
                         .collect();
 
-                    if retry_candidates.is_empty() {
-                        retry_candidates.extend([
-                            (
-                                "7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion"
-                                    .to_string(),
-                                format!(
-                                    "http://{}/{}/",
-                                    "7mnkv5nvnjyifezlfyba6gek7aeimg5eghej5vp65qxnb2hjbtlttlyd.onion",
-                                    uuid
-                                ),
-                            ),
-                            (
-                                "25mjg55vcbjzwykz2uqsvaw7hcevm4pqxl42o324zr6qf5zgddmghkqd.onion"
-                                    .to_string(),
-                                format!(
-                                    "http://{}/{}/",
-                                    "25mjg55vcbjzwykz2uqsvaw7hcevm4pqxl42o324zr6qf5zgddmghkqd.onion",
-                                    uuid
-                                ),
-                            ),
-                            (
-                                "arrfcpipltlfgxc6hvjylixc6c5hrummwctz4wqysk3h56ntqz5scnad.onion"
-                                    .to_string(),
-                                format!(
-                                    "http://{}/{}/",
-                                    "arrfcpipltlfgxc6hvjylixc6c5hrummwctz4wqysk3h56ntqz5scnad.onion",
-                                    uuid
-                                ),
-                            ),
-                        ]);
+                    if retry_candidates.is_empty() && skipped_host_only_candidates > 0 {
+                        let message = format!(
+                            "[Qilin] Skipping {} stale host-only direct retries because host + cms_uuid reconstruction is banned.",
+                            skipped_host_only_candidates
+                        );
+                        timer.emit_log(&message);
+                        println!("[Qilin Phase 42] {}", message);
+                        let _ = app.emit("log", message);
                     }
 
                     let retry_wave_size = 2;
@@ -2442,11 +2469,23 @@ impl CrawlerAdapter for QilinAdapter {
                             });
                         }
 
-                        while let Some(joined) = mirror_tasks.join_next().await {
-                            if let Ok(Some(node)) = joined {
-                                mirror_tasks.abort_all();
-                                found_alive_node = Some(node);
-                                break;
+                        // Phase 126C: Hard outer deadline to handle Arti cancellation-safety issue.
+                        // Inner timeout is 30s; outer deadline gives 15s buffer before aborting.
+                        let mirror_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+                        loop {
+                            match tokio::time::timeout_at(mirror_deadline, mirror_tasks.join_next()).await {
+                                Ok(Some(Ok(Some(node)))) => {
+                                    mirror_tasks.abort_all();
+                                    found_alive_node = Some(node);
+                                    break;
+                                }
+                                Ok(Some(_)) => continue, // Task returned None or JoinError
+                                Ok(None) => break,       // All tasks completed
+                                Err(_) => {
+                                    println!("[Qilin Phase 42] Mirror probe deadline exceeded (45s) — aborting remaining");
+                                    mirror_tasks.abort_all();
+                                    break;
+                                }
                             }
                         }
 
@@ -2485,7 +2524,7 @@ impl CrawlerAdapter for QilinAdapter {
                         // Circuits are now warm after Stage B, so the CMS is reliably reachable
                         let view_url = format!(
                             "{}/site/view?uuid={}",
-                            current_url.split("/site/").next().unwrap_or("").to_string(),
+                            current_url.split("/site/").next().unwrap_or(""),
                             uuid
                         );
                         let (_, bypass_client) = frontier.get_client();
@@ -2562,6 +2601,214 @@ impl CrawlerAdapter for QilinAdapter {
                                 );
                             }
                         }
+
+                        // ════════════════════════════════════════════════════════════
+                        // Phase 116: Patient Retry Mode
+                        // When ALL storage nodes are dead and Phase 77 CMS bypass also
+                        // failed to surface file entries, enter automatic retry mode.
+                        // Waits 15 minutes (configurable), resets cooldowns, gets fresh
+                        // circuits, and re-runs full discovery. Repeats until a node
+                        // comes alive or the user cancels.
+                        // ════════════════════════════════════════════════════════════
+                        if !goto_unleash {
+                            let patient_retry_mins: u64 = std::env::var("CRAWLI_PATIENT_RETRY_MINS")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<u64>().ok())
+                                .unwrap_or(15);
+
+                            let patient_max_retries: usize = std::env::var("CRAWLI_PATIENT_MAX_RETRIES")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(96); // 96 * 15min = 24 hours
+
+                            let patient_enabled = patient_retry_mins > 0 && patient_max_retries > 0;
+
+                            if patient_enabled {
+                                let total_cached = node_cache.get_nodes(uuid).await.len();
+                                timer.emit_log(&format!(
+                                    "[Qilin] ⏳ Phase 116: All {} storage nodes dead. Entering patient retry mode ({} retries, {}m interval). Cancel to abort.",
+                                    total_cached, patient_max_retries, patient_retry_mins
+                                ));
+                                let _ = app.emit("log", format!(
+                                    "[Qilin] ⏳ Phase 116: All {} storage nodes dead. Patient retry mode: checking every {}m (up to {}h). Cancel anytime.",
+                                    total_cached, patient_retry_mins,
+                                    (patient_retry_mins * patient_max_retries as u64) / 60
+                                ));
+                                let _ = app.emit("patient_retry_started", serde_json::json!({
+                                    "interval_mins": patient_retry_mins,
+                                    "max_retries": patient_max_retries,
+                                    "total_nodes": total_cached,
+                                }));
+
+                                'patient_loop: for retry_round in 1..=patient_max_retries {
+                                    if frontier.cancel_flag.load(Ordering::Relaxed) {
+                                        timer.emit_log("[Qilin] Patient retry cancelled by user.");
+                                        let _ = app.emit("log", "[Qilin] Patient retry cancelled.".to_string());
+                                        let _ = app.emit("patient_retry_cancelled", serde_json::json!({"round": retry_round}));
+                                        break 'patient_loop;
+                                    }
+
+                                    // ── Countdown: wait the configured interval ──
+                                    let _ = app.emit("patient_retry_waiting", serde_json::json!({
+                                        "round": retry_round,
+                                        "max_retries": patient_max_retries,
+                                        "wait_mins": patient_retry_mins,
+                                    }));
+                                    println!(
+                                        "[Qilin Phase 116] ⏳ Retry {}/{} — waiting {}m before re-probing...",
+                                        retry_round, patient_max_retries, patient_retry_mins
+                                    );
+
+                                    for elapsed_min in 0..patient_retry_mins {
+                                        if frontier.cancel_flag.load(Ordering::Relaxed) {
+                                            break 'patient_loop;
+                                        }
+                                        // Sleep in 10-second chunks for responsive cancellation
+                                        for _ in 0..6 {
+                                            if frontier.cancel_flag.load(Ordering::Relaxed) {
+                                                break 'patient_loop;
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                        }
+                                        let remaining = patient_retry_mins - elapsed_min - 1;
+                                        if remaining > 0 && remaining % 5 == 0 {
+                                            let _ = app.emit("log", format!(
+                                                "[Qilin] ⏳ Patient retry {}/{}: {}m remaining...",
+                                                retry_round, patient_max_retries, remaining
+                                            ));
+                                        }
+                                        println!(
+                                            "[Qilin Phase 116] {}m remaining until retry {}",
+                                            remaining, retry_round
+                                        );
+                                    }
+
+                                    if frontier.cancel_flag.load(Ordering::Relaxed) {
+                                        break 'patient_loop;
+                                    }
+
+                                    // ── Fresh circuits: NEWNYM all managed Tor daemons ──
+                                    println!("[Qilin Phase 116] Refreshing Tor circuits (NEWNYM)...");
+                                    let current_ports = crate::tor::detect_active_managed_tor_ports();
+                                    for port in current_ports {
+                                        let _ = crate::tor::request_newnym(port).await;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                                    // ── Reset all cooldowns so every node is fresh ──
+                                    let reset_count = node_cache.reset_all_cooldowns(uuid).await;
+                                    timer.emit_log(&format!(
+                                        "[Qilin] Phase 116 retry {}: Reset {} node cooldowns. Re-probing...",
+                                        retry_round, reset_count
+                                    ));
+                                    let _ = app.emit("patient_retry_probing", serde_json::json!({
+                                        "round": retry_round,
+                                        "reset_nodes": reset_count,
+                                    }));
+
+                                    // ── Try fresh CMS /site/data redirect (nodes may have rotated) ──
+                                    let base_domain_retry = current_url
+                                        .split("/site/")
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let data_url_retry = format!("{}/site/data?uuid={}", base_domain_retry, uuid);
+                                    let (_, retry_client) = frontier.get_client();
+                                    if let Ok(Ok((_, Some(redirect_target)))) = tokio::time::timeout(
+                                        std::time::Duration::from_secs(30),
+                                        retry_client.new_isolated()
+                                            .get(&data_url_retry)
+                                            .header("Referer", &base_domain_retry)
+                                            .send_capturing_redirect(),
+                                    ).await {
+                                        println!("[Qilin Phase 116] 🎯 Fresh redirect on retry {}: {}", retry_round, redirect_target);
+                                        timer.emit_log(&format!(
+                                            "[Qilin] Phase 116 retry {}: fresh redirect → {}",
+                                            retry_round, redirect_target
+                                        ));
+                                        // Cache the fresh redirect node
+                                        if let Ok(parsed) = reqwest::Url::parse(&redirect_target) {
+                                            if let Some(host) = parsed.host_str() {
+                                                node_cache.seed_node(uuid, &redirect_target, host).await;
+                                                node_cache.register_discovered_host(host, &format!("patient_retry_{}", retry_round)).await;
+                                            }
+                                        }
+                                    }
+
+                                    // ── Re-run full prioritized discovery ──
+                                    let (_, disc_client) = frontier.get_client();
+                                    let retry_discovery = tokio::time::timeout(
+                                        std::time::Duration::from_secs(120),
+                                        node_cache.discover_and_resolve_prioritized(
+                                            current_url,
+                                            uuid,
+                                            &disc_client,
+                                            Some(&app),
+                                        ),
+                                    ).await;
+
+                                    match retry_discovery {
+                                        Ok(Some(alive_node)) => {
+                                            // 🎉 A node came alive!
+                                            println!(
+                                                "[Qilin Phase 116] ✅ ALIVE NODE on retry {}: {} ({}ms)",
+                                                retry_round, alive_node.host, alive_node.avg_latency_ms
+                                            );
+                                            timer.emit_log(&format!(
+                                                "[Qilin] ✅ Phase 116: Node {} came alive on retry {}! Resuming crawl.",
+                                                alive_node.host, retry_round
+                                            ));
+                                            let _ = app.emit("log", format!(
+                                                "[Qilin] ✅ Storage node {} is ALIVE on retry {}! Resuming crawl.",
+                                                alive_node.host, retry_round
+                                            ));
+                                            let _ = app.emit("patient_retry_success", serde_json::json!({
+                                                "round": retry_round,
+                                                "host": alive_node.host,
+                                                "latency_ms": alive_node.avg_latency_ms,
+                                            }));
+
+                                            actual_seed_url = alive_node.url.clone();
+                                            initial_repin_interval = alive_node.recommended_repin_interval();
+                                            if let Some(ref telemetry) = telemetry {
+                                                telemetry.set_current_node_host(alive_node.host.clone());
+                                            }
+                                            standby_routes = standby_seed_urls(
+                                                &alive_node.url,
+                                                &node_cache.get_nodes(uuid).await,
+                                                4,
+                                            );
+                                            break 'patient_loop;
+                                        }
+                                        Ok(None) => {
+                                            println!(
+                                                "[Qilin Phase 116] ❌ Retry {} exhausted — all nodes still dead.",
+                                                retry_round
+                                            );
+                                            let _ = app.emit("log", format!(
+                                                "[Qilin] ❌ Patient retry {}/{}: all storage nodes still offline. Next retry in {}m.",
+                                                retry_round, patient_max_retries, patient_retry_mins
+                                            ));
+                                            let _ = app.emit("patient_retry_failed", serde_json::json!({
+                                                "round": retry_round,
+                                                "max_retries": patient_max_retries,
+                                                "next_retry_mins": patient_retry_mins,
+                                            }));
+                                        }
+                                        Err(_) => {
+                                            println!(
+                                                "[Qilin Phase 116] ⚠ Retry {} discovery timed out (120s).",
+                                                retry_round
+                                            );
+                                            let _ = app.emit("log", format!(
+                                                "[Qilin] ⚠ Patient retry {}/{}: discovery timed out. Next retry in {}m.",
+                                                retry_round, patient_max_retries, patient_retry_mins
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2597,7 +2844,7 @@ impl CrawlerAdapter for QilinAdapter {
         let durable_winner_url = Arc::new(Mutex::new(None::<String>));
 
         // Reverted to Strict Depth-First Search parsing (Phase 27)
-        if !goto_unleash {
+        if !goto_unleash && !resumed_crawl {
             queue.push(actual_seed_url.clone());
             frontier.mark_visited(&actual_seed_url);
         }
@@ -2650,8 +2897,7 @@ impl CrawlerAdapter for QilinAdapter {
                                     }
                                     let _ = ui_app.emit("crawl_progress", batch.clone());
                                     if collect_results_locally {
-                                        let mut guard = collected_entries_for_batches.lock().await;
-                                        guard.extend(batch.iter().cloned());
+                                        collected_entries_for_batches.push_batch(batch.clone());
                                     }
                                     batch.clear();
                                 }
@@ -2668,8 +2914,7 @@ impl CrawlerAdapter for QilinAdapter {
                             }
                             let _ = ui_app.emit("crawl_progress", batch.clone());
                             if collect_results_locally {
-                                let mut guard = collected_entries_for_batches.lock().await;
-                                guard.extend(batch.iter().cloned());
+                                collected_entries_for_batches.push_batch(batch.clone());
                             }
                             batch.clear();
                         }
@@ -2685,8 +2930,7 @@ impl CrawlerAdapter for QilinAdapter {
                 }
                 let _ = ui_app.emit("crawl_progress", batch.clone());
                 if collect_results_locally {
-                    let mut guard = collected_entries_for_batches.lock().await;
-                    guard.extend(batch);
+                    collected_entries_for_batches.push_batch(batch.clone());
                 }
             }
         });
@@ -2936,7 +3180,10 @@ impl CrawlerAdapter for QilinAdapter {
         let qilin_workers = std::env::var("CRAWLI_QILIN_WORKERS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or_else(|| circuits_ceiling.min(64))
+            // Phase 117: Raised from .min(64) → .min(128). With tor.exe, 120 SOCKS conns
+            // multiplexed over 1 process. With Arti, N workers multiplex over 8 TorClients.
+            // Throttle-Adaptive Governor (Phase 67D) auto-halves if 503s spike.
+            .unwrap_or_else(|| circuits_ceiling.min(128))
             .min(128)
             .max(1);
 
@@ -3016,14 +3263,12 @@ impl CrawlerAdapter for QilinAdapter {
                     .await;
                 }));
             }
-            // If we already borrowed hot clients from the active swarm, don't stall crawl start.
-            if pool.borrowed_client_count() > 0 {
-                drop(preheats);
-            } else if !preheats.is_empty() {
-                // Gate: wait for ANY single client to finish preheating, then unleash workers immediately
+            // Phase 118: Always wait for at least 1 preheat — HS descriptor
+            // may not be cached even with seeded clients (hint path skips warmup).
+            if !preheats.is_empty() {
                 let (result, _index, remaining) = futures::future::select_all(preheats).await;
                 let _ = result; // Ignore errors — circuit warmup is best-effort
-                                // Fire-and-forget remaining preheats as background tasks
+                // Fire-and-forget remaining preheats as background tasks
                 for handle in remaining {
                     tokio::spawn(async move {
                         let _ = handle.await;
@@ -3641,7 +3886,33 @@ impl CrawlerAdapter for QilinAdapter {
                             ),
                         );
 
+                        if !json_entries.is_empty() {
+                            discovered_clone.fetch_add(
+                                json_entries.len(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+
+                        {
+                            let mut vf = vf_clone.lock().await;
+                            vf.insert(next_url.clone());
+                            if effective_url != next_url {
+                                vf.insert(effective_url.clone());
+                            }
+                        }
+                        if subtree_shaping_enabled && use_slow_path {
+                            if let Some(subtree_key) =
+                                SubtreeHeatmap::subtree_key(&active_seed_url, &effective_url)
+                            {
+                                heatmap.lock().await.record_success(&subtree_key);
+                            }
+                        }
+
                         for entry in json_entries {
+                            if entry.entry_type == EntryType::Folder {
+                                let mut df = df_clone.lock().await;
+                                df.insert(entry.raw_url.clone());
+                            }
                             if entry.entry_type == EntryType::Folder && f.mark_visited(&entry.raw_url) {
                                 increment_qilin_pending(
                                     f.as_ref(),
@@ -3653,6 +3924,7 @@ impl CrawlerAdapter for QilinAdapter {
                             }
                             let _ = ui_tx_clone.send(entry.clone()).await;
                         }
+
                         continue;
                     }
 
@@ -4929,7 +5201,7 @@ impl CrawlerAdapter for QilinAdapter {
         }
 
         if collect_results_locally {
-            let final_entries = collected_entries.lock().await.clone();
+            let final_entries = collected_entries.drain_all();
             Ok(final_entries)
         } else {
             Ok(Vec::new())
@@ -5010,13 +5282,13 @@ fn parse_qilin_json(json: &str, base_domain: &str) -> Vec<FileEntry> {
             "dir" | "folder" | "directory"
         );
 
-        // Construct the raw URL. If it's a file, it's a download. If it's a dir, it's a new site view.
+        // Construct the raw URL. If it's a dir, keep it on the JSON bypass track via /site/data.
         let raw_url = if is_dir {
             if !uuid.is_empty() {
-                format!("{}/site/view?uuid={}", base_domain, uuid)
+                format!("{}/site/data?uuid={}", base_domain, uuid)
             } else {
                 format!(
-                    "{}/site/view?name={}",
+                    "{}/site/data?name={}",
                     base_domain,
                     urlencoding::encode(name)
                 )
@@ -5779,7 +6051,7 @@ mod tests {
         assert_eq!(res_a[0].raw_url, "http://qilin.onion/site/data?uuid=u1");
         assert_eq!(res_a[1].path, "/folder1");
         assert_eq!(res_a[1].entry_type, EntryType::Folder);
-        assert_eq!(res_a[1].raw_url, "http://qilin.onion/site/view?uuid=u2");
+        assert_eq!(res_a[1].raw_url, "http://qilin.onion/site/data?uuid=u2");
 
         // Format B: Nested "data" array
         let json_b = r#"{

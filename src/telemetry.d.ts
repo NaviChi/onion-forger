@@ -174,6 +174,21 @@ export interface IResourceMetricsFrame {
 
     /** ResourceMetricsFrame outlierIsolations */
     outlierIsolations?: (number|null);
+
+    /** ResourceMetricsFrame downloadHostCacheHits */
+    downloadHostCacheHits?: (number|null);
+
+    /** ResourceMetricsFrame downloadProbePromotionHits */
+    downloadProbePromotionHits?: (number|null);
+
+    /** ResourceMetricsFrame downloadLowSpeedAborts */
+    downloadLowSpeedAborts?: (number|null);
+
+    /** ResourceMetricsFrame downloadProbeQuarantineHits */
+    downloadProbeQuarantineHits?: (number|null);
+
+    /** ResourceMetricsFrame downloadProbeCandidateExhaustions */
+    downloadProbeCandidateExhaustions?: (number|null);
 }
 
 /** Represents a ResourceMetricsFrame. */
@@ -247,6 +262,21 @@ export class ResourceMetricsFrame implements IResourceMetricsFrame {
 
     /** ResourceMetricsFrame outlierIsolations. */
     public outlierIsolations: number;
+
+    /** ResourceMetricsFrame downloadHostCacheHits. */
+    public downloadHostCacheHits: number;
+
+    /** ResourceMetricsFrame downloadProbePromotionHits. */
+    public downloadProbePromotionHits: number;
+
+    /** ResourceMetricsFrame downloadLowSpeedAborts. */
+    public downloadLowSpeedAborts: number;
+
+    /** ResourceMetricsFrame downloadProbeQuarantineHits. */
+    public downloadProbeQuarantineHits: number;
+
+    /** ResourceMetricsFrame downloadProbeCandidateExhaustions. */
+    public downloadProbeCandidateExhaustions: number;
 
     /**
      * Creates a new ResourceMetricsFrame instance using the specified properties.

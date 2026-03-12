@@ -78,6 +78,22 @@ pub struct ResourceMetricsFrame {
     pub late_throttles: u32,
     #[prost(uint32, tag = "21")]
     pub outlier_isolations: u32,
+    #[prost(uint32, tag = "22")]
+    pub download_host_cache_hits: u32,
+    #[prost(uint32, tag = "23")]
+    pub download_probe_promotion_hits: u32,
+    #[prost(uint32, tag = "24")]
+    pub download_low_speed_aborts: u32,
+    #[prost(uint32, tag = "25")]
+    pub download_probe_quarantine_hits: u32,
+    #[prost(uint32, tag = "26")]
+    pub download_probe_candidate_exhaustions: u32,
+    #[prost(uint32, tag = "27")]
+    pub qilin_fresh_redirect_candidates: u32,
+    #[prost(uint32, tag = "28")]
+    pub qilin_stale_host_only_candidates: u32,
+    #[prost(uint32, tag = "29")]
+    pub qilin_degraded_stage_d_activations: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -236,6 +252,14 @@ mod tests {
             slowest_circuit: Some("c7:8450ms".to_string()),
             late_throttles: 2,
             outlier_isolations: 1,
+            download_host_cache_hits: 11,
+            download_probe_promotion_hits: 4,
+            download_low_speed_aborts: 2,
+            download_probe_quarantine_hits: 6,
+            download_probe_candidate_exhaustions: 2,
+            qilin_fresh_redirect_candidates: 0,
+            qilin_stale_host_only_candidates: 0,
+            qilin_degraded_stage_d_activations: 0,
         };
         let frame = TelemetryFrame {
             ts_ms: 42,
@@ -260,5 +284,7 @@ mod tests {
         );
         assert_eq!(decoded_payload.late_throttles, 2);
         assert_eq!(decoded_payload.outlier_isolations, 1);
+        assert_eq!(decoded_payload.download_probe_quarantine_hits, 6);
+        assert_eq!(decoded_payload.download_probe_candidate_exhaustions, 2);
     }
 }

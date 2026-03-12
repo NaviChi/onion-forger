@@ -277,7 +277,7 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
 
                 match fetch_result {
                     Ok(resp) => {
-                        let text = resp.text().await.ok();
+                        let text = resp.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned()).ok();
                         let len = text.as_ref().map(|t| t.len() as u64).unwrap_or(0);
                         frontier.record_success(
                             winner_cid,
@@ -369,7 +369,7 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
                         let start = std::time::Instant::now();
                         match warm_client.get(&child_url).send().await {
                             Ok(resp) => {
-                                let text = resp.text().await.unwrap_or_default();
+                                let text = String::from_utf8_lossy(&resp.bytes().await.unwrap_or_default()).into_owned();
                                 frontier_ref.record_success(
                                     pcid,
                                     text.len() as u64,
@@ -384,10 +384,19 @@ impl CrawlerAdapter for AdaptiveUniversalExplorer {
                         }
                     });
                 }
-                // Collect ALL prefetch results into cache (not just first)
-                while let Some(res) = join_set.join_next().await {
-                    if let Ok(Some((url, body))) = res {
-                        body_cache.insert(url, body);
+                // Phase 126C: Hard outer deadline — Arti cancellation-safety fix
+                let prefetch_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+                loop {
+                    match tokio::time::timeout_at(prefetch_deadline, join_set.join_next()).await {
+                        Ok(Some(Ok(Some((url, body))))) => {
+                            body_cache.insert(url, body);
+                        }
+                        Ok(Some(_)) => continue,
+                        Ok(None) => break,
+                        Err(_) => {
+                            join_set.abort_all();
+                            break;
+                        }
                     }
                 }
             }

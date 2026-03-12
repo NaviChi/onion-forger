@@ -1,14 +1,15 @@
 {
   "name": "crawli",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.6.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "overlay:integrity": "node tests/overlay_integrity_runner.cjs"
+    "overlay:integrity": "node tests/overlay_integrity_runner.cjs",
+    "native:smoke": "node tests/native_webview_smoke_runner.mjs"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.2.7",
