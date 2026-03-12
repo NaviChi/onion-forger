@@ -72,6 +72,7 @@ jobs:
           gh release view "$tag" --json tagName > $null 2>&1
           if ($LASTEXITCODE -ne 0) {
             gh release create "$tag" `
+              --target "${{ github.event.inputs.ref }}" `
               --title "Onion Forger $tag" `
               --notes "Windows portable-only native-Arti release package (no bundled Tor binaries)."
           }

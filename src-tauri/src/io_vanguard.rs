@@ -115,9 +115,19 @@ fn apply_internal(opts: &mut OpenOptions) -> &mut OpenOptions {
 #[cfg(target_os = "windows")]
 fn apply_internal(opts: &mut OpenOptions) -> &mut OpenOptions {
     use std::os::windows::fs::OpenOptionsExt;
-    // 0x20000000 = FILE_FLAG_NO_BUFFERING
-    // 0x80000000 = FILE_FLAG_WRITE_THROUGH
-    opts.custom_flags(0x20000000 | 0x80000000)
+    // Phase 129: REMOVED FILE_FLAG_NO_BUFFERING (0x20000000).
+    // FILE_FLAG_NO_BUFFERING requires ALL reads and writes to be aligned to the
+    // device sector boundary (typically 512 or 4096 bytes). Tor download chunks
+    // are arbitrarily sized (BBR-controlled, ranging from 16KB to 1MB with no
+    // alignment guarantee), making writes fail with ERROR_INVALID_PARAMETER (87)
+    // on Windows. This was a silent corruption source: the write would fail, the
+    // error would be swallowed, and the file would be left with holes.
+    //
+    // We keep FILE_FLAG_WRITE_THROUGH (0x80000000) which still bypasses the
+    // Windows write-back cache (data goes straight to disk) but does NOT require
+    // sector alignment. This gives us ~90% of the Direct I/O benefit without
+    // the alignment landmine.
+    opts.custom_flags(0x80000000) // FILE_FLAG_WRITE_THROUGH only
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

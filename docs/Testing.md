@@ -1,3 +1,15 @@
+## Phase 129C: Windows Portable Reliability + Windows-Only Release Validation
+- **Date**: 2026-03-12
+- **Action**: Validated the Windows-portable fixes for unbuffered file I/O and privileged NT preallocation, then prepared a Windows-only `0.6.2` release path that pins automatic tag creation to the requested ref.
+- **Validation Commands**:
+  - `npm run build`
+  - `CARGO_TARGET_DIR=/tmp/crawli-release-check-062 cargo check --manifest-path src-tauri/Cargo.toml`
+  - `ruby -e 'require "yaml"; YAML.safe_load(File.read(".github/workflows/release-windows-portable.yml"), aliases: true); puts "workflow yaml parse ok"'`
+- **Result**:
+  - Frontend production build passed on the `0.6.2` metadata set. Vite completed successfully and only emitted the existing `@protobufjs/inquire` eval warning.
+  - Clean Rust compile validation passed in `4m26s` against a fresh target directory, confirming the Windows I/O fixes in `src-tauri/src/io_vanguard.rs` and `src-tauri/src/aria_downloader.rs` compile cleanly with the `0.6.2` release metadata.
+  - The Windows-only workflow YAML parses cleanly after adding `gh release create --target "${{ github.event.inputs.ref }}"`, which prevents a new Windows-only release from being tagged off the default branch by mistake.
+
 ## Phase 129: Parallel Download + IDM-Style Acceleration Release Validation
 - **Date**: 2026-03-12
 - **Action**: Validated the Phase 128/129 crawl/download pipeline changes and bumped all release metadata to `0.6.1` before the GitHub Windows portable release cut.
@@ -13,7 +25,7 @@
 - **Action**: Added a shared Windows portable packaging script and updated both release workflows to call the same script.
 - **Validation Commands**:
   - `ruby -e 'require "yaml"; [".github/workflows/release.yml", ".github/workflows/release-windows-portable.yml"].each { |p| YAML.safe_load(File.read(p), aliases: true); }; puts "workflow yaml parse ok"'`
-  - `pwsh -NoLogo -NoProfile -File packaging/windows/package-portable.ps1 -Tag v0.6.1`
+  - `pwsh -NoLogo -NoProfile -File packaging/windows/package-portable.ps1 -Tag v0.6.2`
 - **Result**:
   - Workflow YAML files parse successfully after the release edits.
   - `pwsh` is not installed in this macOS environment (`command not found`), so executable-level validation of `package-portable.ps1` must run on `windows-latest` CI or a Windows host.

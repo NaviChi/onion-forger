@@ -17,10 +17,23 @@ fn preallocate_windows_nt_blocks(file: &std::fs::File, size: u64) -> std::io::Re
     let handle = file.as_raw_handle() as *mut std::ffi::c_void;
     extern "system" {
         fn SetFileValidData(hFile: *mut std::ffi::c_void, ValidDataLength: i64) -> i32;
+        fn GetLastError() -> u32;
     }
     file.set_len(size)?;
     unsafe {
-        SetFileValidData(handle, size as i64);
+        // Phase 129: Guard against missing SE_MANAGE_VOLUME_NAME privilege.
+        // SetFileValidData requires admin rights. Without it, the call returns 0
+        // and GetLastError() returns ERROR_PRIVILEGE_NOT_HELD (1314).
+        // Fall through gracefully — NT will zero-fill on write (slower but correct).
+        let result = SetFileValidData(handle, size as i64);
+        if result == 0 {
+            let err = GetLastError();
+            if err == 1314 {
+                eprintln!("[IO] SetFileValidData skipped (requires admin). NT will zero-fill.");
+            } else if err != 0 {
+                eprintln!("[IO] SetFileValidData warning: error code {}", err);
+            }
+        }
     }
     Ok(())
 }
