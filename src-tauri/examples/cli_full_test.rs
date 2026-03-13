@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!("  Target: {}", config.url);
     println!("  Circuits Ceiling: {}", config.circuits_ceiling);
-    println!("  Daemons: {}", config.daemons);
+
     println!("  Duration Cap: {}s", config.duration_secs);
     println!("  Mode: {}", if config.crawl_only { "CRAWL ONLY" } else if config.download_only { "DOWNLOAD ONLY" } else { "CRAWL + DOWNLOAD" });
     println!("──────────────────────────────────────────────────────────────\n");
@@ -541,7 +541,7 @@ fn parse_args() -> Result<TestConfig> {
     let mut url = "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/site/view?uuid=c9d2ba19-6aa1-3087-8773-f63d023179ed".to_string();
     let mut duration_secs = 7200u64; // 2 hours for ~22GB
     let mut circuits_ceiling = 120usize;
-    let mut daemons = 1usize;
+
     let mut crawl_only = false;
     let mut download_only = false;
 
@@ -565,13 +565,7 @@ fn parse_args() -> Result<TestConfig> {
                     .parse()
                     .context("parse --circuits-ceiling")?;
             }
-            "--daemons" => {
-                daemons = args
-                    .next()
-                    .ok_or_else(|| anyhow!("missing value for --daemons"))?
-                    .parse()
-                    .context("parse --daemons")?;
-            }
+            "--daemons" => { let _ = args.next(); }
             "--crawl-only" => crawl_only = true,
             "--download-only" => download_only = true,
             other => return Err(anyhow!("unknown arg: {}", other)),
@@ -582,7 +576,7 @@ fn parse_args() -> Result<TestConfig> {
         url,
         duration_secs,
         circuits_ceiling,
-        daemons,
+
         crawl_only,
         download_only,
     })
