@@ -1,4 +1,16 @@
-> **Last Updated:** 2026-03-13T19:35 CDT
+> **Last Updated:** 2026-03-13T21:22 CDT
+
+## Phase 143: Progressive Download Total Tracking (2026-03-13)
+
+### Issue
+During parallel crawl+download, the download progress total would reset to 0% every time a new 100-file chunk started downloading. This happened because `scaffold_download()` emitted `download_batch_started` per chunk, and the frontend listener reset all progress state (completedFiles=0, downloadedBytes=0) on each event.
+
+### Fix
+1. **Backend (lib.rs):** The parallel download consumer now tracks a cumulative `total_queued_for_download` counter. The first batch emits `download_batch_started` to initialize the UI. Subsequent arrivals emit a new `download_total_update` event that only updates `totalFiles`/`totalBytesHint`/`unknownSizeFiles`.
+2. **Frontend (App.tsx):** Added `download_total_update` listener that uses `Math.max()` to grow the total without touching `completedFiles`, `downloadedBytes`, `speedMbps`, or any other progress state.
+
+### Prevention Rules
+- **PR-BATCH-RESET-143:** `download_batch_started` must only be emitted ONCE per download session in parallel mode. For progressive total updates, use `download_total_update` which spreads only `totalFiles` into existing state via `Math.max()`.
 
 ## Phase 142-IMPL: R1+R2+R3+R4 Implementation (2026-03-13)
 
