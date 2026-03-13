@@ -1,5 +1,11 @@
 # Lessons Learned Whitepaper
 
+## 2026-03-13 (Phase 138: Isolation Fan-Out)
+- **LESSON-138-001 (CRITICAL — COST REDUCTION):** Arti's `TorClient::isolated_client()` creates a lightweight view that shares ALL internal state (directory, consensus, guards, channels) but builds separate circuits. Creating N isolated views costs near-zero RAM/CPU vs N full bootstraps. This is the single biggest cost-reduction lever for scaling circuit count.
+- **LESSON-138-002 (HIGH — ARCHITECTURE):** The download pipeline was already using per-circuit `IsolationToken` via `get_arti_client()` — the fan-out at the swarm level is additive, not conflicting. Double isolation (view-level + token-level) produces unique circuits just as effectively.
+- **LESSON-138-003 (MEDIUM — LIMITS):** Fan-out ratio >8 risks bottlenecking the shared channel manager, because all isolated views compete for the same underlying TLS connections to guard relays. 4 is the sweet spot for typical hardware.
+- **LESSON-138-004 (HIGH — PRIOR ART):** Tor Browser uses a single TorClient with stream isolation. OnionShare uses 1 client with IsolationToken per circuit. The tor.exe daemon itself uses 1 process with circuit isolation via SOCKS auth. All production Tor tools already use this pattern — we were the outlier with N full clients.
+
 ## 2026-03-13 (Phase 137: HTTP/2 Flow Control Tuning)
 - **LESSON-137-001 (HIGH — ADAPTIVE WINDOW):** Hyper's `http2_adaptive_window(true)` dynamically grows the HTTP/2 receive window based on measured throughput — equivalent to TCP window scaling for H/2. Without it, the static 256KB stream window causes WINDOW_UPDATE stalls on fast circuits. This is a zero-cost configuration change.
 - **LESSON-137-002 (MEDIUM):** Connection-level HTTP/2 window must be proportional to `stream_window × max_concurrent_streams`. Old 1MB was insufficient for 4+ concurrent streams × 256KB each. Raised to 4MB.

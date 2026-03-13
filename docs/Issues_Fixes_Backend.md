@@ -1,4 +1,31 @@
-> **Last Updated:** 2026-03-13T00:55 CDT
+> **Last Updated:** 2026-03-13T01:25 CDT
+
+## Phase 138: Isolation Fan-Out — More Circuits, Less Cost (2026-03-13)
+
+### Problem
+Each TorClient bootstrap costs ~15-30MB RAM + 15-45s startup (consensus download, guard selection, circuit build). To get N circuit slots, we bootstrapped N full TorClients — linear cost scaling.
+
+### Solution — Isolation Fan-Out Architecture
+Instead of N full bootstraps, spawn `ceil(N / fan_out_ratio)` heavy base clients and create `fan_out_ratio` isolated views per base via `TorClient::isolated_client()`. Each isolated view:
+- **Shares** directory consensus, guard selection, channel manager (zero additional memory)
+- **Gets separate circuits** via built-in Arti isolation (IsolationToken)
+- **Costs near-zero** to create (just an Arc clone + token)
+
+Example: `target=16, fan_out=4` → only **4 heavy bootstraps** → **16 circuit slots**.
+- RAM saved: ~3 × 15-30MB = **45-90MB**
+- Startup saved: ~3 × 15-45s = **45-135s** (parallelized: ~same as 1 base)
+
+### Configuration
+- `CRAWLI_ISOLATION_FAN_OUT` — Controls the fan-out ratio (default: 4, range: 1-8)
+- Set to 1 to disable fan-out and revert to previous N-bootstrap behavior
+
+### Files Modified
+- `tor_native.rs` — `bootstrap_arti_cluster_for_traffic()` now uses fan-out for both initial and background bootstrap phases
+
+### Prevention Rules
+- **PR-FAN-OUT-138-001:** Never create N full TorClients when N isolated views suffice. Arti's `isolated_client()` shares ALL internal state except circuit selection.
+- **PR-FAN-OUT-138-002:** Fan-out ratio must stay ≤8. Beyond 8 isolated views per base, the shared channel manager can become a bottleneck.
+- **PR-FAN-OUT-138-003:** The download pipeline at `aria_downloader.rs:get_arti_client()` already uses fresh `IsolationToken` per circuit — fan-out is safe because double-isolation (view-level + token-level) still produces unique circuits.
 
 ## Phase 137: HTTP/2 Flow Control Tuning — Adaptive Window + Larger Frames (2026-03-13)
 

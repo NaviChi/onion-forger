@@ -1209,29 +1209,63 @@ pub async fn bootstrap_arti_cluster_for_traffic(
     let socks_ports_arc = Arc::new(StdRwLock::new(Vec::new()));
     let clients_count = Arc::new(AtomicUsize::new(0));
 
+    // Phase 138: Isolation Fan-Out — bootstrap fewer heavy TorClients and expand
+    // with isolated_client() views. Each isolated view shares internal state
+    // (directory consensus, guard selection, channel manager) but gets separate
+    // circuits via IsolationToken. This gives us the same circuit isolation with
+    // N/fan_out fewer bootstraps, ~N/fan_out less RAM, and faster startup.
+    //
+    // Example: target=16, fan_out=4 → only 4 heavy bootstraps → 16 isolated slots.
+    // Each bootstrap saves ~15s + ~15-30MB RAM (consensus + circuit state).
+    let fan_out_ratio = env_usize("CRAWLI_ISOLATION_FAN_OUT")
+        .unwrap_or(4)
+        .clamp(1, 8);
+    let base_clients_needed = (target + fan_out_ratio - 1) / fan_out_ratio; // ceil division
+    let base_clients_needed = base_clients_needed.max(1).min(target); // never exceed target
+
+    timer.emit_log(&format!(
+        "[Tor Swarm] Phase 138: Isolation Fan-Out enabled. base_clients={} × fan_out={} → {} circuit slots",
+        base_clients_needed, fan_out_ratio, target
+    ));
+
     let mut client_futures = tokio::task::JoinSet::new();
-    for i in 0..target {
+    for i in 0..base_clients_needed {
         let vm = is_vm;
         let global_node_idx = node_offset + i;
         client_futures
             .spawn(async move { (global_node_idx, spawn_tor_node(global_node_idx, vm).await) });
     }
 
+    let _min_base_ready = (min_ready + fan_out_ratio - 1) / fan_out_ratio; // min base clients before we proceed
     while clients_count.load(Ordering::Relaxed) < min_ready {
         match client_futures.join_next().await {
-            Some(Ok((idx, Ok(client)))) => {
-                let shared_client = Arc::new(StdRwLock::new(Arc::new(client)));
-                let isolation_cache = Arc::new(StdRwLock::new(HashMap::new()));
-                register_live_client_slot(
-                    shared_client.clone(),
-                    isolation_cache.clone(),
-                    &clients_arc,
-                    &isolation_caches_arc,
-                    &clients_count,
-                );
+            Some(Ok((idx, Ok(base_client)))) => {
+                let base_arc = Arc::new(base_client);
+
+                // Phase 138: Fan out this base client into fan_out_ratio isolated views.
+                // The first slot uses the base client directly; additional slots use
+                // isolated_client() which shares ALL internal state but builds separate circuits.
+                let slots_from_this = fan_out_ratio.min(target.saturating_sub(clients_count.load(Ordering::Relaxed)));
+                for slot_i in 0..slots_from_this {
+                    let client_for_slot = if slot_i == 0 {
+                        (*base_arc).clone()
+                    } else {
+                        base_arc.isolated_client()
+                    };
+                    let shared_client = Arc::new(StdRwLock::new(Arc::new(client_for_slot)));
+                    let isolation_cache = Arc::new(StdRwLock::new(HashMap::new()));
+                    register_live_client_slot(
+                        shared_client.clone(),
+                        isolation_cache.clone(),
+                        &clients_arc,
+                        &isolation_caches_arc,
+                        &clients_count,
+                    );
+                }
+
                 timer.emit_log(&format!(
-                    "[Tor Swarm] Node {} built directory consensus and is online.",
-                    idx
+                    "[Tor Swarm] Base node {} online → fanned out {} isolated circuit slots (total: {})",
+                    idx, slots_from_this, clients_count.load(Ordering::Relaxed)
                 ));
             }
             Some(Ok((_idx, Err(e)))) => eprintln!("Arti node failed to create: {}", e),
@@ -1324,7 +1358,7 @@ pub async fn bootstrap_arti_cluster_for_traffic(
         shutdown.clone(),
     );
 
-    if target > min_ready {
+    if target > clients_count.load(Ordering::Relaxed) {
         let app_bg = app.clone();
         let clients_arc_bg = clients_arc.clone();
         let isolation_caches_bg = isolation_caches_arc.clone();
@@ -1333,16 +1367,27 @@ pub async fn bootstrap_arti_cluster_for_traffic(
         tokio::spawn(async move {
             while let Some(result) = client_futures.join_next().await {
                 match result {
-                    Ok((_idx, Ok(client))) => {
-                        let shared_client = Arc::new(StdRwLock::new(Arc::new(client)));
-                        let isolation_cache = Arc::new(StdRwLock::new(HashMap::new()));
-                        register_live_client_slot(
-                            shared_client,
-                            isolation_cache,
-                            &clients_arc_bg,
-                            &isolation_caches_bg,
-                            &clients_count_bg,
-                        );
+                    Ok((_idx, Ok(base_client))) => {
+                        // Phase 138: Fan out background base client too
+                        let base_arc = Arc::new(base_client);
+                        let slots_remaining = target.saturating_sub(clients_count_bg.load(Ordering::Relaxed));
+                        let slots_from_this = fan_out_ratio.min(slots_remaining);
+                        for slot_i in 0..slots_from_this {
+                            let client_for_slot = if slot_i == 0 {
+                                (*base_arc).clone()
+                            } else {
+                                base_arc.isolated_client()
+                            };
+                            let shared_client = Arc::new(StdRwLock::new(Arc::new(client_for_slot)));
+                            let isolation_cache = Arc::new(StdRwLock::new(HashMap::new()));
+                            register_live_client_slot(
+                                shared_client,
+                                isolation_cache,
+                                &clients_arc_bg,
+                                &isolation_caches_bg,
+                                &clients_count_bg,
+                            );
+                        }
 
                         let ready_now = clients_count_bg.load(Ordering::Relaxed);
                         let ready_ports_bg = socks_ports_arc_bg.read().unwrap().clone();
