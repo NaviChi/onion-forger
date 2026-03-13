@@ -1,4 +1,43 @@
-> **Last Updated:** 2026-03-13T11:35 CDT
+> **Last Updated:** 2026-03-13T13:25 CDT
+
+## Phase 141B: Intelligent Download Stall Detection & Recovery (2026-03-13)
+
+### Problem
+Parallel downloads could silently stall when Tor circuits degraded, 503 throttle storms hit, or connections dropped. The consumer would sit blocked in `scaffold_download()` indefinitely with no recovery mechanism.
+
+### Fix
+Added stall detection to the Phase 141 event-driven download consumer:
+- **Tracks `last_progress_at`**: Updated after each successful chunk download
+- **90s stall threshold**: If no new files downloaded for 90s, triggers recovery
+- **Recovery sequence**: NEWNYM on all managed Tor circuits → 30s cooldown → resume
+- **Max 3 recoveries**: Prevents infinite recovery loops; after 3, falls through to post-crawl sweep
+- **Zero state loss**: `downloaded_paths` HashSet preserved across recoveries
+
+### Prevention Rules
+- **PR-STALL-141B:** Any long-running download loop must have stall detection with timestamps. Never rely on timeouts alone — circuits can silently degrade without triggering connection errors.
+
+## Phase 141: Event-Driven Parallel Download Pipeline (2026-03-13)
+
+### Problem
+The Phase 128 parallel download consumer polled the VFS every 10s, scanning ALL entries to find new ones. With 200K+ entries, this was O(N) per cycle — increasingly expensive as the crawl discovered more files. Discovery-to-download latency was ~25s (15s initial delay + 10s poll interval).
+
+### Fix
+Replaced VFS-polling with a channel-driven pipeline:
+- **Architecture**: `Adapter → VFS Flush Task → download_feed_tx → Consumer`
+- **`download_feed_tx`** added to `CrawlerFrontier` struct, set before adapter crawl starts
+- **Qilin VFS flush task** forwards file entries into the channel alongside VFS inserts
+- **Consumer** processes entries in chunks of 100, starts immediately on channel data
+- **Final VFS sweep** catches any entries the channel missed (non-Qilin adapters)
+
+| Metric | Phase 128 (old) | Phase 141 (new) |
+|--------|-----------------|-----------------|
+| VFS scans/cycle | O(N) every 10s | 0 (channel-driven) |
+| Discovery latency | ~25s | <3s |
+| Batch size | All new files | 100 (chunked) |
+| Stall recovery | None | NEWNYM + 30s pause |
+
+### Prevention Rules
+- **PR-POLL-141:** Never use polling loops over growing datasets. Use channels, pub/sub, or push-based notification instead. VFS scans at O(200K) every 10s was a clear scalability bottleneck.
 
 ## Phase 140D: Unified Speed Mode — Single Selector (2026-03-13)
 
