@@ -175,7 +175,7 @@ async fn test_onion_listing_worker_target_stays_pinned_after_failures() {
         resume_index: None,
         mega_password: None,
         stealth_ramp: false, parallel_download: false,
-            download_mode: crawli_lib::frontier::DownloadMode::Medium,
+            download_mode: crawli_lib::frontier::DownloadMode::Default,
             force_clearnet: false,
     };
     let frontier = CrawlerFrontier::new(
@@ -445,7 +445,7 @@ async fn test_crawl_options_propagation() {
             resume_index: None,
             mega_password: None,
             stealth_ramp: false, parallel_download: false,
-            download_mode: crawli_lib::frontier::DownloadMode::Medium,
+            download_mode: crawli_lib::frontier::DownloadMode::Default,
             force_clearnet: false,
         },
         None, // Persistent ledger bound
@@ -472,7 +472,7 @@ async fn test_crawl_options_propagation() {
             resume_index: None,
             mega_password: None,
             stealth_ramp: false, parallel_download: false,
-            download_mode: crawli_lib::frontier::DownloadMode::Medium,
+            download_mode: crawli_lib::frontier::DownloadMode::Default,
             force_clearnet: false,
         },
         None, // Persistent ledger bound

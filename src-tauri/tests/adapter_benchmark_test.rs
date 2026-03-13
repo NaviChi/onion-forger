@@ -369,7 +369,7 @@ async fn run_single_benchmark(
         resume_index: None,
         mega_password: None,
         stealth_ramp: false, parallel_download: false,
-            download_mode: crawli_lib::frontier::DownloadMode::Medium,
+            download_mode: crawli_lib::frontier::DownloadMode::Default,
             force_clearnet: false,
     };
 

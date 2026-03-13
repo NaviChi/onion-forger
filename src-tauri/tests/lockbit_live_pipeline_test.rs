@@ -200,7 +200,7 @@ fn live_lockbit_pipeline_default_ui_settings() {
             resume_index: None,
             mega_password: None,
             stealth_ramp: false, parallel_download: false,
-            download_mode: crawli_lib::frontier::DownloadMode::Medium,
+            download_mode: crawli_lib::frontier::DownloadMode::Default,
             force_clearnet: false,
         };
 
