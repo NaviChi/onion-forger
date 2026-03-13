@@ -1513,6 +1513,21 @@ function App() {
         })
       );
 
+      // Phase 143: Progressive download total update.
+      // As crawling discovers new files during parallel download, the backend
+      // emits download_total_update to grow the total WITHOUT resetting progress.
+      // This keeps completedFiles, downloadedBytes, speed, etc. intact.
+      unlistenPromises.push(
+        listenEvent<{ totalFiles: number; totalBytesHint: number; unknownSizeFiles: number }>("download_total_update", (event) => {
+          setDownloadBatchStatus((prev) => ({
+            ...prev,
+            totalFiles: Math.max(prev.totalFiles, event.payload.totalFiles || 0),
+            totalBytesHint: Math.max(prev.totalBytesHint, event.payload.totalBytesHint || 0),
+            unknownSizeFiles: Math.max(prev.unknownSizeFiles, event.payload.unknownSizeFiles || 0),
+          }));
+        })
+      );
+
       const pollId = setInterval(async () => {
         try {
           if (!telemetryRuntimeRef.current) {

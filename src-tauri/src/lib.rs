@@ -1657,6 +1657,14 @@ async fn start_crawl(
             let mut pending_entries: Vec<adapters::FileEntry> = Vec::new();
             let chunk_size: usize = 100;
 
+            // Phase 143: Progressive download total tracking.
+            // As crawling discovers new files, this counter grows and the UI
+            // shows the increasing total instead of resetting per chunk.
+            let mut total_queued_for_download: usize = 0;
+            let mut total_bytes_hint: u64 = 0;
+            let mut unknown_size_files: usize = 0;
+            let mut batch_started_emitted = false;
+
             // Phase 142 (R3): Adaptive stall detection state.
             // Instead of fixed 90s, we track batch durations and use
             // 3× the slowest recent batch (floor 30s, ceiling 180s).
@@ -1787,6 +1795,47 @@ async fn start_crawl(
 
                 if pending_entries.is_empty() {
                     continue;
+                }
+
+                // Phase 143: Update cumulative download total when new entries arrive.
+                // This makes the UI progress bar grow as crawling discovers more files.
+                // All entries in pending_entries are new (previous ones were fully consumed by chunk loop).
+                let newly_queued = pending_entries.len();
+                if newly_queued > 0 || !batch_started_emitted {
+                    // Update cumulative tracking
+                    for e in &pending_entries {
+                        total_queued_for_download += 1;
+                        if let Some(size) = e.size_bytes {
+                            total_bytes_hint += size;
+                        } else {
+                            unknown_size_files += 1;
+                        }
+                    }
+
+                    if !batch_started_emitted {
+                        // First batch: emit download_batch_started to initialize the UI
+                        batch_started_emitted = true;
+                        let _ = pd_app.emit(
+                            "download_batch_started",
+                            DownloadBatchStartedEvent {
+                                total_files: total_queued_for_download,
+                                total_bytes_hint,
+                                unknown_size_files,
+                                output_dir: pd_output.to_string_lossy().to_string(),
+                            },
+                        );
+                    } else {
+                        // Subsequent entries: emit download_total_update to grow the total
+                        // without resetting completedFiles/downloadedBytes/speed
+                        let _ = pd_app.emit(
+                            "download_total_update",
+                            serde_json::json!({
+                                "totalFiles": total_queued_for_download,
+                                "totalBytesHint": total_bytes_hint,
+                                "unknownSizeFiles": unknown_size_files,
+                            }),
+                        );
+                    }
                 }
 
                 // Phase 142: Process in chunks of 100 — start downloading immediately
