@@ -983,7 +983,7 @@ impl PrefetchedProbeData {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum ResumeValidatorKind {
     #[default]
     None,
@@ -991,7 +991,7 @@ enum ResumeValidatorKind {
     LastModified,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct HostCapabilityState {
     supports_ranges: Option<bool>,
     validator_kind: ResumeValidatorKind,
@@ -1112,6 +1112,62 @@ impl LowSpeedTracker {
 static DOWNLOAD_HOST_CAPABILITIES: OnceLock<StdRwLock<HashMap<String, HostCapabilityState>>> =
     OnceLock::new();
 static DOWNLOAD_ACTIVE_HOST_CONNECTIONS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+static HOST_CAPABILITY_SLED: OnceLock<Option<sled::Db>> = OnceLock::new();
+
+/// Phase 136: Initialize the host capability persistence store.
+/// Loads previously observed host capabilities from sled so we don't lose
+/// range support knowledge, RTT EWMAs, and parallelism caps across restarts.
+pub fn initialize_host_capability_store() {
+    HOST_CAPABILITY_SLED.get_or_init(|| {
+        let mut path = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        path.push(".crawli");
+        let _ = std::fs::create_dir_all(&path);
+        path.push("host_capabilities.sled");
+        match sled::open(&path) {
+            Ok(db) => {
+                // Hydrate in-memory map from sled
+                let mut loaded = 0usize;
+                let guard = download_host_capabilities();
+                if let Ok(mut map) = guard.write() {
+                    for entry in db.iter().flatten() {
+                        if let Ok(key) = std::str::from_utf8(&entry.0) {
+                            if let Ok(state) = serde_json::from_slice::<HostCapabilityState>(&entry.1) {
+                                // Only restore recent entries (last 24h)
+                                let age_ms = current_epoch_ms().saturating_sub(state.last_productive_epoch_ms);
+                                if age_ms <= 24 * 60 * 60 * 1_000 {
+                                    map.insert(key.to_string(), state);
+                                    loaded += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                if loaded > 0 {
+                    eprintln!("[Phase 136] Loaded {} host capabilities from disk cache", loaded);
+                }
+                Some(db)
+            }
+            Err(e) => {
+                eprintln!("[Phase 136] Failed to open host capability sled: {}", e);
+                None
+            }
+        }
+    });
+}
+
+/// Phase 136: Write-through a host capability to sled (non-blocking best-effort).
+fn persist_host_capability(key: &str, state: &HostCapabilityState) {
+    if let Some(Some(db)) = HOST_CAPABILITY_SLED.get() {
+        if let Ok(val) = serde_json::to_vec(state) {
+            let _ = db.insert(key.as_bytes(), val);
+            // Async flush — don't block the hot path
+            let db = db.clone();
+            tokio::spawn(async move { let _ = db.flush_async().await; });
+        }
+    }
+}
 
 fn download_host_capabilities() -> &'static StdRwLock<HashMap<String, HostCapabilityState>> {
     DOWNLOAD_HOST_CAPABILITIES.get_or_init(|| StdRwLock::new(HashMap::new()))
@@ -1206,7 +1262,7 @@ fn record_probe_host_capability(url: &str, is_onion: bool, probe: &ProbeResult, 
     let Ok(mut guard) = download_host_capabilities().write() else {
         return;
     };
-    let state = guard.entry(key).or_default();
+    let state = guard.entry(key.clone()).or_default();
     state.supports_ranges = Some(probe.supports_ranges);
     state.validator_kind = if probe.etag.is_some() {
         ResumeValidatorKind::Etag
@@ -1223,6 +1279,8 @@ fn record_probe_host_capability(url: &str, is_onion: bool, probe: &ProbeResult, 
         state.quarantine_until_epoch_ms = 0;
         state.last_productive_epoch_ms = current_epoch_ms();
     }
+    // Phase 136: write-through to sled
+    persist_host_capability(&key, state);
 }
 
 fn record_host_success(
@@ -1237,7 +1295,7 @@ fn record_host_success(
     let Ok(mut guard) = download_host_capabilities().write() else {
         return;
     };
-    let state = guard.entry(key).or_default();
+    let state = guard.entry(key.clone()).or_default();
     state.recent_successes = state.recent_successes.saturating_add(1);
     state.recent_failures = 0;
     state.consecutive_low_speed_aborts = 0;
@@ -1252,6 +1310,10 @@ fn record_host_success(
             .safe_parallelism_cap
             .saturating_add(1)
             .min(if is_onion { 16 } else { 32 });
+    }
+    // Phase 136: write-through to sled (only on productive transfers to avoid churn)
+    if bytes_transferred >= 32 * 1024 {
+        persist_host_capability(&key, state);
     }
 }
 

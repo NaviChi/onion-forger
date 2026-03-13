@@ -1,4 +1,38 @@
-> **Last Updated:** 2026-03-12T23:49 CDT
+> **Last Updated:** 2026-03-13T00:34 CDT
+
+## Phase 136: Connection Round-Trip Savings — Optimistic Streams + Host Capability Persistence (2026-03-13)
+
+### Problem
+Two sources of unnecessary round trips were identified:
+1. **Clearnet exit connections** waited for the exit relay's CONNECTED response before returning the stream — wasting 1 full round trip (~300-800ms over Tor's 3-hop circuit) when it's a formality for clearnet exits.
+2. **Host capability knowledge was ephemeral** — on app restart all learned host capabilities (range support, RTT EWMAs, parallelism caps) were lost, forcing re-probing from scratch.
+
+### Solution
+
+#### A. Optimistic Streams for Clearnet Exits
+- `arti_connector.rs`: Added conditional `prefs.optimistic()` for non-`.onion` hosts
+- Stream is returned immediately without waiting for CONNECTED response
+- .onion connections still wait for rendezvous handshake (required for correctness)
+- Saves ~300-800ms per new clearnet connection
+
+#### B. Host Capability Persistence via Sled
+- Added `Serialize`/`Deserialize` derives to `HostCapabilityState` and `ResumeValidatorKind`
+- New `HOST_CAPABILITY_SLED` static backed by `~/.crawli/host_capabilities.sled`
+- `initialize_host_capability_store()`: Loads recent entries (last 24h) from sled on startup
+- `persist_host_capability()`: Async write-through on every probe success and productive transfer (≥32KB)
+- Called from `record_probe_host_capability()` and `record_host_success()`
+- On restart, known hosts immediately enter range-mode without re-probing
+
+### Files Modified
+- `arti_connector.rs`: 1 change — conditional optimistic streams
+- `aria_downloader.rs`: 4 changes — Serde derives, sled persistence, write-through calls
+- `lib.rs`: 1 change — `initialize_host_capability_store()` call at bootstrap
+
+### Prevention Rules
+- **P136-1:** NEVER enable optimistic() for .onion hidden service connections — the rendezvous handshake MUST complete before the DataStream is usable.
+- **P136-2:** Host capability persistence must only restore entries from the last 24h to avoid stale data from server infrastructure changes.
+- **P136-3:** Write-through persistence must be async/non-blocking — never block the download hot path for sled I/O.
+
 
 ## Phase 135: Remove `.ariaforge` Temp Extension — Direct-to-Final-Path Downloads (2026-03-12)
 

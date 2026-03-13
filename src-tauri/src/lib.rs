@@ -911,6 +911,9 @@ async fn execute_crawl_attempt(
     timer.emit_log("[VFS] Storage initialized & wiped for new run");
     println!("[Crawli Bootstrap] vfs initialized at {}", vfs_path_str);
 
+    // Phase 136: Load persisted host capabilities (range support, RTT EWMAs)
+    aria_downloader::initialize_host_capability_store();
+
     let registry = adapters::AdapterRegistry::new().with_explorer_context(ledger.clone());
     let hinted_adapter = registry.determine_adapter_from_url_hint(url);
 
