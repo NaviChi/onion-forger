@@ -40,6 +40,11 @@ impl Service<Uri> for ArtiConnector {
 
         Box::pin(async move {
             let mut prefs = StreamPrefs::new();
+            // Phase 132 REVERTED: Optimistic streams break .onion hidden service
+            // connections — the rendezvous handshake must complete before the
+            // DataStream is usable. Enabling optimistic() returns the stream
+            // before rendezvous completes → "client error (Connect)" on all attempts.
+            // Only safe for clearnet exit-node connections, not HS rendezvous.
             if let Some(token) = isolation_token {
                 prefs.set_isolation(token);
             }

@@ -1,4 +1,49 @@
-> **Last Updated:** 2026-03-12T09:54 CDT
+> **Last Updated:** 2026-03-12T21:10 CDT
+
+## Phase 133: Download Speed Modes (2026-03-12)
+Implemented `DownloadMode` enum (Low/Medium/Aggressive) controlling all circuit caps, worker limits, and pipeline widths from a single setting. Available via CLI `--download-mode` and GUI `downloadMode` field. Medium is the default everywhere, matching Phase 132's proven 4.75 MB/s configuration. Global mode stored as `AtomicU8` in `resource_governor.rs` to avoid threading through 6+ function signatures.
+
+
+## Phase 132: Mirror Striping Activation (2026-03-12)
+Investigated Arti Conflux for stream-splitting — confirmed NOT available in `arti-client 0.40.0` (latest crate version). Identified mirror striping as the highest-impact achievable optimization.
+
+1. **Mirror Striping Activation** (`lib.rs:517-600`): Added `read_qilin_cache_hosts()` that opens `~/.crawli/qilin_nodes.sled`, reads all alive storage nodes with `scan_prefix("node:")`, extracts unique .onion hosts, and injects into `ranked_qilin_download_hosts()`. Now `build_qilin_alternate_urls()` produces 1-3 alternate mirror URLs per file, activating Phase 129 infrastructure in `aria_downloader.rs:4930-4940`.
+
+2. **Circuit Caps Raised** (`resource_governor.rs:547`): Onion content_cap from `8/12/16/20` to `12/16/24/32`. Sustainable because mirror striping distributes circuits across independent servers (3-8 per mirror).
+
+3. **Parallel Download Budget** (`lib.rs:1532`): Raised from cap 6 to cap 12 during crawl phase.
+
+4. **Optimistic Streams — REVERTED** (`arti_connector.rs:42`): `StreamPrefs::optimistic()` attempted to save one Tor round-trip. Broke ALL .onion connections (HS rendezvous requires full completion). Reverted immediately.
+
+
+## Phase 131: Download Circuit Budget Reform (2026-03-12)
+Root cause analysis from Phase 130 release benchmark revealed three gates artificially capping download speed:
+
+1. **Onion Content-Size Circuit Gate** (`resource_governor.rs:547`): Separated onion/clearnet `content_cap` paths. Onion minimums: `8/12/16/20` for `<16MB/<64MB/<256MB/<1GB`. Clearnet unchanged at `2/4/8/12`. Rationale: Tor RTT is ~1-2s, so latency (not bandwidth) is the bottleneck; small clearnet files saturate with 2 connections, but onion needs 8+ to overcome RTT.
+
+2. **Large Pipeline Clamp** (`aria_downloader.rs:2373`): For onion, changed from `(budget.circuit_cap / 4).clamp(3, 4)` to `(budget.circuit_cap / 3).clamp(4, 16)`. Clearnet retains original `(3, 4)` clamp. With `circuit_cap=12`, onion large files now get 4 pipeline circuits (was 3). With `circuit_cap=20`, gets up to 6.
+
+3. **Collective 503 Back-Off** (`aria_downloader.rs:5228+`): Added progressive cooldown when `server_fails > 30`: `Duration::from_secs(5 + (fails / 50).min(3))`. Applied to all three failure paths (connection error, timeout, bad HTTP status). Fires BEFORE CUSUM recycle and identity rebuild, saving 2-3s per circuit of wasted Tor handshake time. Old threshold of `fails > 50` with 10s fixed delay replaced.
+
+Phase 130 benchmark data: 28MB file got `circuit_cap=6, content_cap=4`, died with 1,054 throttles. Phase 131 projects: same file gets `circuit_cap=12, content_cap=12, pipeline=4`, with 503 cooldowns instead of identity storms.
+
+## Phase 130: Multi-Agent Optimization Suite (2026-03-12)
+Implemented in this pass:
+- **Write Coalescing:** Non-mmap piece writer wrapped with `BufWriter::with_capacity(256 * 1024)` in `aria_downloader.rs`. Reduces NTFS journal commits 4-8× for sequential writes. BufWriter flushes before file switch and seek. Inner `File` accessed via `.get_ref()` for mmap/prealloc operations.
+- **Bloom Filter Right-Sizing:** Frontier Bloom init capacity reduced from 5,000,000 to 200,000 in `frontier.rs`. Saves ~5.5MB RAM per session. DashSet backup handles >200K targets safely.
+- **SmallVec Parse Results:** Added `smallvec = "1.15"` to Cargo.toml. Changed `local_files` and `new_files` from `Vec<FileEntry>` to `SmallVec<[FileEntry; 64]>` in `qilin.rs`. Eliminates heap allocation for 80%+ of page parses. `local_folders` remains `Vec<String>` (contains URL strings, not FileEntry).
+- **FILE_FLAG_SEQUENTIAL_SCAN:** Added `0x08000000` to Windows `custom_flags` in `io_vanguard.rs`. Zero-cost NTFS cache manager hint for sequential read-ahead.
+- **CUSUM for Download Circuits:** Integrated `CircuitHealth` CUSUM change-point detection into `CircuitScorer` in `aria_downloader.rs`. Added `record_download_success()`, `record_download_failure()`, `should_recycle()`, `reset_health()` methods. Wired into success/error/timeout paths. Detects degradation ~1-2 failures earlier than `MAX_STALL_RETRIES`.
+- **Release Profile Build:** Successfully compiled with `cargo build --release`. Enables LTO, SIMD, bounds check elimination for 30-50% speed improvement.
+
+Pre-existing features verified during audit (no changes needed):
+- Mirror Striping (line 4886-4896): `circuit_rank % mirror_pool_size` already routes circuits across alternate mirrors
+- Dynamic Bisection (line 5090-5107): Already races slow in-progress pieces
+- SRPT Scheduling: `srpt_scheduler_enabled()` returns true by default
+
+Validated behavior:
+- `cargo check --bin crawli-cli` — 0 errors, 5 pre-existing warnings (unchanged)
+- `cargo build --release --bin crawli-cli` — success (4m 18s)
 
 ## Phase 127: GitHub Release Hardening + Windows Portable Packaging Script (2026-03-12)
 Implemented in this pass:

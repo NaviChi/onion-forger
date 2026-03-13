@@ -11,36 +11,51 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 
 // Phase 41: Windows NT Kernel SetFileValidData zero-filling blocks override for immense payloads
+// Phase 128: Returns (Ok(()), mmap_safe) where mmap_safe=true only when SetFileValidData
+// succeeded. Mmap over uncommitted pages causes STATUS_ACCESS_VIOLATION (0xc0000005)
+// on non-admin Windows when NT hasn't zero-filled the pre-allocated region yet.
 #[cfg(target_os = "windows")]
-fn preallocate_windows_nt_blocks(file: &std::fs::File, size: u64) -> std::io::Result<()> {
+fn preallocate_windows_nt_blocks(file: &std::fs::File, size: u64) -> (std::io::Result<()>, bool) {
     use std::os::windows::io::AsRawHandle;
     let handle = file.as_raw_handle() as *mut std::ffi::c_void;
     extern "system" {
         fn SetFileValidData(hFile: *mut std::ffi::c_void, ValidDataLength: i64) -> i32;
         fn GetLastError() -> u32;
     }
-    file.set_len(size)?;
-    unsafe {
+    if let Err(e) = file.set_len(size) {
+        return (Err(e), false);
+    }
+    let mmap_safe = unsafe {
         // Phase 129: Guard against missing SE_MANAGE_VOLUME_NAME privilege.
         // SetFileValidData requires admin rights. Without it, the call returns 0
         // and GetLastError() returns ERROR_PRIVILEGE_NOT_HELD (1314).
         // Fall through gracefully — NT will zero-fill on write (slower but correct).
+        // Phase 128: Callers MUST NOT create mmap when this returns false — the valid
+        // data length hasn't been extended, so mmap writes beyond the original valid
+        // region will hit uncommitted pages and cause ACCESS_VIOLATION.
         let result = SetFileValidData(handle, size as i64);
         if result == 0 {
             let err = GetLastError();
-            if err == 1314 {
-                eprintln!("[IO] SetFileValidData skipped (requires admin). NT will zero-fill.");
-            } else if err != 0 {
-                eprintln!("[IO] SetFileValidData warning: error code {}", err);
+            // Phase 129: Deduplicate this message — log once per session, not per file.
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if err == 1314 {
+                    eprintln!("[IO] SetFileValidData skipped (requires admin). NT will zero-fill. mmap disabled for pre-allocated files.");
+                } else if err != 0 {
+                    eprintln!("[IO] SetFileValidData warning: error code {}. mmap disabled for pre-allocated files.", err);
+                }
             }
+            false
+        } else {
+            true
         }
-    }
-    Ok(())
+    };
+    (Ok(()), mmap_safe)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn preallocate_windows_nt_blocks(file: &std::fs::File, size: u64) -> std::io::Result<()> {
-    file.set_len(size)
+fn preallocate_windows_nt_blocks(file: &std::fs::File, size: u64) -> (std::io::Result<()>, bool) {
+    (file.set_len(size), true)
 }
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -55,6 +70,7 @@ use tokio::task::JoinSet;
 use std::process::Command;
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn apply_windows_no_window(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -69,14 +85,18 @@ struct DownloadLogger {
 
 impl DownloadLogger {
     fn new(output_dir: &str, filename_hint: &str) -> Self {
-        // Build unique log filename: ariaforge_<filename>_<timestamp>.log
+        // Phase 129: Write logs to .crawli_logs/ subdirectory to avoid
+        // polluting the user's download folder with diagnostic files.
+        let log_dir = Path::new(output_dir).join(".crawli_logs");
+        let _ = fs::create_dir_all(&log_dir);
+
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
         let ts = now.as_secs();
         // Sanitize filename for log
         let safe_name = filename_hint.replace(['/', '\\', ':', '?', '*', '"', '<', '>', '|'], "_");
-        let log_path = Path::new(output_dir).join(format!("ariaforge_{}_{}.log", safe_name, ts));
+        let log_path = log_dir.join(format!("ariaforge_{}_{}.log", safe_name, ts));
 
         let file = OpenOptions::new()
             .create(true)
@@ -392,6 +412,10 @@ struct CircuitScorer {
     latency_kalman: Vec<std::sync::Mutex<crate::kalman::KalmanFilter>>,
     latency_baseline: Vec<AtomicU64>, // Baseline from first 3 pieces (ms)
     latency_samples: Vec<AtomicU64>,  // Number of samples recorded
+    // Phase 130: CUSUM change-point detection per download circuit.
+    // Detects sudden circuit degradation and triggers early recycling
+    // before multiple pieces stall. 12 bytes per circuit via CircuitHealth.
+    circuit_health: Vec<crate::circuit_health::CircuitHealth>,
 }
 
 #[allow(dead_code)]
@@ -414,6 +438,8 @@ impl CircuitScorer {
             latency_kalman: kalmans,
             latency_baseline: (0..num_circuits).map(|_| AtomicU64::new(0)).collect(),
             latency_samples: (0..num_circuits).map(|_| AtomicU64::new(0)).collect(),
+            // Phase 130: CUSUM health tracker per download circuit
+            circuit_health: (0..num_circuits).map(|_| crate::circuit_health::CircuitHealth::new()).collect(),
         }
     }
 
@@ -576,6 +602,38 @@ impl CircuitScorer {
                     .partial_cmp(&self.avg_speed_mbps(b))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+    }
+
+    /// Phase 130: Record a successful download chunk for CUSUM tracking.
+    /// Feeds the shared CircuitHealth module to track cumulative degradation.
+    fn record_download_success(&self, cid: usize) {
+        if cid < self.capacity {
+            self.circuit_health[cid].record_success();
+        }
+    }
+
+    /// Phase 130: Record a failed download attempt for CUSUM tracking.
+    fn record_download_failure(&self, cid: usize) {
+        if cid < self.capacity {
+            self.circuit_health[cid].record_failure();
+        }
+    }
+
+    /// Phase 130: Check if CUSUM has detected a change-point on this circuit.
+    /// Returns true if the circuit should be recycled with a fresh identity.
+    fn should_recycle(&self, cid: usize) -> bool {
+        if cid < self.capacity {
+            self.circuit_health[cid].cusum_triggered()
+        } else {
+            false
+        }
+    }
+
+    /// Phase 130: Reset CUSUM after circuit recycling (fresh slate for new identity).
+    fn reset_health(&self, cid: usize) {
+        if cid < self.capacity {
+            self.circuit_health[cid].reset_cusum();
+        }
     }
 }
 
@@ -2313,9 +2371,19 @@ fn plan_batch_lanes(
         return plan;
     }
 
-    let large_pipeline_circuits = (budget.circuit_cap / 4)
-        .clamp(3, 4)
-        .min(budget.circuit_cap.saturating_sub(2).max(1));
+    // Phase 133: Large pipeline clamp driven by DownloadMode.
+    // Low=(2,8), Medium=(4,16), Aggressive=(6,24).
+    let mode = crate::resource_governor::active_download_mode();
+    let large_pipeline_circuits = if is_onion {
+        let (clamp_min, clamp_max) = mode.large_pipeline_clamp();
+        (budget.circuit_cap / 3)
+            .clamp(clamp_min, clamp_max)
+            .min(budget.circuit_cap.saturating_sub(2).max(1))
+    } else {
+        (budget.circuit_cap / 4)
+            .clamp(3, 4)
+            .min(budget.circuit_cap.saturating_sub(2).max(1))
+    };
     let residual_parallelism = budget
         .circuit_cap
         .saturating_sub(large_pipeline_circuits)
@@ -3971,7 +4039,8 @@ pub async fn start_download(
             Some(&logger),
         ) {
             if !is_resuming {
-                let _ = preallocate_windows_nt_blocks(&file, state.content_length);
+                let (prealloc_result, mmap_safe) = preallocate_windows_nt_blocks(&file, state.content_length);
+                let _ = prealloc_result;
                 let _ = app.emit(
                     "log",
                     format!(
@@ -3979,8 +4048,15 @@ pub async fn start_download(
                         state.content_length as f64 / 1_073_741_824.0
                     ),
                 );
-            }
-            if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(&file) } {
+                // Phase 128: Only create mmap when SetFileValidData succeeded.
+                if mmap_safe {
+                    if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(&file) } {
+                        shared_mmap = Some(Arc::new(LockFreeMmap::new(&m)));
+                        initial_mmap_for_writer = Some(m);
+                    }
+                }
+            } else if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(&file) } {
+                // Resume path: file already exists with valid data, mmap is safe
                 shared_mmap = Some(Arc::new(LockFreeMmap::new(&m)));
                 initial_mmap_for_writer = Some(m);
             }
@@ -4050,7 +4126,12 @@ pub async fn start_download(
     let writer_temp_target = temp_target.clone();
     let writer_handle = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let mut active_filepath = String::new();
-        let mut active_file: Option<File> = file_for_writer;
+        // Phase 130: Write coalescing — wrap raw File in 256KB BufWriter to reduce
+        // NTFS journal commits by 4-8× for sequential piece writes. On non-admin Windows
+        // where mmap is disabled, every piece write previously triggered a separate
+        // NTFS metadata update. BufWriter coalesces sequential writes into single flushes.
+        let mut active_file: Option<std::io::BufWriter<File>> = file_for_writer
+            .map(|f| std::io::BufWriter::with_capacity(256 * 1024, f));
         let mut active_mmap: Option<memmap2::MmapMut> = initial_mmap_for_writer;
         if active_file.is_some() {
             active_filepath = writer_temp_target;
@@ -4124,6 +4205,10 @@ pub async fn start_download(
                     if let Some(mmap) = active_mmap.as_mut() {
                         let _ = mmap.flush();
                     }
+                    // Phase 130: Flush BufWriter before switching files
+                    if let Some(ref mut bw) = active_file {
+                        let _ = bw.flush();
+                    }
                     active_mmap = None;
 
                     if let Some(dir) = Path::new(&msg.filepath).parent() {
@@ -4139,15 +4224,24 @@ pub async fn start_download(
                             &writer_app,
                             Some(&writer_logger),
                         )?;
-                        active_file = Some(fout);
+                        // Phase 130: Wrap in 256KB BufWriter for write coalescing
+                        active_file = Some(std::io::BufWriter::with_capacity(256 * 1024, fout));
                     }
 
                     if let Some((st, _)) = &local_state {
                         if st.content_length > 0 && active_mmap.is_none() {
-                            if let Some(f) = active_file.as_ref() {
-                                let _ = preallocate_windows_nt_blocks(f, st.content_length);
-                                if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(f) } {
-                                    active_mmap = Some(m);
+                            if let Some(bw) = active_file.as_ref() {
+                                // Phase 130: Use .get_ref() to access inner File for prealloc/mmap
+                                let f = bw.get_ref();
+                                let (prealloc_result, mmap_safe) = preallocate_windows_nt_blocks(f, st.content_length);
+                                let _ = prealloc_result;
+                                // Phase 128: Only create mmap when SetFileValidData succeeded.
+                                // Without it, valid data length < file size, and mmap writes
+                                // beyond the valid region hit uncommitted NT pages → ACCESS_VIOLATION.
+                                if mmap_safe {
+                                    if let Ok(m) = unsafe { memmap2::MmapOptions::new().map_mut(f) } {
+                                        active_mmap = Some(m);
+                                    }
                                 }
                             }
                         }
@@ -5123,15 +5217,37 @@ pub async fn start_download(
                                 // Reset global fail counter on success
                                 task_server_fails.store(0, Ordering::Relaxed);
                                 task_aimd.on_success_blind(); // Phase 4.4
+                                task_scorer.record_download_success(circuit_id); // Phase 130: CUSUM
                                 resp
                             }
                             Ok(Err(err)) => {
                                 stalls += 1;
                                 task_aimd.on_reject(); // Phase 4.4
+                                task_scorer.record_download_failure(circuit_id); // Phase 130: CUSUM
                                 let fails = task_server_fails.fetch_add(1, Ordering::Relaxed);
 
                                 if err.to_string().contains("connect") || err.to_string().contains("request") {
                                     let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Circuit {} connection reset. Rotating client slot {}...", circuit_id, task_daemon_port));
+                                }
+
+                                // Phase 131: Collective 503 back-off — when global fails exceed
+                                // circuit count, all circuits are being rejected. Pause 5-8s to let
+                                // the server cool down instead of frantically recycling identities
+                                // (each rebuild costs 2-3s of Tor handshake time).
+                                if fails > 30 {
+                                    let cooldown = Duration::from_secs(5 + (fails as u64 / 50).min(3));
+                                    tokio::time::sleep(cooldown).await;
+                                    continue;
+                                }
+
+                                // Phase 130: CUSUM-triggered early recycling — detect degradation
+                                // before MAX_STALL_RETRIES accumulate (typically ~3-4 failures vs 5).
+                                if task_scorer.should_recycle(circuit_id) {
+                                    let _ = task_app.emit("log", format!("[⚡] CUSUM: Circuit {} degraded. Recycling identity...", circuit_id));
+                                    circuit_client = circuit_client.new_isolated();
+                                    task_scorer.reset_health(circuit_id);
+                                    stalls = 0;
+                                    continue;
                                 }
 
                                 if stalls > MAX_STALL_RETRIES {
@@ -5140,25 +5256,33 @@ pub async fn start_download(
                                     stalls = 0;
                                     continue;
                                 }
-                                // Graceful degradation: if many circuits failing, pause longer
-                                if fails > 50 {
-                                    tokio::time::sleep(Duration::from_secs(10)).await;
-                                }
                                 tokio::time::sleep(backoff_duration(stalls)).await;
                                 continue;
                             }
                             Err(_) => {
                                 stalls += 1;
                                 task_aimd.on_timeout(); // Phase 4.4
+                                task_scorer.record_download_failure(circuit_id); // Phase 130: CUSUM
                                 let fails = task_server_fails.fetch_add(1, Ordering::Relaxed);
+                                // Phase 130: CUSUM-triggered early recycling on timeout
+                                if task_scorer.should_recycle(circuit_id) {
+                                    let _ = task_app.emit("log", format!("[⚡] CUSUM: Circuit {} timeout-degraded. Recycling...", circuit_id));
+                                    circuit_client = circuit_client.new_isolated();
+                                    task_scorer.reset_health(circuit_id);
+                                    stalls = 0;
+                                    continue;
+                                }
                                 if stalls > MAX_STALL_RETRIES {
                                     let _ = task_app.emit("log", format!("[↻] Supervisor self-healing: Circuit {} header timeout on piece {}. Rebuilding identity...", circuit_id, piece_idx));
                                     circuit_client = circuit_client.new_isolated();
                                     stalls = 0;
                                     continue;
                                 }
-                                if fails > 50 {
-                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                // Phase 131: Collective timeout back-off
+                                if fails > 30 {
+                                    let cooldown = Duration::from_secs(5 + (fails as u64 / 50).min(3));
+                                    tokio::time::sleep(cooldown).await;
+                                    continue;
                                 }
                                 tokio::time::sleep(backoff_duration(stalls)).await;
                                 continue;
@@ -5179,6 +5303,15 @@ pub async fn start_download(
                                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                             {
                                 let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Circuit {} hit HTTP {}. Rotating client slot {}...", circuit_id, status, task_daemon_port));
+                            }
+
+                            // Phase 131: On 503/429 status, check for collective back-off
+                            // before wasting time recycling the circuit identity.
+                            let fails = task_server_fails.load(Ordering::Relaxed);
+                            if fails > 30 {
+                                let cooldown = Duration::from_secs(5 + (fails as u64 / 50).min(3));
+                                tokio::time::sleep(cooldown).await;
+                                continue;
                             }
 
                             if stalls > MAX_STALL_RETRIES {

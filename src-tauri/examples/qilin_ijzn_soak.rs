@@ -18,7 +18,6 @@ struct SoakConfig {
     duration_secs: u64,
     mode: String,
     circuits_ceiling: usize,
-    daemons: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -48,7 +47,6 @@ struct SoakReport {
     duration_secs: u64,
     mode: String,
     circuits_ceiling: usize,
-    daemons: usize,
     crawl_result: Option<CrawlSessionResult>,
     partial_vfs_summary: Option<VfsSummary>,
     crawl_error: Option<String>,
@@ -177,6 +175,7 @@ async fn main() -> Result<()> {
                 resume_index: None,
                 mega_password: None,
                 stealth_ramp: true, parallel_download: false,
+            download_mode: crawli_lib::frontier::DownloadMode::Medium,
             force_clearnet: false,
             },
             output_dir.to_string_lossy().to_string(),
@@ -193,7 +192,6 @@ async fn main() -> Result<()> {
                 duration_secs: config.duration_secs,
                 mode: config.mode.clone(),
                 circuits_ceiling: config.circuits_ceiling,
-                daemons: config.daemons,
                 crawl_result: None,
                 partial_vfs_summary: partial_vfs_summary().await,
                 crawl_error: Some(err.to_string()),
@@ -215,7 +213,6 @@ async fn main() -> Result<()> {
                 duration_secs: config.duration_secs,
                 mode: config.mode.clone(),
                 circuits_ceiling: config.circuits_ceiling,
-                daemons: config.daemons,
                 crawl_result: None,
                 partial_vfs_summary: partial_vfs_summary().await,
                 crawl_error: Some("authorized soak crawl timed out".to_string()),
@@ -286,7 +283,6 @@ async fn main() -> Result<()> {
         duration_secs: config.duration_secs,
         mode: config.mode,
         circuits_ceiling: config.circuits_ceiling,
-        daemons: config.daemons,
         crawl_result,
         partial_vfs_summary: partial_vfs_summary().await,
         crawl_error: None,

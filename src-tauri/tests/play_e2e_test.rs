@@ -455,12 +455,12 @@ async fn test_politeness_semaphore_bottleneck() {
         Vec::new(),
         CrawlOptions {
             stealth_ramp: false, parallel_download: false,
+            download_mode: crawli_lib::frontier::DownloadMode::Medium,
             force_clearnet: false,
             listing: true,
             sizes: true,
             download: true,
             circuits: None,
-            daemons: None,
             agnostic_state: false,
             resume: false,
             resume_index: None,

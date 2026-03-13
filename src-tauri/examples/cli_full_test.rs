@@ -23,7 +23,6 @@ struct TestConfig {
     url: String,
     duration_secs: u64,
     circuits_ceiling: usize,
-    daemons: usize,
     crawl_only: bool,
     download_only: bool,
 }
@@ -212,7 +211,8 @@ async fn main() -> Result<()> {
 
     let timestamp = unix_now();
     let output_dir = PathBuf::from(format!(
-        "/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/cli_full_test_{}",
+        "{}\\cli_full_test_{}",
+        std::env::temp_dir().display(),
         timestamp
     ));
     std::fs::create_dir_all(&output_dir)?;
@@ -245,6 +245,7 @@ async fn main() -> Result<()> {
                     resume_index: None,
                     mega_password: None,
                     stealth_ramp: true, parallel_download: false,
+            download_mode: crawli_lib::frontier::DownloadMode::Medium,
                     force_clearnet: false,
                 },
                 output_dir.to_string_lossy().to_string(),
@@ -528,9 +529,7 @@ async fn main() -> Result<()> {
         output_dir: output_dir.to_string_lossy().to_string(),
     };
 
-    let report_path = PathBuf::from(
-        "/Users/navi/Documents/Projects/LOKI TOOLS/Onion Forger/crawli/tmp/cli_full_test_latest.json",
-    );
+    let report_path = std::env::temp_dir().join("cli_full_test_latest.json");
     std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
     println!("📄 JSON report: {}", report_path.display());
     println!("📁 Output dir:  {}", output_dir.display());

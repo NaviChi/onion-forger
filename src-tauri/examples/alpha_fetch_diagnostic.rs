@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
         listing: true,
         circuits: Some(5),
         resume: false,
+            resume_index: None,
         ..Default::default()
     };
 

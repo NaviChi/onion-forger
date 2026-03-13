@@ -12,6 +12,94 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Semaphore;
 
+/// Phase 133: Download speed mode controlling circuit caps, parallel budgets,
+/// and pipeline widths. Each mode is tuned for different use cases:
+/// - **Low:** Stealth mode — minimizes server footprint, avoids rate-limiting.
+/// - **Medium:** Balanced — proven 4.75 MB/s in Phase 132 benchmarks.
+/// - **Aggressive:** Maximum throughput — uses all available mirrors aggressively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadMode {
+    Low,
+    Medium,
+    Aggressive,
+}
+
+impl Default for DownloadMode {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+impl std::fmt::Display for DownloadMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Low => write!(f, "low"),
+            Self::Medium => write!(f, "medium"),
+            Self::Aggressive => write!(f, "aggressive"),
+        }
+    }
+}
+
+impl DownloadMode {
+    /// Circuit cap multipliers for onion content-size tiers.
+    /// Returns (micro, small, medium, large) caps.
+    /// These are the BASE values — resource_governor may further adjust.
+    pub fn onion_content_caps(self) -> (usize, usize, usize, usize) {
+        match self {
+            //           <16MB  <64MB  <256MB  <1GB
+            Self::Low =>       (6,     8,    12,    16),
+            Self::Medium =>    (12,   16,    24,    32),
+            Self::Aggressive => (20,   28,    40,    56),
+        }
+    }
+
+    /// Maximum parallel download circuits during crawl overlap.
+    pub fn parallel_download_cap(self) -> usize {
+        match self {
+            Self::Low => 6,
+            Self::Medium => 12,
+            Self::Aggressive => 24,
+        }
+    }
+
+    /// Default circuit count when none specified.
+    pub fn default_circuits(self) -> usize {
+        match self {
+            Self::Low => 6,
+            Self::Medium => 12,
+            Self::Aggressive => 24,
+        }
+    }
+
+    /// Large pipeline clamp range (min, max) for onion.
+    pub fn large_pipeline_clamp(self) -> (usize, usize) {
+        match self {
+            Self::Low => (2, 8),
+            Self::Medium => (4, 16),
+            Self::Aggressive => (6, 24),
+        }
+    }
+
+    /// Number of Tor swarm clients (Arti instances) to bootstrap.
+    pub fn tor_swarm_clients(self) -> usize {
+        match self {
+            Self::Low => 4,
+            Self::Medium => 8,
+            Self::Aggressive => 12,
+        }
+    }
+
+    /// Crawl worker ceiling for the Qilin adaptive governor.
+    pub fn crawl_worker_ceiling(self) -> usize {
+        match self {
+            Self::Low => 3,
+            Self::Medium => 4,
+            Self::Aggressive => 6,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CrawlOptions {
@@ -37,6 +125,9 @@ pub struct CrawlOptions {
     /// discovered files to the download engine in real-time.
     #[serde(default)]
     pub parallel_download: bool,
+    /// Phase 133: Download speed mode — low/medium/aggressive.
+    #[serde(default)]
+    pub download_mode: DownloadMode,
 }
 
 impl Default for CrawlOptions {
@@ -53,6 +144,7 @@ impl Default for CrawlOptions {
             mega_password: None,
             stealth_ramp: true,
             parallel_download: false,
+            download_mode: DownloadMode::Medium,
         }
     }
 }
@@ -221,7 +313,9 @@ impl CrawlerFrontier {
             }
         }
 
-        let mut bloom = Bloom::new_for_fp_rate(5_000_000, 0.01).expect("Failed to init bloom");
+        // Phase 130: Right-sized bloom filter. Old 5M init wasted ~5.7MB for Qilin targets
+        // (~50K URLs). 200K init uses ~240KB — 24× RAM savings. DashSet backup handles collisions.
+        let mut bloom = Bloom::new_for_fp_rate(200_000, 0.01).expect("Failed to init bloom");
         let hashes = DashSet::new();
 
         let safe_name = sanitize_filename(&target_url);

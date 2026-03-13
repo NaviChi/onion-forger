@@ -255,6 +255,7 @@ async fn run_single_adapter(
         resume_index: None,
         mega_password: None,
         stealth_ramp: true, parallel_download: false,
+            download_mode: crawli_lib::frontier::DownloadMode::Medium,
             force_clearnet: false,
     };
     let daemon_count = if is_onion {

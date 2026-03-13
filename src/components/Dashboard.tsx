@@ -238,7 +238,6 @@ export function Dashboard({
     0,
     downloadBatchStatus.smoothedSpeedMbps || resolvedSpeedMbps || 0,
   ).toFixed(2);
-  const downloadedMb = (resolvedDownloadedBytes / 1048576).toFixed(2);
   const diskWriteMbps = Math.max(0, downloadBatchStatus.diskWriteMbps || 0);
   const activeCircuits = Math.max(0, downloadBatchStatus.activeCircuits || 0);
   const etaConfidencePct = Math.round(Math.max(0, Math.min(1, downloadBatchStatus.etaConfidence || 0)) * 100);
@@ -364,13 +363,13 @@ export function Dashboard({
         <div className="dash-icon"><CloudDownload size={24} /></div>
         <div className="dash-info">
           <div className="dash-title">NETWORK I/O (BBR)</div>
-          <div className="dash-value">{speedMb} MB/s</div>
-          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Peak BW: {downloadBatchStatus.peakBandwidthMbps?.toFixed(2) || "0.00"} MB/s</div>
+          <div className="dash-value">{downloadElapsedSec > 0 ? throughputFromAverage.toFixed(2) : speedMb} MB/s avg</div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono', color: 'var(--accent-primary)' }}>Downloaded: {(resolvedDownloadedBytes / 1048576).toFixed(1)} MB{downloadBatchStatus.totalBytesHint > 0 ? ` / ${hintedGb} GB` : ''}</div>
+          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Live: {speedMb} MB/s | Peak BW: {downloadBatchStatus.peakBandwidthMbps?.toFixed(2) || "0.00"} MB/s</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Disk I/O: {diskWriteMbps.toFixed(2)} MB/s (Peak {downloadBatchStatus.peakDiskWriteMbps?.toFixed(2) || "0.00"})</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Active Circuits: {activeCircuits} (Peak {downloadBatchStatus.peakActiveCircuits || 0})</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>BBR Bottleneck: {downloadBatchStatus.bbrBottleneckMbps?.toFixed(2) || "0.00"} MB/s</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>EKF Var/Cov: {downloadBatchStatus.ekfCovariance?.toFixed(3) || "0.000"} P</div>
-          <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Total Payload: {downloadedMb} MB</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Tor Uptime: {Math.floor((resourceMetrics.uptimeSeconds || 0) / 3600)}h {Math.floor(((resourceMetrics.uptimeSeconds || 0) % 3600) / 60)}m {(resourceMetrics.uptimeSeconds || 0) % 60}s</div>
           <div className="dash-sub" style={{ fontFamily: 'JetBrains Mono' }}>Consensus Wgt: {resourceMetrics.consensusWeight || 0} CW</div>
         </div>

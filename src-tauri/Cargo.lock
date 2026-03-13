@@ -1349,6 +1349,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sled",
+ "smallvec",
  "socket2 0.5.10",
  "sysinfo 0.32.1",
  "tauri",

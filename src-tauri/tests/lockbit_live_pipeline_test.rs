@@ -195,12 +195,12 @@ fn live_lockbit_pipeline_default_ui_settings() {
             sizes: true,
             download: false,
             circuits: Some(120),
-            daemons: Some(4),
             agnostic_state: false,
             resume: false,
             resume_index: None,
             mega_password: None,
             stealth_ramp: false, parallel_download: false,
+            download_mode: crawli_lib::frontier::DownloadMode::Medium,
             force_clearnet: false,
         };
 

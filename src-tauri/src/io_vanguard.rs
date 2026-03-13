@@ -127,7 +127,10 @@ fn apply_internal(opts: &mut OpenOptions) -> &mut OpenOptions {
     // Windows write-back cache (data goes straight to disk) but does NOT require
     // sector alignment. This gives us ~90% of the Direct I/O benefit without
     // the alignment landmine.
-    opts.custom_flags(0x80000000) // FILE_FLAG_WRITE_THROUGH only
+    // Phase 130: Added FILE_FLAG_SEQUENTIAL_SCAN (0x08000000) — zero-cost hint to NTFS
+    // cache manager to optimize read-ahead for sequential access. Piece-mode downloads
+    // largely arrive in order, so this improves cache utilization for hash verification reads.
+    opts.custom_flags(0x80000000 | 0x08000000) // FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -136,11 +139,11 @@ fn apply_internal(opts: &mut OpenOptions) -> &mut OpenOptions {
 }
 
 /// Applies post-open configurations (required for macOS F_NOCACHE).
-pub fn post_open_config(file: &std::fs::File) {
+pub fn post_open_config(_file: &std::fs::File) {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::io::AsRawFd;
-        let fd = file.as_raw_fd();
+        let fd = _file.as_raw_fd();
         unsafe {
             if libc::fcntl(fd, libc::F_NOCACHE, 1) == -1 {
                 eprintln!("[Warning] Failed to set F_NOCACHE on macOS");

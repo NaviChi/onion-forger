@@ -8,7 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
-const TELEMETRY_BRIDGE_INTERVAL_MS: u64 = 250;
+// Phase 129: Throttle all UI telemetry updates to 3-second intervals.
+// At 250ms the bridge generated 4 updates/second/channel, causing excessive
+// WebView IPC serialization overhead. 3s balances UX responsiveness with
+// CPU/energy savings (~12× fewer IPC round-trips).
+const TELEMETRY_BRIDGE_INTERVAL_MS: u64 = 3000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

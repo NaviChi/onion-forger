@@ -532,11 +532,68 @@ fn ranked_qilin_download_hosts(entries: &[adapters::FileEntry]) -> Vec<String> {
         *counts.entry(host).or_default() += 1;
     }
 
+    // Phase 132: Inject alternate hosts from QilinNodeCache sled DB.
+    // The crawl uses a single winner host, so entries only contain 1 host.
+    // Reading alive alternate nodes from the cache gives us mirror hosts
+    // for download striping across independent servers.
+    let cache_hosts = read_qilin_cache_hosts();
+    for host in cache_hosts {
+        counts.entry(host).or_insert(1);
+    }
+
     let mut ranked = counts.into_iter().collect::<Vec<_>>();
     ranked.sort_by(|(host_a, count_a), (host_b, count_b)| {
         count_b.cmp(count_a).then_with(|| host_a.cmp(host_b))
     });
     ranked.into_iter().map(|(host, _)| host).collect()
+}
+
+/// Phase 132: Read alive storage node hosts from QilinNodeCache sled DB.
+/// Returns up to 5 unique .onion hosts that are not cooling down.
+fn read_qilin_cache_hosts() -> Vec<String> {
+    let mut path = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    path.push(".crawli");
+    path.push("qilin_nodes.sled");
+
+    let db = match sled::open(&path) {
+        Ok(db) => db,
+        Err(_) => return Vec::new(),
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut hosts: Vec<(String, u32)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for item in db.scan_prefix(b"node:").flatten() {
+        if let Ok(node) = serde_json::from_slice::<serde_json::Value>(&item.1) {
+            let host = node.get("host").and_then(|h| h.as_str()).unwrap_or_default().to_string();
+            let cooldown = node.get("cooldown_until").and_then(|c| c.as_u64()).unwrap_or(0);
+            let last_seen = node.get("last_seen").and_then(|l| l.as_u64()).unwrap_or(0);
+            let hit_count = node.get("hit_count").and_then(|h| h.as_u64()).unwrap_or(0) as u32;
+
+            if host.is_empty() || !host.ends_with(".onion") {
+                continue;
+            }
+            // Skip cooling down nodes and stale nodes (>7 days)
+            if cooldown > now || now.saturating_sub(last_seen) > 604_800 {
+                continue;
+            }
+            if seen.insert(host.clone()) {
+                hosts.push((host, hit_count));
+            }
+        }
+    }
+
+    // Sort by hit count descending — most reliable mirrors first
+    hosts.sort_by(|a, b| b.1.cmp(&a.1));
+    hosts.into_iter().take(5).map(|(h, _)| h).collect()
 }
 
 fn stable_rotation_index(key: &str, len: usize) -> usize {
@@ -1473,6 +1530,20 @@ async fn start_crawl(
     let retry_budget = 2usize;
     let started_at_epoch = chrono::Local::now().timestamp().max(0) as u64;
 
+    // Phase 133: Activate download mode globally before any budget calculations
+    resource_governor::set_active_download_mode(options.download_mode);
+    app.emit(
+        "crawl_log",
+        format!(
+            "[System] Download mode: {} (circuits={}, pd_cap={}, workers={})",
+            options.download_mode,
+            options.download_mode.default_circuits(),
+            options.download_mode.parallel_download_cap(),
+            options.download_mode.crawl_worker_ceiling(),
+        ),
+    )
+    .unwrap_or_default();
+
     if options.resume && options.resume_index.is_none() {
         if best_prior_count > 0 && target_paths.stable_best_dirs_listing_path.exists() {
             options.resume_index = Some(
@@ -1529,7 +1600,9 @@ async fn start_crawl(
         let pd_output = output_root.clone();
         let pd_target_dir = target_paths.target_dir.clone();
         let pd_cancel = parallel_download_cancel.clone();
-        let pd_circuits = options.circuits.unwrap_or(8).max(1).min(6); // Moderate budget during crawl
+        // Phase 133: Parallel download circuit budget driven by DownloadMode.
+        let pd_cap = options.download_mode.parallel_download_cap();
+        let pd_circuits = options.circuits.unwrap_or(options.download_mode.default_circuits()).max(1).min(pd_cap);
         let pd_is_onion = url_targets_onion(&url) && !options.force_clearnet;
 
         app.emit(

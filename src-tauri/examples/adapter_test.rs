@@ -286,7 +286,6 @@ struct CliArgs {
     circuits: usize,
     timeout_seconds: u64,
     json_output: bool,
-    daemons: usize,
 }
 
 fn parse_args() -> CliArgs {
@@ -298,7 +297,6 @@ fn parse_args() -> CliArgs {
         circuits: DEFAULT_CIRCUITS,
         timeout_seconds: DEFAULT_TIMEOUT_SECS,
         json_output: false,
-        daemons: DEFAULT_TOR_DAEMONS,
     };
 
     let mut i = 1;
@@ -393,7 +391,6 @@ async fn run_adapter_test(
     arti_clients: &[crawli_lib::tor_native::SharedTorClient],
     active_ports: &[u16],
     circuits: usize,
-    daemons: usize,
     timeout_seconds: u64,
 ) -> AdapterTestResult {
     let mut result = AdapterTestResult {
@@ -428,6 +425,7 @@ async fn run_adapter_test(
         resume_index: None,
         mega_password: None,
         stealth_ramp: true, parallel_download: false,
+            download_mode: crawli_lib::frontier::DownloadMode::Medium,
             force_clearnet: false,
     };
 

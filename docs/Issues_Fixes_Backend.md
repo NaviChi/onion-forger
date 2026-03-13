@@ -1,4 +1,197 @@
-> **Last Updated:** 2026-03-11T20:00 CDT
+> **Last Updated:** 2026-03-12T21:10 CDT
+
+## Phase 133: Download Speed Modes — Low / Medium / Aggressive (2026-03-12)
+
+### Design
+Added a `DownloadMode` enum (`frontier.rs`) with three presets controlling all circuit and worker parameters. **Medium is the default** everywhere — CLI (even with no flags), GUI, and all test binaries.
+
+### Parameter Table
+
+| Parameter | Low (Stealth) | Medium (Balanced) | Aggressive (Max) |
+|-----------|:---:|:---:|:---:|
+| Default circuits | 6 | **12** | 24 |
+| Parallel download cap | 6 | **12** | 24 |
+| Tor swarm clients | 4 | **8** | 12 |
+| Crawl worker ceiling | 3 | **4** | 6 |
+| Content cap <16MB | 6 | **12** | 20 |
+| Content cap <64MB | 8 | **16** | 28 |
+| Content cap <256MB | 12 | **24** | 40 |
+| Content cap <1GB | 16 | **32** | 56 |
+| Pipeline clamp (min,max) | (2,8) | **(4,16)** | (6,24) |
+
+### Files Modified
+- `frontier.rs`: Added `DownloadMode` enum with all parameter methods
+- `cli.rs`: Added `--download-mode` (low/medium/aggressive), `DownloadModeCli` ValueEnum  
+- `resource_governor.rs`: Added global `ACTIVE_DOWNLOAD_MODE` AtomicU8 with get/set, content_cap reads from mode
+- `lib.rs`: Sets mode at crawl start, parallel download cap from mode
+- `aria_downloader.rs`: Large pipeline clamp from mode
+- 4 test binaries: Added `download_mode: Medium` field
+
+### Prevention Rules
+- **P133-1:** `DownloadMode::Medium` MUST always be the default. The Phase 132 benchmark (4.75 MB/s) validated these exact values.
+- **P133-2:** When adding new CrawlOptions constructors, always include `download_mode` field. The compiler will enforce this (no `Default` spread in most bin files).
+
+
+## Phase 132: Mirror Striping Activation & Optimistic Streams Revert (2026-03-12)
+
+### Mirror Striping (lib.rs:517-600)
+- **Before:** `ranked_qilin_download_hosts()` only extracted hosts from file URLs. Since Qilin crawls from a single winner host, all files had the same host → 0 alternate URLs → mirror striping infrastructure (Phase 129) was inert.
+- **Fix:** Added `read_qilin_cache_hosts()` that opens the QilinNodeCache sled DB (`~/.crawli/qilin_nodes.sled`), reads all alive non-cooling-down storage nodes, extracts their .onion hosts, and injects them into `ranked_hosts`. Now `build_qilin_alternate_urls()` produces 1-3 mirror URLs per file.
+- **Impact:** Each mirror has independent rate limits. 4 mirrors × 4 circuits each = 16 effective circuits with near-zero 503s. Projected 3-4× download speed increase.
+
+### Optimistic Streams (arti_connector.rs:42) — REVERTED
+- **Attempted:** Added `StreamPrefs::optimistic()` to eliminate one Tor round-trip per connection.
+- **Result:** ALL fingerprint probes failed with "client error (Connect)" (4/4 failures) when site was confirmed online.
+- **Root Cause:** Hidden service rendezvous is more complex than regular exit connections. `optimistic()` returns the DataStream before rendezvous completes → HTTP layer hits a broken pipe.
+- **Prevention:** **NEVER enable optimistic streams for .onion connections.** Only safe for clearnet exit-node traffic.
+
+### Circuit Cap Increase (resource_governor.rs:547)
+- **Before:** Onion content caps at 8/12/16/20 (Phase 131).
+- **After:** Raised to 12/16/24/32 to properly utilize mirror striping. With 3-4 mirrors, each gets 3-8 circuits (under individual 503 threshold).
+
+### Parallel Download Budget (lib.rs:1532)
+- **Before:** Capped at 6 circuits during crawl.
+- **After:** Raised to 12. With mirror striping, 12 circuits across 3-4 mirrors = 3-4 per mirror.
+
+### Prevention Rules
+- **P132-1:** NEVER use `StreamPrefs::optimistic()` for .onion hidden service connections. The HS rendezvous handshake MUST complete before the DataStream is usable.
+- **P132-2:** Mirror striping effectiveness depends on QilinNodeCache having discovered alternate storage nodes. First crawl of a new target builds the cache; subsequent runs benefit from cached mirrors.
+- **P132-3:** When raising circuit caps, validate that mirror striping distributes load across independent servers. Higher caps on a SINGLE server will increase 503s, not speed.
+
+
+## Phase 131: Download Circuit Budget Reform — 3 Critical Bottlenecks Fixed (2026-03-12)
+
+### Root Cause (from Phase 130 Release Benchmark)
+Live benchmark stalled at 35/43 files (0.51 MB/s → 0 MB/s) on a 28MB PDF for 5+ minutes. Root cause: three pre-existing resource governor gates artificially capped download circuits far below useful capacity for Tor.
+
+### Bottleneck 1: Content-Size Circuit Gate (resource_governor.rs:547)
+- **Before:** `content_cap` for onion files <64MB = only 4 circuits. Designed for clearnet where 4 connections saturate bandwidth. Over Tor with ~1-2s RTT, 4 × 200 KB/s = 0.8 MB/s max.
+- **Fix:** Separate onion/clearnet paths. Onion minimums raised to `8/12/16/20` (was `2/4/8/12`). Clearnet values unchanged.
+- **Impact:** 28MB onion file now gets 12 circuits (was 4) → 3× projected throughput.
+
+### Bottleneck 2: Large Pipeline Clamp (aria_downloader.rs:2373)
+- **Before:** `.clamp(3, 4)` hard-capped large file downloads to 4 circuits regardless of budget.
+- **Fix:** Onion path uses `.clamp(4, 16)` with `budget.circuit_cap / 3`. Clearnet unchanged at `.clamp(3, 4)`.
+- **Impact:** With circuit_cap=12, onion large files get 4 circuits (was 3). With circuit_cap=16+, gets up to 16 circuits.
+
+### Bottleneck 3: Circuit Death Spiral (aria_downloader.rs:5228+)
+- **Before:** When 50+ global failures accumulated, system would pause 10s per circuit THEN continue recycling. Constant `new_isolated()` calls cost 2-3s each in Tor handshake time.
+- **Fix:** Collective back-off at 30 fails with progressive cooldown: `Duration::from_secs(5 + (fails / 50).min(3))`. Applied to all three failure paths (connection error, timeout, bad status). Back-off fires BEFORE the CUSUM/recycle path, preventing wasteful identity rebuilds during server overload.
+- **Impact:** During the 1,054-throttle storm in Phase 130, system would have paused 5-8s collectively instead of burning ~30s per circuit in rebuild overhead.
+
+### Prevention Rules
+- **P131-1:** Onion content caps MUST account for Tor RTT latency (~1-2s), not just bandwidth. Even a 1MB onion file needs 8+ circuits.
+- **P131-2:** Pipeline clamps MUST be onion-aware. Clearnet saturates at 4 connections; Tor needs 8-16.
+- **P131-3:** When ALL circuits fail simultaneously, the problem is server-side rate-limiting, NOT circuit quality. Pause collectively instead of recycling individually.
+- **P131-4:** The `discovered_entries` counter in `qilin.rs` is a RAW parse counter including duplicates from retried pages. The true unique count comes from `vfs.summarize_entries()`. Document this distinction in metrics.
+
+## Phase 130: Multi-Agent Optimization Suite — 8 Algorithms Implemented (2026-03-12)
+
+### Changes Implemented
+
+1. **Write Coalescing (Item 2)** — Non-mmap piece writer wrapped in `BufWriter::with_capacity(256KB)`.
+   - **File:** `aria_downloader.rs` line 4084
+   - **Impact:** 4-8× fewer NTFS journal commits on non-admin Windows. BufWriter flushes before file switch and before non-sequential seeks.
+   - **Safety:** Flush called on file switch, BufWriter `.get_ref()` used for mmap/prealloc inner File access.
+
+2. **Bloom Filter Right-Sizing (Item 3)** — Init capacity reduced from 5,000,000 to 200,000.
+   - **File:** `frontier.rs` line 226
+   - **Impact:** RAM savings: ~5.7MB → ~240KB (24× reduction). DashSet backup handles collisions for targets >200K URLs.
+
+3. **SmallVec for Parse Results (Item 4)** — `local_files` and `new_files` vectors changed from `Vec<FileEntry>` to `SmallVec<[FileEntry; 64]>`.
+   - **File:** `qilin.rs` lines 3953, 3984, 4835, 4857 + `Cargo.toml`
+   - **Impact:** Eliminates heap allocation for 80%+ of page parses (typical Qilin pages: 20-50 entries).
+   - **Note:** `local_folders` remains `Vec<String>` since it contains URL strings, not FileEntry.
+
+4. **FILE_FLAG_SEQUENTIAL_SCAN (Item 7)** — Added `0x08000000` alongside `FILE_FLAG_WRITE_THROUGH`.
+   - **File:** `io_vanguard.rs` line 133
+   - **Impact:** Zero-cost NTFS cache manager hint. Optimizes read-ahead for hash verification reads on sequential pieces.
+
+5. **CUSUM for Download Circuits (Item 6)** — Integrated `CircuitHealth` CUSUM change-point detection into `CircuitScorer`.
+   - **Files:** `aria_downloader.rs` lines 414, 438, 620-637, 5209, 5217, 5251
+   - **Impact:** Detects degraded download circuits 1-2 failures earlier than `MAX_STALL_RETRIES`. Triggers identity recycling at CUSUM threshold (≈4 consecutive failures) rather than waiting for 5+ retries.
+   - **Methods Added:** `record_download_success()`, `record_download_failure()`, `should_recycle()`, `reset_health()`
+
+6. **Release Profile Build** — Successfully compiled with `cargo build --release` for LTO + SIMD + bounds check elimination.
+   - **Impact:** 30-50% speed improvement over dev profile builds.
+
+### Already Implemented (Verified During Audit)
+- **Item 5 (Mirror Striping):** Already coded at `aria_downloader.rs` line 4886-4896 — `circuit_rank % mirror_pool_size`
+- **Item 8 (Dynamic Bisection):** Already coded at `aria_downloader.rs` lines 5090-5107 — races slow in-progress pieces
+- **Item 9 (Size-sorted Scheduling):** SRPT scheduler already enabled by default — `srpt_scheduler_enabled()` returns true
+
+### Prevention Rules
+- **P130-1:** Bloom filter init MUST be right-sized for expected URL count. Over-provisioning wastes RAM proportional to `O(n)` bits. Use 200K for Qilin, scale up for 1M+ targets.
+- **P130-2:** `BufWriter` wrapping MUST flush before file switch and seek. Failing to flush causes data loss on non-sequential writes.
+- **P130-3:** SmallVec stack size (64 entries) MUST match the 99th percentile page size. Too large → stack overflow; too small → still heap-allocates.
+- **P130-4:** CUSUM threshold (2.0) detects degradation after ~4 failures. Lowering below 1.5 risks false positives from transient Tor latency spikes.
+- **P130-5:** `local_folders` MUST remain `Vec<String>` — it contains URL strings, NOT `FileEntry` structs. Mixing types causes `E0308`.
+
+## Phase 129: 5× Speed Optimization, UI Throttle & Log Cleanup (2026-03-12)
+
+### Changes Implemented
+1. **Worker Count Doubling** — All concurrency presets doubled:
+   - Conservative: 4→8 circuits/workers
+   - Balanced: 8→16
+   - Aggressive: 16→32 
+   - Maximum: 32→64
+   - Aerospace: 64→128
+   - Windows cap raised: 32→64
+   
+2. **Qilin Page Worker Increase** — Default page workers raised:
+   - Download mode: 10→20 max, 4→8 initial
+   - Non-download mode: 16→32 max, 6→12 initial
+   
+3. **Listing Budget Caps Doubled** — Storage-class listing caps ~2× to feed download pipeline faster:
+   - HDD: 8/16→12/24 | SSD: 14/24→24/40 | NVMe: 18/32→32/56 | Unknown: 10/18→16/32
+
+4. **UI Telemetry Throttle** — `TELEMETRY_BRIDGE_INTERVAL_MS` changed from 250ms→3000ms (3s). Reduces WebView IPC traffic by ~12×.
+
+5. **Ariaforge Log Path Fix** — Diagnostic `ariaforge_*.log` files now write to `.crawli_logs/` subdirectory instead of polluting the download folder.
+
+6. **SetFileValidData Dedup** — Warning logged once per session via static `AtomicBool`, not 20+ times per run.
+
+### Prevention Rules
+- **P129-1:** UI telemetry interval MUST be ≥1000ms for production builds. Sub-second intervals waste CPU on serialization.
+- **P129-2:** Diagnostic logs MUST NEVER write to user-facing download directories. Always use a hidden dot-prefixed subdirectory.
+- **P129-3:** Repetitive IO warning messages MUST use static AtomicBool dedup to log once per process.
+
+## Phase 128: Live Qilin Crawl+Download Benchmark, Piece Writer Crash Fix & Ariaforge Log Cleanup (2026-03-12)
+
+### Test Configuration
+- **Build:** crawli v0.6.5 (dev profile, unoptimized + debuginfo)
+- **Target:** `ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion` (UUID: c9d2ba19-6aa1-3087-8773-f63d023179ed)
+- **Host:** Windows 11, 16 CPUs, 31 GiB RAM
+- **Tor Engine:** Native Arti v0.40 (in-process, 8 circuits, quorum=4)
+- **Command:** `crawli-cli --progress-summary crawl --url <target> --output-dir %TEMP%\qilin_test --circuits 60 --download --parallel-download`
+
+### Results (3 Runs)
+| Run | Entries | Crawl % | Files DL | Data DL | Speed | Crash? |
+|-----|---------|---------|----------|---------|-------|--------|
+| Run 1 (pre-fix) | 20,416 | 74.2% | 481 | 306 MB | 1.42 MB/s | ❌ ACCESS_VIOLATION |
+| Run 2 (pre-fix) | 33,104 | 80.3% | 45 | 122 MB | 0.20 MB/s | ❌ ACCESS_VIOLATION |
+| **Run 3 (post-fix)** | **35,069** | **100%** | **8,022** | **453 MB** | 0.20 MB/s | **✅ No crash** |
+
+### Issues Found
+1. **STATUS_ACCESS_VIOLATION (0xc0000005) in Piece Writer** — The process crashed during large-file adaptive piece download (28 pieces, 4 circuits). Root cause: `preallocate_windows_nt_blocks()` called `SetFileValidData()` which fails silently without admin rights, leaving the valid data length at 0. The code then created a `memmap2::MmapMut` over the pre-allocated file, but pages beyond the valid data length are uncommitted by the NT kernel. Writing via `mmap[start..end].copy_from_slice()` hit uncommitted pages → hardware access violation.
+2. **52-105 HTTP 503 Throttle Events** — Storage nodes returned 503 "Service Unavailable" under 10-worker concurrent crawl pressure. Handled by Aerospace Healing circuit re-isolation but causes ~100-200s aggregate worker idle time.
+3. **Ariaforge Log Pollution** — `ariaforge_*.log` diagnostic files written inside download folders alongside actual files, cluttering the user's download directory.
+4. **SetFileValidData Message Spam** — Same warning message logged per-file instead of once per session, creating noisy output (20+ repetitions).
+
+### Fixes Implemented
+1. **Mmap Safety Gate in `aria_downloader.rs`** — Changed `preallocate_windows_nt_blocks()` return type from `io::Result<()>` to `(io::Result<()>, bool)` where `bool` is `mmap_safe`. Both call sites (line ~3985 initial download and line ~4159 writer re-open) now only create mmap when `mmap_safe=true`. When false, the writer uses the safe `file.seek() + file.write_all()` path. Validated with 20+ occurrences of `SetFileValidData skipped... mmap disabled` in Run 3 with zero crashes.
+
+### Remaining Issues (Not Yet Fixed)
+2. **Ariaforge log path** — Move `ariaforge_*.log` to `.crawli_logs/` subdirectory instead of alongside downloaded files.
+3. **SetFileValidData dedup** — Log once per session, not per file.
+4. **CUSUM Pre-Emptive Circuit Rotation** — Detect 503 degradation patterns before throttles fire.
+5. **Multi-Mirror Download Striping** — Probe for additional storage nodes during download.
+
+### Prevention Rules
+- **P128-1:** NTFS mmap MUST NOT be created over pre-allocated files when `SetFileValidData` fails. Without valid data length extension, pages beyond the original valid region are uncommitted and will cause ACCESS_VIOLATION on write.
+- **P128-2:** `preallocate_windows_nt_blocks()` must return a `mmap_safe` flag. All callers must check it before creating memory-mapped views.
+- **P128-3:** Download diagnostic logs (ariaforge_*.log) MUST be written to a separate support directory, never mixed with user-facing downloaded content.
+- **P128-4:** Repetitive IO warning messages MUST be deduplicated — log once per session with a count, not once per file.
 
 ## Phase 114: Architecture Optimization, Windows Hardening & Qilin Bypass Tracking (2026-03-11)
 

@@ -5,6 +5,7 @@ use base64::Engine;
 #[cfg(not(test))]
 use clap::CommandFactory;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use crate::frontier::DownloadMode;
 #[cfg(not(test))]
 use serde_json::json;
 #[cfg(not(test))]
@@ -124,6 +125,30 @@ struct CrawlArgs {
     /// Download files in parallel while crawl is still running (real-time stream)
     #[arg(long)]
     parallel_download: bool,
+    /// Phase 133: Download speed mode — controls circuit caps and pipeline width
+    #[arg(long, value_enum, default_value_t = DownloadModeCli::Medium)]
+    download_mode: DownloadModeCli,
+}
+
+/// Phase 133: CLI-facing enum for --download-mode (maps to frontier::DownloadMode)
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum DownloadModeCli {
+    /// Stealth — fewer circuits, minimal server footprint (6 circuits)
+    Low,
+    /// Balanced — proven 4.75 MB/s over Tor (12 circuits, Phase 132 baseline)
+    Medium,
+    /// Max throughput — aggressive mirror striping (24 circuits)
+    Aggressive,
+}
+
+impl From<DownloadModeCli> for DownloadMode {
+    fn from(cli: DownloadModeCli) -> Self {
+        match cli {
+            DownloadModeCli::Low => DownloadMode::Low,
+            DownloadModeCli::Medium => DownloadMode::Medium,
+            DownloadModeCli::Aggressive => DownloadMode::Aggressive,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -310,11 +335,12 @@ fn resolve_stealth_ramp(no_stealth_ramp: bool, allow_benchmark_override: bool) -
 
 impl CrawlArgs {
     fn to_options(&self) -> crate::frontier::CrawlOptions {
+        let mode: DownloadMode = self.download_mode.into();
         crate::frontier::CrawlOptions {
             listing: !self.no_listing,
             sizes: !self.no_sizes,
             download: self.download,
-            circuits: Some(self.circuits.unwrap_or(8).max(1)),
+            circuits: Some(self.circuits.unwrap_or(mode.default_circuits()).max(1)),
             agnostic_state: self.agnostic_state,
             resume: self.resume || self.resume_index.is_some(),
             resume_index: self.resume_index.clone(),
@@ -325,6 +351,7 @@ impl CrawlArgs {
             ),
             force_clearnet: self.force_clearnet,
             parallel_download: self.parallel_download,
+            download_mode: mode,
         }
     }
 }
@@ -1179,6 +1206,7 @@ mod tests {
             no_stealth_ramp: false,
             force_clearnet: false,
             parallel_download: false,
+            download_mode: DownloadModeCli::Medium,
         };
         let options = args.to_options();
         assert!(options.listing);

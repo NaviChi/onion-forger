@@ -1,11 +1,14 @@
 # OnionForge: AI Engineering & Context Reference
-> **Last Updated:** 2026-03-10T11:55 CDT
-> **Version:** 2.3.0
+> **Last Updated:** 2026-03-12T19:25 CDT
+> **Version:** 2.4.0
 > **Authors:** Navi (User), Antigravity (AI)
 
 This document serves as the master blueprint for any AI agent tasked with maintaining, extending, or recreating the OnionForge intelligence gathering application. It contains all critical architectural decisions, environment constraints, GUI styling instructions, and API behavioral knowledge required to build this system from scratch without guessing.
 
 Current repo state note:
+- Phase 130 implemented 6 new optimizations: Write Coalescing (`BufWriter` 256KB), Bloom Filter Right-Sizing (5M→200K entries, 24× RAM savings), SmallVec for Parse Results (stack-allocated `FileEntry` vectors for ≤64 entries), FILE_FLAG_SEQUENTIAL_SCAN (zero-cost NTFS hint), CUSUM for download circuits (integrated `CircuitHealth` change-point detection for 1-2 failures earlier recycling), and Release Profile Build (30-50% speed boost). Also confirmed Mirror Striping, Dynamic Bisection, and SRPT Scheduling were already implemented.
+- `smallvec = "1.15"` was added to `Cargo.toml`. The `local_files` and `new_files` vectors in `qilin.rs` crawl loops use `SmallVec<[FileEntry; 64]>` while `local_folders` remains `Vec<String>` since it contains URL strings, NOT FileEntry structs.
+- `CircuitScorer` in `aria_downloader.rs` now has a `circuit_health: Vec<CircuitHealth>` field with `record_download_success()`, `record_download_failure()`, `should_recycle()`, `reset_health()` methods. CUSUM is wired into all success/error/timeout paths.
 - Phase 96 repaired the Windows portable CLI surface. The portable package now needs to ship both `crawli.exe` (GUI, Windows subsystem) and `crawli-cli.exe` (console subsystem), plus a `crawli-cli.cmd` wrapper and a portable README.
 - The shared backend CLI surface still lives in `src-tauri/src/cli.rs`, but Windows operator usage should target `crawli-cli.exe` from the portable zip rather than attempting terminal commands through the GUI-subsystem `crawli.exe`.
 - Phase 95 completed the clearnet direct-file audit and direct-mode fix. The app/CLI now classify non-onion HTTP(S) archive URLs as `direct` instead of `onion`, the clearnet downloader keeps connection pooling enabled, and the March 10, 2026 `10Gb.dat` benchmark reached about `3.8 GiB` in `60s` (`~63 MiB/s`, `~530 Mbps`) with the repaired `32`-circuit clearnet lane.

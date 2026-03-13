@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listing: true,
         circuits: Some(5),
         resume: false,
+            resume_index: None,
         ..Default::default()
     };
 

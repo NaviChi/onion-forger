@@ -148,24 +148,24 @@ pub fn recommended_concurrency_preset() -> SystemProfile {
 
     let (preset, circuits, workers) = if total_ram_gb <= 4.5 || profile.cpu_cores <= 2 {
         // 4GB Azure VM, ultra-low resource
-        ("Conservative", 4_usize, 4_usize)
+        ("Conservative", 8_usize, 8_usize)
     } else if total_ram_gb <= 8.5 || profile.cpu_cores <= 4 {
         // 8GB VM or low-end hardware
-        ("Balanced", 8, 8)
+        ("Balanced", 16, 16)
     } else if total_ram_gb <= 16.5 || profile.cpu_cores <= 8 {
-        // Mid-range system
-        ("Aggressive", 16, 16)
+        // Mid-range system — Phase 129: doubled from 16→32
+        ("Aggressive", 32, 32)
     } else if total_ram_gb <= 32.5 || profile.cpu_cores <= 12 {
-        // High-end Mac / desktop
-        ("Maximum", 32, 32)
+        // High-end Mac / desktop — Phase 129: doubled from 32→64
+        ("Maximum", 64, 64)
     } else {
-        // Power workstation
-        ("Aerospace", 64, 64)
+        // Power workstation — Phase 129: doubled from 64→128
+        ("Aerospace", 128, 128)
     };
 
-    // Windows additional constraint (just keep it as is, max 64 now)
+    // Phase 129: Raised Windows cap from 32→64 to allow higher concurrency
     let (circuits, workers) = if cfg!(target_os = "windows") {
-        (circuits.min(32), workers.min(32))
+        (circuits.min(64), workers.min(64))
     } else {
         (circuits, workers)
     };
@@ -452,33 +452,34 @@ fn listing_budget_for_profile(
         (permit_budget / 2).clamp(4.min(limit), limit)
     };
 
+    // Phase 129: Raised listing caps ~2× to feed download pipeline faster
     let storage_cap = match profile.storage_class {
         StorageClass::Hdd => {
             if reserve_for_downloads {
-                8
-            } else {
-                16
-            }
-        }
-        StorageClass::Ssd => {
-            if reserve_for_downloads {
-                14
+                12
             } else {
                 24
             }
         }
+        StorageClass::Ssd => {
+            if reserve_for_downloads {
+                24
+            } else {
+                40
+            }
+        }
         StorageClass::Nvme => {
             if reserve_for_downloads {
-                18
-            } else {
                 32
+            } else {
+                56
             }
         }
         StorageClass::Unknown => {
             if reserve_for_downloads {
-                10
+                16
             } else {
-                18
+                32
             }
         }
     };
@@ -516,6 +517,30 @@ pub fn recommend_download_budget(
     )
 }
 
+/// Phase 133: Global download mode state. Set once at crawl/download start,
+/// read by resource_governor and aria_downloader. Using AtomicU8 avoids
+/// threading the mode through 6+ function signatures.
+static ACTIVE_DOWNLOAD_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1); // 1 = Medium
+
+/// Set the active download mode. Call this at crawl start.
+pub fn set_active_download_mode(mode: crate::frontier::DownloadMode) {
+    let value = match mode {
+        crate::frontier::DownloadMode::Low => 0u8,
+        crate::frontier::DownloadMode::Medium => 1u8,
+        crate::frontier::DownloadMode::Aggressive => 2u8,
+    };
+    ACTIVE_DOWNLOAD_MODE.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Get the active download mode.
+pub fn active_download_mode() -> crate::frontier::DownloadMode {
+    match ACTIVE_DOWNLOAD_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => crate::frontier::DownloadMode::Low,
+        2 => crate::frontier::DownloadMode::Aggressive,
+        _ => crate::frontier::DownloadMode::Medium,
+    }
+}
+
 fn download_budget_for_profile(
     requested_circuits: usize,
     content_length: Option<u64>,
@@ -543,13 +568,28 @@ fn download_budget_for_profile(
     } else {
         base_cap.saturating_mul(2)
     };
-    let content_cap = match content_length.unwrap_or(0) {
-        0 => requested_circuits.max(1),
-        len if len < 16 * 1024 * 1024 => 2,
-        len if len < 64 * 1024 * 1024 => 4,
-        len if len < 256 * 1024 * 1024 => 8,
-        len if len < 1024 * 1024 * 1024 => 12,
-        _ => onion_cap,
+    // Phase 133: Content caps driven by DownloadMode enum.
+    // Low = stealth, Medium = Phase 132 proven values, Aggressive = max throughput.
+    let mode = active_download_mode();
+    let content_cap = if is_onion {
+        let (micro, small, medium, large) = mode.onion_content_caps();
+        match content_length.unwrap_or(0) {
+            0 => requested_circuits.max(1),
+            len if len < 16 * 1024 * 1024 => micro,
+            len if len < 64 * 1024 * 1024 => small,
+            len if len < 256 * 1024 * 1024 => medium,
+            len if len < 1024 * 1024 * 1024 => large,
+            _ => onion_cap,
+        }
+    } else {
+        match content_length.unwrap_or(0) {
+            0 => requested_circuits.max(1),
+            len if len < 16 * 1024 * 1024 => 2,
+            len if len < 64 * 1024 * 1024 => 4,
+            len if len < 256 * 1024 * 1024 => 8,
+            len if len < 1024 * 1024 * 1024 => 12,
+            _ => onion_cap,
+        }
     };
 
     let mut circuit_cap = apply_pressure_to_budget(
@@ -709,7 +749,7 @@ fn detect_storage_class(output_path: Option<&Path>) -> StorageClass {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let disks = Disks::new_with_refreshed_list();
     let mut best_match: Option<(DiskKind, String)> = None;
-    let mut best_mount: Option<std::path::PathBuf> = None;
+    let mut _best_mount: Option<std::path::PathBuf> = None;
     let mut best_len = 0usize;
 
     for disk in disks.list() {
@@ -722,7 +762,7 @@ fn detect_storage_class(output_path: Option<&Path>) -> StorageClass {
                     disk.kind(),
                     disk.name().to_string_lossy().to_ascii_lowercase(),
                 ));
-                best_mount = Some(mount.to_path_buf());
+                _best_mount = Some(mount.to_path_buf());
             }
         }
     }
@@ -742,7 +782,7 @@ fn detect_storage_class(output_path: Option<&Path>) -> StorageClass {
 
     #[cfg(target_os = "macos")]
     if let Some(fallback) =
-        macos_storage_class_fallback(best_mount.as_deref().unwrap_or_else(|| Path::new("/")))
+        macos_storage_class_fallback(_best_mount.as_deref().unwrap_or_else(|| Path::new("/")))
     {
         if storage_class_rank(fallback) > storage_class_rank(detected) {
             return fallback;
@@ -752,6 +792,7 @@ fn detect_storage_class(output_path: Option<&Path>) -> StorageClass {
     detected
 }
 
+#[cfg(target_os = "macos")]
 fn storage_class_rank(class: StorageClass) -> u8 {
     match class {
         StorageClass::Unknown => 0,

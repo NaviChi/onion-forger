@@ -364,12 +364,12 @@ async fn run_single_benchmark(
         sizes: true,
         download: false,
         circuits: Some(CIRCUIT_COUNT),
-        daemons: Some(TOR_DAEMONS),
         agnostic_state: false,
         resume: false,
         resume_index: None,
         mega_password: None,
         stealth_ramp: false, parallel_download: false,
+            download_mode: crawli_lib::frontier::DownloadMode::Medium,
             force_clearnet: false,
     };
 

@@ -857,7 +857,8 @@ function App() {
     resumeIndex: undefined as string | undefined,
     stealthRamp: true,
     forceClearnet: false,
-    parallelDownload: false
+    parallelDownload: false,
+    downloadMode: 'medium' as 'low' | 'medium' | 'aggressive',
   });
 
   useEffect(() => {
@@ -2440,28 +2441,62 @@ function App() {
           <span style={{ fontSize: '0.85rem', color: crawlOptions.sizes ? 'var(--text-main)' : 'var(--text-muted)' }}>Map File Sizes</span>
         </label>
 
-        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Automatically download files to disk as soon as they are found during the crawl.">
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Download all discovered files after the crawl finishes.">
           <input
             data-testid="chk-auto-download"
             type="checkbox"
-            checked={crawlOptions.download}
-            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, download: e.target.checked }))}
+            checked={crawlOptions.download && !crawlOptions.parallelDownload}
+            onChange={(e) => setCrawlOptions((prev) => ({
+              ...prev,
+              download: e.target.checked,
+              parallelDownload: false,
+            }))}
             style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
             disabled={isCrawling}
           />
-          <span style={{ fontSize: '0.85rem', color: crawlOptions.download ? 'var(--text-main)' : 'var(--text-muted)' }}>Auto-Download During Crawl</span>
+          <span style={{ fontSize: '0.85rem', color: (crawlOptions.download && !crawlOptions.parallelDownload) ? 'var(--text-main)' : 'var(--text-muted)' }}>Auto Download</span>
         </label>
 
-        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Stream discovered files to the download engine in real-time while crawl is still running. Useful for download testing during short intervals.">
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Download files in real-time while the crawl is still running. Faster than Auto Download.">
           <input
             data-testid="chk-parallel-download"
             type="checkbox"
             checked={crawlOptions.parallelDownload}
-            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, parallelDownload: e.target.checked }))}
+            onChange={(e) => setCrawlOptions((prev) => ({
+              ...prev,
+              download: e.target.checked,
+              parallelDownload: e.target.checked,
+            }))}
             style={{ accentColor: 'var(--accent-primary)', width: '16px', height: '16px' }}
             disabled={isCrawling}
           />
           <span style={{ fontSize: '0.85rem', color: crawlOptions.parallelDownload ? 'var(--text-main)' : 'var(--text-muted)' }}>⚡ Parallel Download</span>
+        </label>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Controls circuit caps, pipeline width, and worker counts. Low = stealth (6 circuits), Medium = balanced 4.75 MB/s (12 circuits), Aggressive = max throughput (24 circuits).">
+          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', minWidth: '95px' }}>Speed Mode:</span>
+          <select
+            data-testid="select-download-mode"
+            value={crawlOptions.downloadMode}
+            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, downloadMode: e.target.value as 'low' | 'medium' | 'aggressive' }))}
+            disabled={isCrawling}
+            style={{
+              background: 'var(--bg-card)',
+              color: 'var(--text-main)',
+              border: '1px solid var(--border-color)',
+              borderRadius: '6px',
+              padding: '4px 8px',
+              fontSize: '0.82rem',
+              fontFamily: 'inherit',
+              cursor: 'pointer',
+              outline: 'none',
+              minWidth: '140px',
+            }}
+          >
+            <option value="low">🛡️ Low (Stealth)</option>
+            <option value="medium">⚡ Medium (Balanced)</option>
+            <option value="aggressive">🚀 Aggressive (Max)</option>
+          </select>
         </label>
 
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Ignore the server domain when caching to dynamically resume aborted downloads even if the host changes.">

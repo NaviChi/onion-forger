@@ -53,6 +53,8 @@ sled = "0.34.7"
 libsqlite3-sys = { version = "0.36.0", features = ["bundled"] }
 urlencoding = "2.1"
 crossbeam-queue = "0.3.12"
+# Phase 130: Stack-allocated FileEntry vectors during page parsing (eliminates heap alloc for ≤64 entries)
+smallvec = "1.15"
 memmap2 = "0.9.10"
 regex = "1.12.3"
 headless_chrome = "1.0.21"

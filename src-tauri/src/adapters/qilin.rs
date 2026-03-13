@@ -1162,7 +1162,7 @@ impl QilinCrawlGovernor {
             reserve_for_downloads,
             telemetry.as_ref(),
         );
-        let default_max = if reserve_for_downloads { 10 } else { 16 };
+        let default_max = if reserve_for_downloads { 20 } else { 32 };
         let explicit_qilin_workers = env_usize("CRAWLI_QILIN_WORKERS");
 
         let mut max_active = env_usize(if reserve_for_downloads {
@@ -1184,7 +1184,7 @@ impl QilinCrawlGovernor {
         } else {
             "CRAWLI_QILIN_PAGE_WORKERS_START"
         })
-        .unwrap_or(if reserve_for_downloads { 4 } else { 6 })
+        .unwrap_or(if reserve_for_downloads { 8 } else { 12 })
         .clamp(min_active, max_active);
 
         if let Some(explicit) = explicit_qilin_workers {
@@ -3949,7 +3949,8 @@ impl CrawlerAdapter for QilinAdapter {
                         continue;
                     }
 
-                    let mut new_files = Vec::new();
+                    // Phase 130: SmallVec eliminates heap alloc for pages with ≤64 entries (typical: 20-50)
+                    let mut new_files: smallvec::SmallVec<[FileEntry; 64]> = smallvec::SmallVec::new();
 
                     // Extract the relative directory path from the base seed URL
                     let mut nested_path = String::new();
@@ -3979,8 +3980,8 @@ impl CrawlerAdapter for QilinAdapter {
                         let nested_path = nested_path.clone();
                         let domain_clone = domain_clone.clone();
                         move || {
-                            let mut local_files = Vec::new();
-                            let mut local_folders = Vec::new();
+                            let mut local_files: smallvec::SmallVec<[FileEntry; 64]> = smallvec::SmallVec::new();
+                            let mut local_folders: Vec<String> = Vec::new();
 
                             // Check if it's the old <table id="list"> Qilin or the new V3 HTML structure
                             if html.contains("<table id=\"list\">") || html.contains("Data browser") {
@@ -4830,7 +4831,8 @@ impl CrawlerAdapter for QilinAdapter {
 
                             if !f.active_options.listing { continue; }
 
-                            let mut new_files = Vec::new();
+                            // Phase 130: SmallVec for stack-allocated parse results
+                            let mut new_files: smallvec::SmallVec<[FileEntry; 64]> = smallvec::SmallVec::new();
                             let mut nested_path = String::new();
                             if next_url == active_seed_url {
                                 emit_root_listing_diagnostics(&ui_app_clone, &effective_url, &html);
@@ -4851,8 +4853,8 @@ impl CrawlerAdapter for QilinAdapter {
                                 let nested_path = nested_path.clone();
                                 let domain_clone = domain_clone.clone();
                                 move || {
-                                    let mut local_files = Vec::new();
-                                    let mut local_folders = Vec::new();
+                                    let mut local_files: smallvec::SmallVec<[FileEntry; 64]> = smallvec::SmallVec::new();
+                                    let mut local_folders: Vec<String> = Vec::new();
 
                                     if html.contains("<table id=\"list\">") || html.contains("Data browser") {
                                         let mut found_any = false;

@@ -379,6 +379,7 @@ async fn run_single_benchmark(
         stealth_ramp: false, parallel_download: false,
             force_clearnet: false,
         mega_password: None,
+        download_mode: crawli_lib::frontier::DownloadMode::Medium,
     };
 
     let daemon_count = arti_clients.len().max(active_ports.len()).max(1);
@@ -629,3 +630,4 @@ fn convert_headers(src: &http::HeaderMap) -> reqwest::header::HeaderMap {
     }
     dst
 }
+
