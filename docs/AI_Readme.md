@@ -1,6 +1,6 @@
 # OnionForge: AI Engineering & Context Reference
-> **Last Updated:** 2026-03-12T19:25 CDT
-> **Version:** 2.4.0
+> **Last Updated:** 2026-03-13T07:15 CDT
+> **Version:** 2.5.0
 > **Authors:** Navi (User), Antigravity (AI)
 
 This document serves as the master blueprint for any AI agent tasked with maintaining, extending, or recreating the OnionForge intelligence gathering application. It contains all critical architectural decisions, environment constraints, GUI styling instructions, and API behavioral knowledge required to build this system from scratch without guessing.
@@ -122,6 +122,7 @@ When the user clicks "Download", the Rust backend intercepts the file array. It 
 *   **Prevention Rule:** Batch/onion download code must bootstrap a fresh managed Tor cluster when no active ports are registered, rather than assuming `9051` exists.
 *   **Prevention Rule:** Portable release packaging must treat `src-tauri/bin/*` as optional legacy payloads; native-Arti builds do not require bundled Tor binaries.
 *   **Prevention Rule:** Experimental download engines must not bypass production control semantics. If a path does not preserve `.ariaforge_state`, `DownloadControl`, and standardized telemetry, it stays lab-only.
+*   **Prevention Rule (PR-WIN-JOIN-139):** On Windows, NEVER call `PathBuf::join()` with a `/`-prefixed path. Adapter FileEntry paths always start with `/` — these MUST pass through `sanitize_path()` before any join with the output root. `PathBuf::join("/subdir/file")` on Windows replaces the entire base path with `C:\subdir\file`. Additionally, always use `normalize_for_starts_with()` when comparing canonicalized paths, because `\\?\` prefix inconsistency between `ensure_long_path()` and `std::fs::canonicalize()` breaks `starts_with()` security checks.
 *   **Implementation Note:** The current integrated-Arti architecture deliberately distinguishes metadata crawling from download pressure. When a session includes download work, the Qilin page governor reserves part of the swarm so HTML discovery does not starve transfer stages.
 *   **Implementation Note:** `aria_downloader.rs` is the production downloader. It now caps handshake tournament width with live telemetry and gates active range fetchers through a BBR-managed startup window; `multipath.rs` is only for isolated experimentation.
 *   **Implementation Note:** The repository includes a synthetic local benchmark harness in `src-tauri/examples/qilin_benchmark.rs`, but the main binary itself now has a first-class CLI mode for headless operator validation. Prefer `cargo run --manifest-path src-tauri/Cargo.toml -- <subcommand>` when validating the shipped program surface.

@@ -1533,16 +1533,24 @@ async fn start_crawl(
     let retry_budget = 2usize;
     let started_at_epoch = chrono::Local::now().timestamp().max(0) as u64;
 
-    // Phase 133: Activate download mode globally before any budget calculations
-    resource_governor::set_active_download_mode(options.download_mode);
+    // Phase 133 + Phase 140: Activate download mode globally with RAM-aware auto-demotion.
+    // On low-RAM systems, Aggressive/Medium modes are automatically demoted to prevent OOM.
+    let output_path = std::path::Path::new(&output_dir);
+    let (effective_mode, demotion_warning) =
+        resource_governor::clamp_mode_for_hardware(options.download_mode, Some(output_path));
+    if let Some(warning) = &demotion_warning {
+        app.emit("crawl_log", format!("[RAM Guard] {warning}"))
+            .unwrap_or_default();
+    }
+    resource_governor::set_active_download_mode(effective_mode);
     app.emit(
         "crawl_log",
         format!(
             "[System] Download mode: {} (circuits={}, pd_cap={}, workers={})",
-            options.download_mode,
-            options.download_mode.default_circuits(),
-            options.download_mode.parallel_download_cap(),
-            options.download_mode.crawl_worker_ceiling(),
+            effective_mode,
+            effective_mode.default_circuits(),
+            effective_mode.parallel_download_cap(),
+            effective_mode.crawl_worker_ceiling(),
         ),
     )
     .unwrap_or_default();
@@ -1603,14 +1611,18 @@ async fn start_crawl(
         let pd_output = output_root.clone();
         let pd_target_dir = target_paths.target_dir.clone();
         let pd_cancel = parallel_download_cancel.clone();
-        // Phase 133: Parallel download circuit budget driven by DownloadMode.
-        let pd_cap = options.download_mode.parallel_download_cap();
-        let pd_circuits = options.circuits.unwrap_or(options.download_mode.default_circuits()).max(1).min(pd_cap);
+        // Phase 140: Parallel download now uses full mode budget instead of the
+        // constrained cap from Phase 128. This doubles download throughput during crawl.
+        let pd_cap = effective_mode.parallel_download_cap();
+        let pd_circuits = options.circuits.unwrap_or(effective_mode.default_circuits()).max(1).min(pd_cap);
         let pd_is_onion = url_targets_onion(&url) && !options.force_clearnet;
 
         app.emit(
             "crawl_log",
-            "[PARALLEL] ⚡ Parallel download consumer armed. Will stream files during crawl.".to_string(),
+            format!(
+                "[PARALLEL] ⚡ Parallel download consumer armed ({} circuits, {} cap). Speed threshold: 0.3 MB/s.",
+                pd_circuits, pd_cap
+            ),
         )
         .unwrap_or_default();
 
@@ -1882,15 +1894,18 @@ async fn start_crawl(
 
     let mut auto_download_started = false;
 
-    // Phase 128: Wait for parallel download consumer to finish its current batch
+    // Phase 128 + Phase 140: Wait for parallel download consumer with hard timeout.
+    // Without this timeout, the consumer can hang indefinitely when the last few files
+    // are stuck in retry loops (503 throttles, connection drops). The post-crawl sweep
+    // via build_download_resume_plan() will pick up any remaining files.
     if let Some(handle) = parallel_download_handle {
         app.emit(
             "crawl_log",
-            "[PARALLEL] Waiting for parallel download consumer to finish current batch...".to_string(),
+            "[PARALLEL] Waiting for parallel download consumer to finish (120s max)...".to_string(),
         )
         .unwrap_or_default();
-        match handle.await {
-            Ok(_) => {
+        match tokio::time::timeout(std::time::Duration::from_secs(120), handle).await {
+            Ok(Ok(_)) => {
                 auto_download_started = true;
                 app.emit(
                     "crawl_log",
@@ -1898,10 +1913,19 @@ async fn start_crawl(
                 )
                 .unwrap_or_default();
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 app.emit(
                     "crawl_log",
                     format!("[PARALLEL] Consumer task error: {}", e),
+                )
+                .unwrap_or_default();
+            }
+            Err(_) => {
+                // Timeout: consumer is stuck retrying. The post-crawl sweep will handle
+                // remaining files via build_download_resume_plan().
+                app.emit(
+                    "crawl_log",
+                    "[PARALLEL] ⚠️ Consumer timed out after 120s. Post-crawl sweep will handle remaining files.".to_string(),
                 )
                 .unwrap_or_default();
             }

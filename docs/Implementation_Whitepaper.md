@@ -1,4 +1,70 @@
-> **Last Updated:** 2026-03-12T21:10 CDT
+> **Last Updated:** 2026-03-13T10:40 CDT
+
+## Phase 140C: Arti Client Cap Increase for 4× Download Speed (2026-03-13)
+
+**Root cause identified via live 200K-entry crawl test:**
+Each `isolated_client()` from Phase 138 Fan-Out shares the **same guard relay** as its parent. With cap=8 / fan-out=4 → only 2 base TorClients → 2 guard nodes → bandwidth ceiling ~1.8 MB/s.
+
+**Fix:** Increased `recommend_arti_cap_with_storage()` in `resource_governor.rs`:
+- Unknown storage (16+ cores, 32+ GB, 8+ avail): 10 → **16**
+- SSD (16+/32+/8+): 16 → **24**
+- NVMe (16+/32+/8+): 18 → **24**; (24+/64+/16+): 24 → **32**
+- Windows caps: Unknown 8→**16**, SSD 12→**20**, NVMe 16→**24**
+- Global max: 24 → **32**
+
+**Impact:** cap=16 / fan-out=4 → **4 base TorClients** → 4 independent guard nodes → expected 4× bandwidth
+
+
+## Phase 140B: Speed-Threshold Circuit Selection + Download Speed Boost (2026-03-13)
+
+**4. Speed-Threshold Circuit Selection (0.3 MB/s minimum)**
+- Added `fast_circuits_above_threshold()` to both `scorer.rs` and `aria_downloader.rs` CircuitScorer
+- Circuits with measured avg speed < 0.3 MB/s and ≥3 recorded pieces are considered "slow"
+- Slow circuits get 3-5 second yield delays (vs 0ms for fast circuits), effectively deprioritizing them
+- Starvation prevention: if ALL circuits are below threshold, no penalty applied (slow network fallback)
+- Fast circuits sorted by speed descending — fastest circuits always grab work first
+
+**5. Parallel Download Circuit Budget Increase**
+- Parallel download consumer now uses full `effective_mode.parallel_download_cap()` instead of constrained cap
+- In Medium (Balanced) mode: goes from 6→12 circuits during crawl
+- In Aggressive mode: goes from 12→24 circuits during crawl
+- Expected speed improvement: +40-60% (from 0.58 MB/s → ~0.8-1.0 MB/s during crawl)
+
+**6. Mode Display Rename (UX)**
+- Low → "stealth" in display output
+- Medium → "balanced" in display output
+- Aggressive stays "aggressive"
+- JSON serde remains `"low"`, `"medium"`, `"aggressive"` for backward compatibility
+
+**Files modified:** `scorer.rs`, `aria_downloader.rs`, `frontier.rs`, `lib.rs`, `resource_governor.rs`
+
+## Phase 140: Parallel Consumer Timeout + RAM-Aware Mode Demotion (2026-03-13)
+
+**1. Parallel Download Consumer Timeout (P0)**
+- Added `tokio::time::timeout(120s)` wrapper on `handle.await` in `lib.rs` to prevent infinite hang
+- On timeout, emits `[PARALLEL] ⚠️ Consumer timed out` and falls through to post-crawl sweep
+
+**2. RAM-Aware Mode Auto-Demotion (P1)**
+- New `clamp_mode_for_hardware()` in `resource_governor.rs`
+- Thresholds: Aggressive needs ≥8GiB avail / ≥16GiB total; Medium needs ≥2GiB avail / ≥4GiB total
+
+**3. Live Test Validation (Phase 139 Confirmation)**
+- 35,069 entries, 100% folder verification, 416/430 downloads (216.1 MB at 0.58 MB/s)
+
+
+## Phase 139: Windows Folder Structure Preservation Fix (2026-03-13)
+Fixed two critical path resolution bugs affecting download folder structure on Windows:
+
+1. **PathBuf::join() with rooted paths:** On Windows, `PathBuf::join("/subdir/file")` replaces the base path entirely because `/`-prefixed paths root to the current drive. Fix: Always run `sanitize_path()` first (strips leading `/`) before joining with `output_root`. Removed the dangerous `is_absolute()` branch from `resolve_download_target_within_root()`.
+
+2. **`\\?\` prefix mismatch in starts_with checks:** `canonicalize_output_root()` adds `\\?\` via `ensure_long_path()`, but `std::fs::canonicalize()` returns inconsistent prefix forms. This broke `starts_with()` security checks. Fix: Added `normalize_for_starts_with()` helper that strips the extended-length prefix before comparisons. Applied to all escape-detection checks in both `resolve_path_within_root()` and `resolve_download_target_within_root()`.
+
+Also fixed unrelated: `engine_test.rs` referenced `num_daemons` field that was renamed to `num_clients` — updated the test.
+
+Validated behavior:
+- `cargo check` — 0 errors
+- `cargo check --lib` — 0 errors
+- Standalone path verification script confirmed Windows `PathBuf::join` behavior
 
 ## Phase 133: Download Speed Modes (2026-03-12)
 Implemented `DownloadMode` enum (Low/Medium/Aggressive) controlling all circuit caps, worker limits, and pipeline widths from a single setting. Available via CLI `--download-mode` and GUI `downloadMode` field. Medium is the default everywhere, matching Phase 132's proven 4.75 MB/s configuration. Global mode stored as `AtomicU8` in `resource_governor.rs` to avoid threading through 6+ function signatures.

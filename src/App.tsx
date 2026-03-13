@@ -851,14 +851,14 @@ function App() {
     listing: true,
     sizes: true,
     download: false,
-    circuits: 8,
+    circuits: 24,
     agnosticState: false,
     resume: false,
     resumeIndex: undefined as string | undefined,
     stealthRamp: true,
     forceClearnet: false,
     parallelDownload: false,
-    downloadMode: 'medium' as 'low' | 'medium' | 'aggressive',
+    downloadMode: 'default' as 'default' | 'high' | 'aggressive',
   });
 
   useEffect(() => {
@@ -946,10 +946,10 @@ function App() {
           storageClass: string; os: string;
         }>("get_system_profile");
         setSystemProfile(profile);
-        // Snap auto-detected circuits to nearest UI preset: Low(4), Balanced(8), Performance(64)
-        const presetCircuits = profile.circuits <= 4 ? 4 : profile.circuits <= 12 ? 8 : 64;
-        setCrawlOptions(prev => ({ ...prev, circuits: presetCircuits }));
-        setLogs(l => [...l, `[SYSTEM] Auto-detected: ${profile.os} ${profile.cpuCores}c/${profile.totalRamGb}GB/${profile.storageClass.toUpperCase()} → ${profile.preset} (${presetCircuits} circuits)`]);
+        // Phase 140D: Auto-detect download mode based on RAM
+        const autoMode = profile.totalRamGb > 20 ? 'aggressive' : profile.totalRamGb > 8.5 ? 'high' : 'default';
+        setCrawlOptions(prev => ({ ...prev, downloadMode: autoMode as 'default' | 'high' | 'aggressive' }));
+        setLogs(l => [...l, `[SYSTEM] Auto-detected: ${profile.os} ${profile.cpuCores}c/${profile.totalRamGb}GB/${profile.storageClass.toUpperCase()} → ${autoMode} mode`]);
       } catch {
         // Fallback: keep default 8 circuits
       }
@@ -2483,31 +2483,7 @@ function App() {
           <span style={{ fontSize: '0.85rem', color: crawlOptions.parallelDownload ? 'var(--text-main)' : 'var(--text-muted)' }}>⚡ Parallel Download</span>
         </label>
 
-        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Controls circuit caps, pipeline width, and worker counts. Low = stealth (6 circuits), Medium = balanced 4.75 MB/s (12 circuits), Aggressive = max throughput (24 circuits).">
-          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', minWidth: '95px' }}>Speed Mode:</span>
-          <select
-            data-testid="select-download-mode"
-            value={crawlOptions.downloadMode}
-            onChange={(e) => setCrawlOptions((prev) => ({ ...prev, downloadMode: e.target.value as 'low' | 'medium' | 'aggressive' }))}
-            disabled={isCrawling}
-            style={{
-              background: 'var(--bg-card)',
-              color: 'var(--text-main)',
-              border: '1px solid var(--border-color)',
-              borderRadius: '6px',
-              padding: '4px 8px',
-              fontSize: '0.82rem',
-              fontFamily: 'inherit',
-              cursor: 'pointer',
-              outline: 'none',
-              minWidth: '140px',
-            }}
-          >
-            <option value="low">🛡️ Low (Stealth)</option>
-            <option value="medium">⚡ Medium (Balanced)</option>
-            <option value="aggressive">🚀 Aggressive (Max)</option>
-          </select>
-        </label>
+
 
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} title="Ignore the server domain when caching to dynamically resume aborted downloads even if the host changes.">
           <input
@@ -2577,17 +2553,17 @@ function App() {
         </button>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginLeft: 'auto' }} data-testid="preset-selector">
-          <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', letterSpacing: '0.04em', marginRight: '2px' }}>MODE:</span>
+          <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.04em', marginRight: '2px' }}>MODE:</span>
           {([
-            { key: 'low', label: 'Low', emoji: '🛡️', circuits: 4, desc: '4 Workers · 2 Clients', tip: 'For 4GB RAM / weak CPUs / VMs' },
-            { key: 'balanced', label: 'Balanced', emoji: '⚡', circuits: 8, desc: '8 Workers · 4 Clients', tip: 'Recommended for Windows 8GB / mid-range' },
-            { key: 'performance', label: 'Performance', emoji: '🚀', circuits: 64, desc: '64 Workers · 8 Clients', tip: 'For 16GB+ RAM / M1 Max / high-end — matches tor.exe 120 circuits' },
+            { key: 'default', label: 'Default', emoji: '⚡', downloadMode: 'default' as const, desc: '2 Guard Nodes', tip: 'Proven 1.83 MB/s peak — recommended for most systems' },
+            { key: 'high', label: 'High', emoji: '🔥', downloadMode: 'high' as const, desc: '3 Guard Nodes', tip: '+50% bandwidth — 3 independent Tor guard relays (needs ≥8GB RAM)' },
+            { key: 'aggressive', label: 'Aggressive', emoji: '🚀', downloadMode: 'aggressive' as const, desc: '4 Guard Nodes', tip: '+100% bandwidth — 4 independent Tor guard relays (needs ≥16GB RAM)' },
           ] as const).map((preset) => {
-            const isSelected = crawlOptions.circuits === preset.circuits;
+            const isSelected = crawlOptions.downloadMode === preset.downloadMode;
             const isAutoDetected = systemProfile && (
-              (preset.key === 'low' && (systemProfile.preset === 'Conservative' || (systemProfile.totalRamGb <= 4.5))) ||
-              (preset.key === 'balanced' && (systemProfile.preset === 'Balanced' || (systemProfile.totalRamGb > 4.5 && systemProfile.totalRamGb <= 8.5))) ||
-              (preset.key === 'performance' && (systemProfile.preset === 'Aggressive' || systemProfile.preset === 'Maximum' || systemProfile.preset === 'Aerospace'))
+              (preset.key === 'default' && (!systemProfile || systemProfile.totalRamGb <= 8.5)) ||
+              (preset.key === 'high' && (systemProfile.totalRamGb > 8.5 && systemProfile.totalRamGb <= 20)) ||
+              (preset.key === 'aggressive' && systemProfile.totalRamGb > 20)
             );
             return (
               <button
@@ -2595,7 +2571,7 @@ function App() {
                 data-testid={`preset-${preset.key}`}
                 title={preset.tip}
                 disabled={isCrawling}
-                onClick={() => setCrawlOptions(prev => ({ ...prev, circuits: preset.circuits }))}
+                onClick={() => setCrawlOptions(prev => ({ ...prev, downloadMode: preset.downloadMode }))}
                 style={{
                   display: 'flex',
                   flexDirection: 'column',

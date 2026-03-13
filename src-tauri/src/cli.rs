@@ -125,27 +125,27 @@ struct CrawlArgs {
     /// Download files in parallel while crawl is still running (real-time stream)
     #[arg(long)]
     parallel_download: bool,
-    /// Phase 133: Download speed mode — controls circuit caps and pipeline width
-    #[arg(long, value_enum, default_value_t = DownloadModeCli::Medium)]
+    /// Phase 140D: Unified speed mode — controls guard node count for download bandwidth
+    #[arg(long, value_enum, default_value_t = DownloadModeCli::Default)]
     download_mode: DownloadModeCli,
 }
 
-/// Phase 133: CLI-facing enum for --download-mode (maps to frontier::DownloadMode)
+/// Phase 140D: CLI-facing enum for --download-mode (maps to frontier::DownloadMode)
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum DownloadModeCli {
-    /// Stealth — fewer circuits, minimal server footprint (6 circuits)
-    Low,
-    /// Balanced — proven 4.75 MB/s over Tor (12 circuits, Phase 132 baseline)
-    Medium,
-    /// Max throughput — aggressive mirror striping (24 circuits)
+    /// Default — proven 1.83 MB/s, 2 guard nodes (resource governor arti cap)
+    Default,
+    /// High — 3 guard nodes, +50% bandwidth (arti cap override = 12)
+    High,
+    /// Aggressive — 4 guard nodes, +100% bandwidth (arti cap override = 16)
     Aggressive,
 }
 
 impl From<DownloadModeCli> for DownloadMode {
     fn from(cli: DownloadModeCli) -> Self {
         match cli {
-            DownloadModeCli::Low => DownloadMode::Low,
-            DownloadModeCli::Medium => DownloadMode::Medium,
+            DownloadModeCli::Default => DownloadMode::Default,
+            DownloadModeCli::High => DownloadMode::High,
             DownloadModeCli::Aggressive => DownloadMode::Aggressive,
         }
     }
@@ -1206,7 +1206,7 @@ mod tests {
             no_stealth_ramp: false,
             force_clearnet: false,
             parallel_download: false,
-            download_mode: DownloadModeCli::Medium,
+            download_mode: DownloadModeCli::Default,
         };
         let options = args.to_options();
         assert!(options.listing);

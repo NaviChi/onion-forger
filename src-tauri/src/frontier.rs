@@ -12,30 +12,37 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Semaphore;
 
-/// Phase 133: Download speed mode controlling circuit caps, parallel budgets,
-/// and pipeline widths. Each mode is tuned for different use cases:
-/// - **Low:** Stealth mode — minimizes server footprint, avoids rate-limiting.
-/// - **Medium:** Balanced — proven 4.75 MB/s in Phase 132 benchmarks.
-/// - **Aggressive:** Maximum throughput — uses all available mirrors aggressively.
+/// Phase 140D: Unified speed mode — single selector controls everything.
+/// All modes use the same proven circuit/worker values from Test 1 (1.83 MB/s).
+/// The ONLY difference is how many base TorClients (independent guard nodes)
+/// are bootstrapped, which directly controls aggregate download bandwidth:
+/// - **Default:** 2 guard nodes (proven 1.83 MB/s peak, arti cap from resource governor)
+/// - **High:** 3 guard nodes (~50% more bandwidth, arti cap override = 12)
+/// - **Aggressive:** 4 guard nodes (~100% more bandwidth, arti cap override = 16)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
 pub enum DownloadMode {
-    Low,
-    Medium,
+    /// Default — proven Test 1 config. 2 base TorClients, resource governor arti cap.
+    #[serde(alias = "low", alias = "medium", alias = "default")]
+    Default,
+    /// High — 3 base TorClients, arti cap override = 12. +50% bandwidth.
+    #[serde(alias = "high")]
+    High,
+    /// Aggressive — 4 base TorClients, arti cap override = 16. +100% bandwidth.
+    #[serde(alias = "aggressive")]
     Aggressive,
 }
 
 impl Default for DownloadMode {
     fn default() -> Self {
-        Self::Medium
+        Self::Default
     }
 }
 
 impl std::fmt::Display for DownloadMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Low => write!(f, "low"),
-            Self::Medium => write!(f, "medium"),
+            Self::Default => write!(f, "default"),
+            Self::High => write!(f, "high"),
             Self::Aggressive => write!(f, "aggressive"),
         }
     }
@@ -44,58 +51,56 @@ impl std::fmt::Display for DownloadMode {
 impl DownloadMode {
     /// Circuit cap multipliers for onion content-size tiers.
     /// Returns (micro, small, medium, large) caps.
-    /// These are the BASE values — resource_governor may further adjust.
+    /// Phase 140D: All modes use aggressive-tier values (proven in Test 1).
     pub fn onion_content_caps(self) -> (usize, usize, usize, usize) {
-        match self {
-            //           <16MB  <64MB  <256MB  <1GB
-            Self::Low =>       (6,     8,    12,    16),
-            Self::Medium =>    (12,   16,    24,    32),
-            Self::Aggressive => (20,   28,    40,    56),
-        }
+        //           <16MB  <64MB  <256MB  <1GB
+        (20, 28, 40, 56)
     }
 
     /// Maximum parallel download circuits during crawl overlap.
+    /// Phase 140D: All modes use 24 (proven in Test 1).
     pub fn parallel_download_cap(self) -> usize {
-        match self {
-            Self::Low => 6,
-            Self::Medium => 12,
-            Self::Aggressive => 24,
-        }
+        24
     }
 
     /// Default circuit count when none specified.
+    /// Phase 140D: All modes use 24 (proven in Test 1).
     pub fn default_circuits(self) -> usize {
-        match self {
-            Self::Low => 6,
-            Self::Medium => 12,
-            Self::Aggressive => 24,
-        }
+        24
     }
 
     /// Large pipeline clamp range (min, max) for onion.
     pub fn large_pipeline_clamp(self) -> (usize, usize) {
-        match self {
-            Self::Low => (2, 8),
-            Self::Medium => (4, 16),
-            Self::Aggressive => (6, 24),
-        }
+        (6, 24)
     }
 
-    /// Number of Tor swarm clients (Arti instances) to bootstrap.
+    /// Number of Tor swarm clients (Arti instances) to bootstrap for crawl.
     pub fn tor_swarm_clients(self) -> usize {
-        match self {
-            Self::Low => 4,
-            Self::Medium => 8,
-            Self::Aggressive => 12,
-        }
+        8
     }
 
     /// Crawl worker ceiling for the Qilin adaptive governor.
     pub fn crawl_worker_ceiling(self) -> usize {
+        6
+    }
+
+    /// Phase 140D: Arti cap override for the download swarm.
+    /// Returns None to use resource governor default, or Some(cap) to override.
+    /// This is the key differentiator: more base TorClients = more guard nodes = more bandwidth.
+    pub fn arti_cap_override(self) -> Option<usize> {
         match self {
-            Self::Low => 3,
-            Self::Medium => 4,
-            Self::Aggressive => 6,
+            Self::Default => None,       // Use resource governor default (~8 → 2 base TorClients)
+            Self::High => Some(12),      // 3 base TorClients → 3 guard nodes
+            Self::Aggressive => Some(16), // 4 base TorClients → 4 guard nodes
+        }
+    }
+
+    /// Serde value for JSON serialization (used in frontend communication).
+    pub fn serde_value(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::High => "high",
+            Self::Aggressive => "aggressive",
         }
     }
 }
@@ -144,7 +149,7 @@ impl Default for CrawlOptions {
             mega_password: None,
             stealth_ramp: true,
             parallel_download: false,
-            download_mode: DownloadMode::Medium,
+            download_mode: DownloadMode::Default,
         }
     }
 }

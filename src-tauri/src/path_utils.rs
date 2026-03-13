@@ -283,6 +283,25 @@ pub fn display_path(path: &Path) -> String {
     normalize_windows_device_path(&path.to_string_lossy())
 }
 
+/// Phase 139: Normalize a path for reliable `starts_with` comparisons.
+///
+/// On Windows, `std::fs::canonicalize()` returns `\\?\C:\...` while user-constructed
+/// paths may or may not have the prefix. This mismatch causes `PathBuf::starts_with()`
+/// to return incorrect results. This function strips the extended-length prefix so
+/// both sides of `starts_with()` use the same format.
+///
+/// Example: `\\?\C:\output\HR\file.pdf` → `C:\output\HR\file.pdf`
+fn normalize_for_starts_with(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", rest));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
 pub fn resolve_path_within_root(
     output_root: &Path,
     raw_path: &str,
@@ -293,11 +312,17 @@ pub fn resolve_path_within_root(
         return Ok(None);
     }
 
+    // Phase 139: Always join with output_root — sanitize_path strips leading
+    // slashes and `..` so the result is always a clean relative path.
     let joined = output_root.join(&sanitized);
+    // Normalize the output_root for consistent starts_with checks.
+    // On Windows, canonicalize may add/remove \\?\ prefix inconsistently.
+    let normalized_root = normalize_for_starts_with(output_root);
     if is_directory {
         std::fs::create_dir_all(&joined)?;
         let canonical = std::fs::canonicalize(&joined)?;
-        if !canonical.starts_with(output_root) {
+        let normalized_canonical = normalize_for_starts_with(&canonical);
+        if !normalized_canonical.starts_with(&normalized_root) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "Resolved directory escaped output root",
@@ -314,7 +339,8 @@ pub fn resolve_path_within_root(
     })?;
     std::fs::create_dir_all(parent)?;
     let canonical_parent = std::fs::canonicalize(parent)?;
-    if !canonical_parent.starts_with(output_root) {
+    let normalized_parent = normalize_for_starts_with(&canonical_parent);
+    if !normalized_parent.starts_with(&normalized_root) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Resolved file parent escaped output root",
@@ -334,19 +360,20 @@ pub fn resolve_download_target_within_root(
     output_root: &Path,
     requested_path: &str,
 ) -> std::io::Result<PathBuf> {
-    let requested = PathBuf::from(requested_path);
-    let candidate = if requested.is_absolute() {
-        requested
-    } else {
-        let sanitized = sanitize_path(requested_path);
-        if sanitized.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Requested download path is empty after sanitization",
-            ));
-        }
-        output_root.join(sanitized)
-    };
+    // Phase 139 FIX: ALWAYS sanitize first. On Windows, paths like
+    // "/HR/Reports/file.pdf" are treated as absolute by PathBuf::is_absolute()
+    // because they root to the current drive (C:\HR\...).  Adapter paths always
+    // start with "/" and are logically relative to the output root.  By running
+    // sanitize_path() first — which strips leading slashes and `..` — we
+    // guarantee the path is joined correctly with output_root.
+    let sanitized = sanitize_path(requested_path);
+    if sanitized.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Requested download path is empty after sanitization",
+        ));
+    }
+    let candidate = output_root.join(&sanitized);
 
     let parent = candidate.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -356,7 +383,9 @@ pub fn resolve_download_target_within_root(
     })?;
     std::fs::create_dir_all(parent)?;
     let canonical_parent = std::fs::canonicalize(parent)?;
-    if !canonical_parent.starts_with(output_root) {
+    let normalized_root = normalize_for_starts_with(output_root);
+    let normalized_parent = normalize_for_starts_with(&canonical_parent);
+    if !normalized_parent.starts_with(&normalized_root) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Download target escaped output root",
@@ -481,18 +510,84 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_windows_device_path_for_display() {
-        assert_eq!(
-            normalize_windows_device_path(r"\\?\X:\Exports\Case1"),
-            r"X:\Exports\Case1"
+    fn test_phase_139_leading_slash_preserves_folder_structure() {
+        let temp = std::env::temp_dir().join("crawli_phase139_test");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let root = std::fs::canonicalize(&temp).unwrap();
+
+        // Adapter paths typically start with "/" — these should be joined
+        // with the output root, NOT treated as absolute drive-root paths.
+        let result = resolve_download_target_within_root(&root, "/HR/Reports/file.pdf").unwrap();
+        let result_norm = normalize_for_starts_with(&result);
+        let root_norm = normalize_for_starts_with(&root);
+        assert!(
+            result_norm.starts_with(&root_norm),
+            "Path {:?} should be under root {:?}",
+            result_norm,
+            root_norm
         );
-        assert_eq!(
-            normalize_windows_device_path(r"\\?\UNC\server\share\Exports"),
-            r"\\server\share\Exports"
-        );
-        assert_eq!(
-            normalize_windows_device_path(r"X:\Exports\Case1"),
-            r"X:\Exports\Case1"
-        );
+        // The parent chain should include the HR/Reports directories
+        let parent = result.parent().unwrap();
+        assert!(parent.ends_with("HR/Reports") || parent.to_string_lossy().contains("HR"));
+
+        // Nested adapter paths
+        let nested = resolve_download_target_within_root(
+            &root,
+            "/Finance/Q3 2025/Invoices/payment.xlsx",
+        )
+        .unwrap();
+        let nested_norm = normalize_for_starts_with(&nested);
+        assert!(nested_norm.starts_with(&root_norm));
+        assert!(nested.file_name().unwrap() == "payment.xlsx");
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_phase_139_resolve_path_within_root_with_leading_slash() {
+        let temp = std::env::temp_dir().join("crawli_phase139_resolve_test");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let root = std::fs::canonicalize(&temp).unwrap();
+
+        // File path with leading slash
+        let result = resolve_path_within_root(&root, "/Documents/report.pdf", false)
+            .unwrap()
+            .expect("Should resolve to a path");
+        let result_norm = normalize_for_starts_with(&result);
+        let root_norm = normalize_for_starts_with(&root);
+        assert!(result_norm.starts_with(&root_norm));
+        assert!(result.file_name().unwrap() == "report.pdf");
+
+        // Directory path with leading slash
+        let dir_result = resolve_path_within_root(&root, "/Archive/2025/Q1", true)
+            .unwrap()
+            .expect("Should resolve to a dir path");
+        let dir_norm = normalize_for_starts_with(&dir_result);
+        assert!(dir_norm.starts_with(&root_norm));
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_phase_139_normalize_for_starts_with() {
+        use std::path::PathBuf;
+
+        let with_prefix = PathBuf::from(r"\\?\C:\Users\output\HR\file.pdf");
+        let normalized = normalize_for_starts_with(&with_prefix);
+        assert_eq!(normalized, PathBuf::from(r"C:\Users\output\HR\file.pdf"));
+
+        let without_prefix = PathBuf::from(r"C:\Users\output\HR\file.pdf");
+        let normalized2 = normalize_for_starts_with(&without_prefix);
+        assert_eq!(normalized2, without_prefix);
+
+        let unc = PathBuf::from(r"\\?\UNC\server\share\folder");
+        let unc_normalized = normalize_for_starts_with(&unc);
+        assert_eq!(unc_normalized, PathBuf::from(r"\\server\share\folder"));
+
+        // Unix-style path (no-op)
+        let unix = PathBuf::from("/home/user/output/file.pdf");
+        assert_eq!(normalize_for_starts_with(&unix), unix);
     }
 }

@@ -70,7 +70,7 @@ fn main() {
                 stealth_ramp: false, parallel_download: false,
             force_clearnet: false,
                 mega_password: None,
-                download_mode: crawli_lib::frontier::DownloadMode::Medium,
+                download_mode: crawli_lib::frontier::DownloadMode::Default,
             };
 
             let frontier = CrawlerFrontier::new(

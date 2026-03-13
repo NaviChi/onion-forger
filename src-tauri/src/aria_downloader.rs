@@ -554,17 +554,56 @@ impl CircuitScorer {
         (total_b / total_ms) * 1000.0 / 1_048_576.0 // Convert bytes/ms to MB/s
     }
 
+    /// Phase 140: Returns circuit IDs with avg speed >= threshold_mbps, sorted fastest-first.
+    /// Only considers circuits with ≥3 recorded pieces for statistical validity.
+    fn fast_circuits_above_threshold(
+        &self,
+        threshold_mbps: f64,
+    ) -> Vec<(usize, f64)> {
+        let mut qualified: Vec<(usize, f64)> = (0..self.capacity)
+            .filter_map(|cid| {
+                let pieces = self.pieces_completed[cid].load(Ordering::Relaxed);
+                if pieces < 3 {
+                    return None;
+                }
+                let speed = self.avg_speed_mbps(cid);
+                if speed >= threshold_mbps && !self.is_degrading(cid) {
+                    Some((cid, speed))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        qualified.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        qualified
+    }
+
     /// How long a circuit should wait before claiming the next piece.
-    /// Fast circuits: 0ms. Slow circuits: up to 1000ms.
-    /// This naturally gives more work to faster circuits.
+    /// Fast circuits (≥0.3 MB/s): 0ms. Slow circuits (<0.3 MB/s): 3-5s.
+    /// Phase 140: Aggressive speed-threshold enforcement — circuits below
+    /// 0.3 MB/s are penalized with long delays so fast circuits grab work first.
     fn yield_delay(&self, cid: usize) -> Duration {
         if cid >= self.capacity {
             return Duration::ZERO;
         }
+        let pieces = self.pieces_completed[cid].load(Ordering::Relaxed);
+        if pieces == 0 {
+            return Duration::ZERO; // Untested, let it prove itself
+        }
+
+        // Phase 140: Hard speed threshold — circuits below 0.3 MB/s get heavy penalty
+        let speed = self.avg_speed_mbps(cid);
+        if pieces >= 3 && speed < 0.3 {
+            // Below threshold: 3-5s delay proportional to how far below 0.3 MB/s
+            let severity = ((0.3 - speed) / 0.3).clamp(0.0, 1.0);
+            let delay_ms = 3000 + (severity * 2000.0) as u64; // 3000-5000ms
+            return Duration::from_millis(delay_ms.min(5000));
+        }
+
         let my_score = self.thompson_score(cid);
         if my_score == f64::MAX {
             return Duration::ZERO;
-        } // Untested, no delay
+        }
 
         // Collect scores of all active circuits
         let mut scores: Vec<f64> = (0..self.capacity)
@@ -584,12 +623,12 @@ impl CircuitScorer {
         // Ratio: 0.0 (worst) to 1.0 (best)
         let ratio = (my_score / best).clamp(0.0, 1.0);
 
-        // Map: top 50% → 0ms, bottom 50% → 0-1000ms proportional
+        // Map: top 50% → 0ms, bottom 50% → 0-1500ms proportional
         if ratio > 0.5 {
             Duration::ZERO
         } else {
-            let delay_ms = ((0.5 - ratio) * 2000.0) as u64; // 0-1000ms
-            Duration::from_millis(delay_ms.min(1000))
+            let delay_ms = ((0.5 - ratio) * 3000.0) as u64; // 0-1500ms
+            Duration::from_millis(delay_ms.min(1500))
         }
     }
 

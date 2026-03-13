@@ -520,13 +520,13 @@ pub fn recommend_download_budget(
 /// Phase 133: Global download mode state. Set once at crawl/download start,
 /// read by resource_governor and aria_downloader. Using AtomicU8 avoids
 /// threading the mode through 6+ function signatures.
-static ACTIVE_DOWNLOAD_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1); // 1 = Medium
+static ACTIVE_DOWNLOAD_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // 0 = Default
 
 /// Set the active download mode. Call this at crawl start.
 pub fn set_active_download_mode(mode: crate::frontier::DownloadMode) {
     let value = match mode {
-        crate::frontier::DownloadMode::Low => 0u8,
-        crate::frontier::DownloadMode::Medium => 1u8,
+        crate::frontier::DownloadMode::Default => 0u8,
+        crate::frontier::DownloadMode::High => 1u8,
         crate::frontier::DownloadMode::Aggressive => 2u8,
     };
     ACTIVE_DOWNLOAD_MODE.store(value, std::sync::atomic::Ordering::Relaxed);
@@ -535,10 +535,66 @@ pub fn set_active_download_mode(mode: crate::frontier::DownloadMode) {
 /// Get the active download mode.
 pub fn active_download_mode() -> crate::frontier::DownloadMode {
     match ACTIVE_DOWNLOAD_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => crate::frontier::DownloadMode::Low,
+        1 => crate::frontier::DownloadMode::High,
         2 => crate::frontier::DownloadMode::Aggressive,
-        _ => crate::frontier::DownloadMode::Medium,
+        _ => crate::frontier::DownloadMode::Default,
     }
+}
+
+/// Phase 140D: RAM-aware mode auto-demotion.
+///
+/// Prevents OOM crashes on low-RAM systems by clamping the download mode
+/// to what the hardware can safely support. Returns the (possibly demoted)
+/// mode and an optional warning message for the user.
+///
+/// Thresholds:
+/// - Aggressive: requires ≥8 GiB available AND ≥16 GiB total
+/// - High: requires ≥4 GiB available AND ≥8 GiB total
+/// - Default: always safe
+pub fn clamp_mode_for_hardware(
+    requested: crate::frontier::DownloadMode,
+    output_path: Option<&std::path::Path>,
+) -> (crate::frontier::DownloadMode, Option<String>) {
+    let profile = detect_profile(output_path);
+    let avail_gib = profile.available_memory_bytes / GIB;
+    let total_gib = profile.total_memory_bytes / GIB;
+
+    match requested {
+        crate::frontier::DownloadMode::Aggressive => {
+            if avail_gib < 4 || total_gib < 8 {
+                return (
+                    crate::frontier::DownloadMode::Default,
+                    Some(format!(
+                        "⚠️ Auto-demoted from Aggressive → Default: only {}GiB available / {}GiB total (need ≥8GiB/≥16GiB)",
+                        avail_gib, total_gib
+                    )),
+                );
+            }
+            if avail_gib < 8 || total_gib < 16 {
+                return (
+                    crate::frontier::DownloadMode::High,
+                    Some(format!(
+                        "⚠️ Auto-demoted from Aggressive → High: only {}GiB available / {}GiB total (need ≥8GiB/≥16GiB for Aggressive)",
+                        avail_gib, total_gib
+                    )),
+                );
+            }
+        }
+        crate::frontier::DownloadMode::High => {
+            if avail_gib < 4 || total_gib < 8 {
+                return (
+                    crate::frontier::DownloadMode::Default,
+                    Some(format!(
+                        "⚠️ Auto-demoted from High → Default: only {}GiB available / {}GiB total (need ≥4GiB/≥8GiB)",
+                        avail_gib, total_gib
+                    )),
+                );
+            }
+        }
+        crate::frontier::DownloadMode::Default => {}
+    }
+
+    (requested, None)
 }
 
 fn download_budget_for_profile(
@@ -681,6 +737,10 @@ fn recommend_arti_cap_with_storage(
     let total_gib = total_memory_bytes / GIB;
     let available_gib = available_memory_bytes / GIB;
 
+    // Phase 140C: Moderate cap increase for higher download bandwidth.
+    // Each base TorClient bootstraps an independent guard relay (~0.5-1.0 MB/s).
+    // Fan-out=4, so cap=12 → 3 base clients → 3 guard nodes → ~50% more bandwidth
+    // than the old cap=8 / 2 base clients, without being overly aggressive.
     let mut cap = match storage_class {
         StorageClass::Hdd => {
             if cpu_cores <= 4 || total_gib <= 8 || available_gib <= 2 {
@@ -706,7 +766,7 @@ fn recommend_arti_cap_with_storage(
             if cpu_cores >= 24 && total_gib >= 64 && available_gib >= 16 {
                 24
             } else if cpu_cores >= 16 && total_gib >= 32 && available_gib >= 8 {
-                18
+                16
             } else if cpu_cores >= 8 && total_gib >= 16 && available_gib >= 4 {
                 12
             } else {
@@ -714,23 +774,26 @@ fn recommend_arti_cap_with_storage(
             }
         }
         StorageClass::Unknown => {
-            if cpu_cores <= 4 || total_gib <= 8 || available_gib <= 2 {
+            // cap=12 / fan_out=4 → 3 base TorClients → 3 independent guard nodes
+            if cpu_cores >= 16 && total_gib >= 32 && available_gib >= 8 {
+                12
+            } else if cpu_cores <= 4 || total_gib <= 8 || available_gib <= 2 {
                 4
             } else if cpu_cores <= 8 || total_gib <= 16 || available_gib <= 4 {
                 6
-            } else if cpu_cores >= 16 && total_gib >= 32 && available_gib >= 8 {
-                10
             } else {
                 8
             }
         }
     };
 
+    // Phase 140C: Conservative Windows caps — one extra base TorClient (+50% bandwidth)
+    // over the old caps without going wild. RSS monitor + RAM Guard provide safety.
     if cfg!(target_os = "windows") {
         cap = cap.min(match storage_class {
             StorageClass::Nvme => 16,
-            StorageClass::Ssd => 12,
-            StorageClass::Hdd | StorageClass::Unknown => 8,
+            StorageClass::Ssd => 16,
+            StorageClass::Hdd | StorageClass::Unknown => 12,
         });
     }
 

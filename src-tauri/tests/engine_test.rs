@@ -123,12 +123,12 @@ async fn test_frontier_initialization() {
         120,
         "Expected 120 persistent Tor circuit clients"
     );
-    assert_eq!(frontier.num_daemons, 4);
+    assert_eq!(frontier.num_clients, 4);
     assert!(frontier.is_onion);
     println!(
         "✅ Frontier initialized: {} clients across {} daemons",
         frontier.http_clients.len(),
-        frontier.num_daemons
+        frontier.num_clients
     );
     assert_eq!(
         frontier.worker_target(),

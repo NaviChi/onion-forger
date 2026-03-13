@@ -1,4 +1,176 @@
-> **Last Updated:** 2026-03-13T01:25 CDT
+> **Last Updated:** 2026-03-13T11:35 CDT
+
+## Phase 140D: Unified Speed Mode — Single Selector (2026-03-13)
+
+### Problem
+Two separate UI mode selectors caused confusion:
+1. **Speed Mode dropdown** (Low/Medium/Aggressive) — controlled `downloadMode` for circuit caps
+2. **MODE preset buttons** (Low/Balanced/Performance) — controlled `circuits` count
+
+Users had to configure two things that should have been one.
+
+### Fix
+Merged into a **single unified MODE selector** with 3 buttons:
+- **⚡ Default** — 2 guard nodes (proven 1.83 MB/s, resource governor arti cap)
+- **🔥 High** — 3 guard nodes, arti cap override=12 (+50% bandwidth, needs ≥8GB RAM)
+- **🚀 Aggressive** — 4 guard nodes, arti cap override=16 (+100% bandwidth, needs ≥16GB RAM)
+
+All three modes use the same proven Test 1 circuit/worker values (24 circuits, 24 parallel DL cap, 6 worker ceiling). The **only** difference is how many base TorClients are bootstrapped → how many independent guard relay paths exist → aggregate bandwidth.
+
+**Files modified:** `frontier.rs` (DownloadMode enum), `resource_governor.rs` (mode encoding, clamp_mode_for_hardware), `cli.rs` (DownloadModeCli), `App.tsx` (unified selector), all test binaries.
+
+### Prevention Rules
+- **PR-UI-MODE-140D:** Never expose two overlapping mode configuration controls. A single mode selector must control all related parameters (circuits, arti cap, workers) in one click.
+
+## Phase 140C: Conservative Arti Cap Increase — 3 Guard Nodes (2026-03-13)
+
+### Problem
+Live test (144bf0f5 target, 201K entries) showed 1.07-1.81 MB/s with aggressive mode. Root cause:
+- `recommended_arti_cap` returned 8 for the user's 16-core/31GB Unknown-storage system (Windows cap was 8)
+- With fan-out=4, only **2 base TorClients** were bootstrapped
+- All 4 isolated views from each base TorClient share the **same guard node** — sharing its bandwidth
+- Only 2 independent guard relay paths = each saturated at ~0.5-1.0 MB/s
+
+### Fix (Conservative Middle Ground)
+Moderately increased caps in `resource_governor.rs` — **+1 base TorClient** over baseline:
+- **Unknown storage** (16+ cores, 32+ GB): 8 → **12** circuit cap (3 base TorClients)
+- **SSD** (16+ cores, 32+ GB): 16 (unchanged); (8+ cores, 16+ GB): 12 → **12** (unchanged)
+- **NVMe** (16+ cores, 32+ GB): 18 → **16**; (24+ cores, 64+ GB): 24 (unchanged)
+- **Windows per-storage caps**: Unknown 8→**12**, SSD 12→**16**, NVMe 16 (unchanged)
+- Global max clamp: stays at **24**
+
+With fan-out=4, cap=12 → **3 base TorClients** → **3 independent guard nodes** → ~50% more bandwidth.
+
+### Safety Net
+RAM Guard (Phase 140) + Memory Pressure Monitor prevent OOM. Test showed 687-744 MB RSS at 200K entries — well within the 31 GB system budget.
+
+### Live Test Results (Before Fix)
+| Metric | Value |
+|--------|-------|
+| Target | 144bf0f5 (201K entries, ~25K files) |
+| Peak download speed | **1.83 MB/s** |
+| Steady-state speed | **1.07-1.14 MB/s** |
+| Files downloaded | 1,479 / 15,624 |
+| Data downloaded | 1,449 MB |
+| RSS | 687-744 MB (2.1-2.3%) |
+| Active workers | 16/16 |
+| 503 throttles | 1,055 |
+| Failovers | 1,105 |
+
+### Prevention Rules
+- **PR-ARTI-CAP-140C:** The `recommended_arti_cap` must scale proportionally with available hardware. Each base TorClient uses an independent guard relay — more base clients = linearly more aggregate bandwidth. The fan-out only provides circuit isolation, NOT independent bandwidth paths.
+
+## Phase 140B: Download Speed — Circuit Quality Gate & Budget Increase (2026-03-13)
+
+### Problem
+Download speed plateaued at 0.58 MB/s during parallel download. Two root causes:
+1. Parallel download consumer only used 4-6 circuits (Phase 128 conservative cap) while full mode budget was 12-24
+2. Slow circuits (<0.3 MB/s) were still getting equal work allocation, dragging down aggregate throughput
+
+### Fix
+**1. Circuit Speed Threshold (0.3 MB/s):** Enhanced `yield_delay()` in aria_downloader's CircuitScorer:
+- Circuits with ≥3 pieces and avg speed < 0.3 MB/s get 3-5 second delays (proportional to how far below threshold)
+- Circuits ≥0.3 MB/s get 0ms delay — they grab work immediately
+- Added `fast_circuits_above_threshold()` method to both `scorer.rs` and `aria_downloader.rs`
+
+**2. Parallel Download Budget Increase:** Changed `pd_circuits` from `min(requested, old_cap)` to `min(requested, effective_mode.parallel_download_cap())`:
+- Medium mode: 6→12 circuits during crawl
+- Aggressive mode: 12→24 circuits during crawl
+
+### Files Modified
+- `aria_downloader.rs` — Enhanced yield_delay with 0.3 MB/s threshold; added fast_circuits_above_threshold
+- `scorer.rs` — Added fast_circuits_above_threshold and select_fast_download_pool
+- `lib.rs` — Updated parallel download consumer to use full mode budget
+- `frontier.rs` — Mode display rename (Low→stealth, Medium→balanced)
+
+### Prevention Rules
+- **PR-SPEED-GATE-140B-001:** When allocating download workers, circuits MUST be filtered by minimum speed threshold (0.3 MB/s default). Avoid giving equal work to circuits that are provably slow — use proportional delay instead of hard rejection to prevent starvation.
+- **PR-BUDGET-MATCH-140B-002:** The parallel download consumer during crawl MUST use the same circuit budget as the post-crawl download sweep. Using a smaller budget wastes available throughput.
+
+## Phase 140: Parallel Consumer Hang + RAM-Aware Mode Demotion (2026-03-13)
+
+### Problem 1 — Parallel Download Consumer Infinite Hang (P0)
+After crawl completion, the parallel download consumer wait at `lib.rs:1892` (`handle.await`) blocked **indefinitely**. The consumer was stuck retrying 14 failing files (503 throttles / connection drops) with no overall timeout. Process had to be force-terminated.
+
+**Root Cause:** No `tokio::time::timeout` wrapper on `handle.await`. The consumer's internal batch download has no max-elapsed-time guard.
+
+**Fix:** Wrapped `handle.await` with `tokio::time::timeout(120s)`. On timeout, logs a warning and proceeds to the post-crawl sweep which handles remaining files via `build_download_resume_plan()`.
+
+### Problem 2 — Aggressive Mode OOM on Low-RAM Systems (P1)
+Users selecting "Aggressive" mode on systems with <8 GiB available RAM caused OOM crashes. 24 Tor circuits × 15-30 MB each + Sled DBs + download buffers easily exceeds 1-2 GB.
+
+**Root Cause:** `DownloadMode` override bypassed the resource governor's hardware-aware caps. No demotion guard existed.
+
+**Fix:** New `clamp_mode_for_hardware()` function in `resource_governor.rs` that auto-demotes modes based on available RAM:
+- Aggressive → Medium if <8 GiB avail or <16 GiB total
+- Aggressive → Low if <4 GiB avail or <8 GiB total
+- Medium → Low if <2 GiB avail or <4 GiB total
+
+Wired into `start_crawl()` before `set_active_download_mode()`. Logs `[RAM Guard]` warning on demotion.
+
+### Verification
+Live test against target `c9d2ba19-6aa1-3087-8773-f63d023179ed`:
+- 35,069 entries (27,142 files + 7,927 folders) crawled in 1,422s
+- 100% folder verification (7,928/7,928)
+- Folder structure confirmed preserved: `Accounting/Bank Recs/` (358 files), `HR/` (28 files)
+- No path escapes — Phase 139 fix working perfectly
+- 416/430 files downloaded during crawl (216.1 MB at 0.58 MB/s)
+- Memory stable at 450 MB RSS (1.4% of 31 GiB)
+
+### Files Modified
+- `lib.rs` — Added 120s timeout on parallel download consumer wait; wired RAM-aware mode demotion
+- `resource_governor.rs` — New `clamp_mode_for_hardware()` function
+
+### Prevention Rules
+- **PR-CONSUMER-TIMEOUT-140-001:** NEVER `handle.await` on JoinSet/JoinHandle without a `tokio::time::timeout` wrapper. Even "cooperative" consumer tasks can hang on network retries.
+- **PR-RAM-GUARD-140-002:** Any user-selectable mode that increases resource consumption MUST pass through `clamp_mode_for_hardware()` before activation. The mode enum values are NOT safe to use directly.
+- **PR-CRAWL-RESUME-140-003 (FUTURE):** VFS sled DB already persists entries during crawl. A future `--resume` enhancement should reload VFS entries and rebuild the frontier from unparsed folder entries, eliminating the need to re-crawl from scratch after crash/exit.
+
+
+## Phase 139: Windows Folder Structure Preservation — Critical Path Join Bug (2026-03-13)
+
+### Problem
+Downloaded files were losing their folder structure on Windows. A file that should be saved at `C:\output\HR\Reports\file.pdf` was instead written to `C:\HR\Reports\file.pdf` — bypassing the output directory entirely.
+
+**Root Cause 1 — `PathBuf::join()` with rooted paths on Windows:**
+Adapter paths from crawlers start with `/` (e.g. `/HR/Reports/file.pdf`). On Windows, `PathBuf::join("/HR/Reports/file.pdf")` treats the `/`-prefixed path as "rooted to current drive" and **replaces the entire base path**. So `C:\output\.join("/HR/...")` → `C:\HR\...` instead of `C:\output\HR\...`.
+
+Diagnostic proof:
+```rust
+let root = PathBuf::from(r"C:\output");
+root.join("/HR/Reports/file.pdf")  // → C:/HR/Reports/file.pdf  ❌ WRONG
+root.join("HR/Reports/file.pdf")   // → C:\output\HR/Reports/file.pdf  ✅ CORRECT
+```
+
+The `resolve_download_target_within_root` function previously had an `is_absolute()` check that happened to mask this for most cases, but the underlying `sanitize_path()` was the real fix — it strips leading `/` before joining.
+
+**Root Cause 2 — `\\?\` prefix mismatch in security checks:**
+`canonicalize_output_root()` adds the `\\?\` extended-length prefix via `ensure_long_path()`. But `std::fs::canonicalize()` returns paths with inconsistent prefix forms. When comparing via `starts_with()`:
+```
+child (no prefix): C:\output\HR\file.pdf
+root  (prefixed):  \\?\C:\output
+→ starts_with = false  ❌ FALSE ESCAPE DETECTION
+```
+This could either:
+- Silently allow directory escapes (false negative)
+- Reject valid downloads with "escaped output root" error (false positive)
+
+### Solution
+
+#### A. Always Sanitize Before Join
+In `resolve_download_target_within_root()`: removed the `is_absolute()` branch entirely. Now ALWAYS runs `sanitize_path()` first (strips leading `/`, `..`, etc.) then joins with `output_root`. This guarantees the path is always relative before joining.
+
+#### B. Normalize `\\?\` Prefix for starts_with Checks
+Added `normalize_for_starts_with()` helper that strips the `\\?\` and `\\?\UNC\` prefixes before `starts_with()` comparisons. Applied to all path escape checks in both `resolve_path_within_root()` and `resolve_download_target_within_root()`.
+
+### Files Modified
+- `path_utils.rs` — `resolve_path_within_root()`, `resolve_download_target_within_root()`, new `normalize_for_starts_with()` helper, new Phase 139 tests
+
+### Prevention Rules
+- **PR-WIN-JOIN-139-001:** NEVER call `PathBuf::join()` with a `/`-prefixed path on Windows. Always strip leading slashes via `sanitize_path()` first. The Rust `join()` method treats `/`-prefixed paths as "rooted" and replaces the base.
+- **PR-WIN-JOIN-139-002:** NEVER use raw `starts_with()` to compare canonicalized paths on Windows. Always normalize both sides via `normalize_for_starts_with()` to handle the `\\?\` prefix inconsistency.
+- **PR-WIN-JOIN-139-003:** Adapter `FileEntry.path` values always start with `/` by convention. All path consumers must pass through `sanitize_path()` before filesystem operations.
+- **PR-WIN-JOIN-139-004:** When adding any new path-joining code, always validate with the Windows test case: `root.join("/subdir/file")` should produce `root\subdir\file`, NOT `C:\subdir\file`.
 
 ## Phase 138: Isolation Fan-Out — More Circuits, Less Cost (2026-03-13)
 

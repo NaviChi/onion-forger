@@ -192,6 +192,58 @@ impl CircuitScorer {
         best_cid
     }
 
+    /// Phase 140: Returns circuit IDs whose measured average speed is above
+    /// `threshold_mbps` (e.g. 0.3 MB/s), sorted fastest-first.
+    /// Only considers circuits with ≥3 recorded pieces (enough data for
+    /// statistically meaningful speed measurement).
+    pub fn fast_circuits_above_threshold(
+        &self,
+        num_circuits: usize,
+        threshold_mbps: f64,
+    ) -> Vec<(usize, f64)> {
+        let limit = num_circuits.min(self.capacity);
+        let mut qualified: Vec<(usize, f64)> = (0..limit)
+            .filter_map(|cid| {
+                let pieces = self.pieces_completed[cid].load(Ordering::Relaxed);
+                if pieces < 3 {
+                    return None; // Not enough data
+                }
+                let speed = self.avg_speed_mbps(cid);
+                if speed >= threshold_mbps && !self.is_degrading(cid) {
+                    Some((cid, speed))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Sort by speed descending — fastest circuits first
+        qualified.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        qualified
+    }
+
+    /// Phase 140: Build a download worker pool from only circuits that meet the
+    /// minimum speed threshold. If no circuits qualify, falls back to ALL
+    /// non-degrading circuits (prevents starvation on slow networks).
+    ///
+    /// Returns: Vec of circuit IDs to use for parallel download.
+    pub fn select_fast_download_pool(
+        &self,
+        num_circuits: usize,
+        min_speed_mbps: f64,
+        max_pool_size: usize,
+    ) -> Vec<usize> {
+        let fast = self.fast_circuits_above_threshold(num_circuits, min_speed_mbps);
+        if !fast.is_empty() {
+            return fast.into_iter().map(|(cid, _)| cid).take(max_pool_size).collect();
+        }
+        // Fallback: no circuits meet threshold — use all non-degrading circuits
+        let limit = num_circuits.min(self.capacity);
+        (0..limit)
+            .filter(|&cid| !self.is_degrading(cid))
+            .take(max_pool_size)
+            .collect()
+    }
+
     /// How long a circuit should wait before claiming the next URL target.
     /// Fast circuits: 0ms. Slow circuits: up to 1000ms.
     /// This naturally gives more work to faster circuits.
