@@ -1647,8 +1647,18 @@ function App() {
         listenEvent<{ url: string; path: string; hash: string; time_taken_secs: number }>("complete", (event) => {
           const roots = [activeDownloadOutputDirRef.current, outputDir];
           const displayPath = toDisplayPath(event.payload.path, roots);
-          setLogs((l) => [...l.slice(-399), `[✓] Download finished: ${displayPath} (SHA256: ${event.payload.hash})`]);
-          showToast("success", "Download Finished", `File saved and verified (${event.payload.hash})`);
+          setLogs((l) => [...l.slice(-399), `[✓] File verified: ${displayPath} (SHA256: ${event.payload.hash})`]);
+          // Phase 134: During batch downloads, per-file completion must NOT say "Download Finished"
+          // because it misleads the user into thinking the entire batch is done.
+          setDownloadBatchStatus((prev) => {
+            const done = prev.completedFiles + prev.failedFiles + 1;
+            if (prev.totalFiles > 1) {
+              showToast("success", "File Verified", `${displayPath} (${done}/${prev.totalFiles})`);
+            } else {
+              showToast("success", "Download Finished", `File saved and verified (${event.payload.hash})`);
+            }
+            return { ...prev, completedFiles: Math.max(prev.completedFiles, done) };
+          });
 
           // Phase 128B: Mark completed in buffer + aggregate tracking
           const existingProgress = downloadProgressBufferRef.current[displayPath];

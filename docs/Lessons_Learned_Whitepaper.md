@@ -1,5 +1,10 @@
 # Lessons Learned Whitepaper
 
+## 2026-03-12 (Phase 135: Remove .ariaforge Temp Extension)
+- **PR-DIRECT-PATH-135-001 (HIGH):** The `.ariaforge` temp extension pattern caused orphaned files on cancellation, Windows rename failures (locked by indexer/AV), and confusing UX (files appeared with wrong extension during download). **FIX:** Download directly to the final file path. The `.ariaforge_state` sidecar provides all needed resume metadata (completed pieces, ETag, offsets) without a separate temp file.
+- **PR-DIRECT-PATH-135-002 (SUBTLE):** Removing the rename step eliminates a **cross-volume edge case** on Windows. If `entry.path` and the temp file (`{path}.ariaforge`) were on different NTFS volumes (e.g., junction points, symlinks), `fs::rename()` would fail with `ERROR_NOT_SAME_DEVICE`. Direct-to-path avoids this entirely.
+- **LESSON-135-001:** Temp extension patterns add complexity without proportional safety for downloads that already have resume state metadata. The `.ariaforge_state` sidecar tracks piece completion, offsets, ETag, and Last-Modified — sufficient for determining download completeness without relying on file extension.
+
 ## 2026-03-12 (Phase 132: Mirror Striping Activation & Optimistic Streams)
 - **PR-OPTIMISTIC-132-001 (CRITICAL — NEVER DO THIS):** `StreamPrefs::optimistic()` in `arti_connector.rs` BREAKS .onion hidden service connections. The HS rendezvous handshake is multi-step and must complete before the DataStream can be used. Optimistic mode returns the stream early → "client error (Connect)" on all attempts. **RULE:** Only enable optimistic streams for clearnet exit-node connections, NEVER for .onion.
 - **PR-MIRROR-INERT-132-002 (HIGH — SUBTLE):** Phase 129 mirror striping infrastructure in `aria_downloader.rs:4930-4940` was fully implemented but INERT because `ranked_qilin_download_hosts()` only extracted hosts from file URLs. Since Qilin crawls from a single winner host, all files had the same host → alternates list was always empty. **FIX:** Read QilinNodeCache sled DB to inject discovered alternate storage node hosts into the ranked list.

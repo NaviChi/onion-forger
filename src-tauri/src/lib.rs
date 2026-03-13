@@ -2540,6 +2540,12 @@ async fn cancel_crawl(app: tauri::AppHandle) -> Result<String, String> {
 
     // Force-stop any active single file download first.
     let _ = stop_active_download(app.clone());
+    // Phase 134: Immediately release the download control lock so a restarted
+    // download can acquire it. Without this, the previous start_crawl is still
+    // unwinding and holds the ACTIVE_CONTROL mutex, causing the next
+    // activate_download_control() to return None → "A download is already active"
+    // → batch download skipped → files land flat without folder scaffolding.
+    aria_downloader::clear_download_control();
 
     if let Some(frontier) = active_frontier {
         frontier.cancel();

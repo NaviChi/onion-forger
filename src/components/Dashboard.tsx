@@ -1,7 +1,7 @@
 import { Network, Cpu, Database, CloudDownload, TerminalSquare, Cloud } from "lucide-react";
 import "./Dashboard.css";
 import { VibeLoader } from "./VibeLoader";
-import { VfsTreeView } from "./VfsTreeView";
+
 
 interface EfficiencyHistory {
   requestsPerEntry: number[];
@@ -169,7 +169,7 @@ export function Dashboard({
   downloadBatchStatus,
   logs,
   vfsCount,
-  vfsRefreshTrigger,
+  vfsRefreshTrigger: _vfsRefreshTrigger,
   downloadProgress,
   elapsed,
   downloadElapsed,
@@ -545,19 +545,7 @@ export function Dashboard({
         </div>
       </div>
 
-      <div className="dash-card vfs-tree-card" style={{ gridColumn: "1 / -1", height: "400px", padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-        <div className="dash-info" style={{ width: "100%", padding: "16px", borderBottom: "1px solid var(--border-color)", flexShrink: 0 }}>
-          <div className="dash-title">VFS TARGET TREE</div>
-        </div>
-        <div style={{ flex: 1, overflow: "hidden" }}>
-          <VfsTreeView
-            triggerRefresh={vfsRefreshTrigger}
-            targetKey={crawlRunStatus?.targetKey || null}
-            stableCurrentListingPath={crawlRunStatus?.stableCurrentListingPath || null}
-            outputDir={downloadBatchStatus.outputDir}
-          />
-        </div>
-      </div>
+
     </div>
   );
 }

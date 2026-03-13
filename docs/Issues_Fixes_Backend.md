@@ -1,4 +1,30 @@
-> **Last Updated:** 2026-03-12T21:10 CDT
+> **Last Updated:** 2026-03-12T23:49 CDT
+
+## Phase 135: Remove `.ariaforge` Temp Extension — Direct-to-Final-Path Downloads (2026-03-12)
+
+### Problem
+Downloads used a two-phase write pattern: data was written to `{path}.ariaforge`, then after SHA256 verification, renamed to the final path via `fs::rename()`. This caused several issues:
+1. **Orphaned `.ariaforge` files** — if a download was cancelled or crashed mid-transfer, the `.ariaforge` file remained on disk at the temp path. Users saw mysterious `.ariaforge`-suffixed files.
+2. **Rename failures on Windows** — `fs::rename()` can fail if the target file is locked by an indexer (Windows Search), antivirus scan, or another process.
+3. **Confusing UX** — while downloading, the file appeared as `filename.ext.ariaforge` instead of `filename.ext`.
+
+### Solution
+Eliminated the `.ariaforge` temp extension entirely. Files now download **directly to their final path**:
+- `aria_downloader.rs:3672-3675`: Replaced `temp_target = format!("{}.ariaforge", entry.path)` with direct use of `entry.path`
+- All 7 references to `temp_target` across the download pipeline (writer, piece tasks, stream fallback, SHA256 verification) now reference `entry.path`
+- Removed the `fs::rename(&temp_target, &entry.path)` step after SHA256 verification
+- `.ariaforge_state` sidecar file preserved for resume metadata tracking
+- `direct_download_benchmark.rs`: Updated `best_observed_downloaded_bytes()` to read from the final path instead of the old `.ariaforge` temp path
+
+### Files Modified
+- `aria_downloader.rs`: 8 changes — removed temp_target variable, updated all references, removed rename step
+- `bin/direct_download_benchmark.rs`: 1 change — updated fallback byte estimation
+
+### Prevention Rules
+- **P135-1:** NEVER reintroduce a temp extension pattern for downloads. The `.ariaforge_state` sidecar provides all resume metadata needed without requiring a separate temp file path.
+- **P135-2:** If partial/corrupt file detection is needed, use the `.ariaforge_state` sidecar's `completed_pieces` bitfield — do NOT check file extension to determine download completeness.
+- **P135-3:** The resume validator (ETag/Last-Modified) in `.ariaforge_state` already protects against serving stale content from a changed server file.
+
 
 ## Phase 133: Download Speed Modes — Low / Medium / Aggressive (2026-03-12)
 

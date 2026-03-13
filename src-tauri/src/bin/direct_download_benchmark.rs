@@ -156,8 +156,8 @@ fn best_observed_downloaded_bytes(path: &Path) -> u64 {
     if let Some(state_bytes) = estimate_downloaded_bytes_from_state(path) {
         return state_bytes;
     }
-    let partial_path = format!("{}.ariaforge", path.display());
-    actual_allocated_bytes(Path::new(&partial_path))
+    // Phase 135: Files now download directly to final path (no .ariaforge temp extension)
+    actual_allocated_bytes(path)
 }
 
 #[cfg(unix)]

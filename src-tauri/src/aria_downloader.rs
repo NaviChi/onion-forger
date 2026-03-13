@@ -3670,8 +3670,9 @@ pub async fn start_download(
     let is_onion = crate::url_targets_onion(&entry.url) || force_tor;
     let download_telemetry = telemetry_handle(&app);
     let state_file_path = format!("{}.ariaforge_state", entry.path);
-    // Download to a temp file with .ariaforge extension, rename on completion
-    let temp_target = format!("{}.ariaforge", entry.path);
+    // Phase 135: Download directly to final path — no temp .ariaforge extension.
+    // Resume metadata is tracked via .ariaforge_state sidecar. This eliminates
+    // orphaned .ariaforge files on cancellation and simplifies the pipeline.
 
     // Create log file in the output directory
     let output_dir = Path::new(&entry.path)
@@ -4005,7 +4006,7 @@ pub async fn start_download(
                         "[!] Resume validators/state mismatch detected. Discarding stale partial state and restarting clean.".to_string(),
                     );
                     let _ = fs::remove_file(&state_file_path);
-                    let _ = fs::remove_file(&temp_target);
+                    let _ = fs::remove_file(&entry.path);
                 }
             }
         }
@@ -4030,7 +4031,7 @@ pub async fn start_download(
 
     if range_mode && state.content_length > 0 {
         if let Ok(file) = open_file_with_adaptive_io(
-            Path::new(&temp_target),
+            Path::new(&entry.path),
             !is_resuming, // create/truncate if fresh
             true,
             true,
@@ -4123,7 +4124,7 @@ pub async fn start_download(
         h
     });
 
-    let writer_temp_target = temp_target.clone();
+    let writer_final_target = entry.path.clone();
     let writer_handle = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let mut active_filepath = String::new();
         // Phase 130: Write coalescing — wrap raw File in 256KB BufWriter to reduce
@@ -4134,7 +4135,7 @@ pub async fn start_download(
             .map(|f| std::io::BufWriter::with_capacity(256 * 1024, f));
         let mut active_mmap: Option<memmap2::MmapMut> = initial_mmap_for_writer;
         if active_file.is_some() {
-            active_filepath = writer_temp_target;
+            active_filepath = writer_final_target;
         }
         let mut local_state = state_for_writer;
         let mut last_flush = Instant::now();
@@ -4943,7 +4944,7 @@ pub async fn start_download(
             } else {
                 entry.url.clone()
             };
-            let task_path = temp_target.clone();
+            let task_path = entry.path.clone();
             let task_control = control.clone();
             let task_running = Arc::clone(&run_flag);
             let task_total = Arc::clone(&total_downloaded);
@@ -5580,7 +5581,7 @@ pub async fn start_download(
         let task_tx = tx.clone();
         let task_app = app.clone();
         let task_url = entry.url.clone();
-        let task_path = temp_target.clone();
+        let task_path = entry.path.clone();
         let task_control = control.clone();
         let task_running = Arc::clone(&run_flag);
         let task_total = Arc::clone(&total_downloaded);
@@ -5957,7 +5958,7 @@ pub async fn start_download(
     );
 
     let sha_start = Instant::now();
-    let output_target_clone = temp_target.clone();
+    let output_target_clone = entry.path.clone();
     let content_length = probe.content_length;
 
     // Channel for SHA progress reporting
@@ -6104,15 +6105,8 @@ pub async fn start_download(
         &app,
         format!("[+] SHA256 verified in {:.1}s: {}", sha_elapsed, hash),
     );
-    // Rename from .ariaforge temp file to final name
-    if let Err(e) = fs::rename(&temp_target, &entry.path) {
-        logger.log(
-            &app,
-            format!("[!] Rename failed: {} — file is at {}", e, temp_target),
-        );
-    } else {
-        logger.log(&app, format!("[+] Renamed to final: {}", entry.path));
-    }
+    // Phase 135: No rename needed — file was downloaded directly to final path.
+    logger.log(&app, format!("[+] Download verified at final path: {}", entry.path));
 
     let _ = app.emit(
         "complete",
