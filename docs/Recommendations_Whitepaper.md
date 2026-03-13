@@ -1,4 +1,4 @@
-> **Last Updated:** 2026-03-13T21:53 CDT
+> **Last Updated:** 2026-03-13T22:24 CDT
 
 ## Phase 144-IMPL: Stall Prevention — All 5 Bugs Fixed + R5/R7 (2026-03-13)
 
@@ -18,6 +18,21 @@ Remaining deferred for next cycle:
 - **R4:** Parallel probes (4 concurrent) — would 4× probe phase speed
 - **R6:** Token bucket for 503 throttles — coordinated backoff
 - **R8:** Circuit health pre-check before chunk start
+
+## Phase 144: Tokio vs C Analysis + C-Implementation Borrowed Patterns (2026-03-13)
+
+**Verdict: Tokio is optimal.** Our bottleneck is Tor transport (2-5s RTT), not async runtime overhead (~0.2ms). io_uring is Linux-only; we target Windows. Benchmarks show Rust+io_uring ≈ C+io_uring (198K vs 200K req/s).
+
+**Three C patterns worth copying:**
+- **CP1 (5 min, from libcurl):** `reqwest::Client::builder().pool_max_idle_per_host(4).pool_idle_timeout(90s)` — prevents FD exhaustion on high-fanout sites. libcurl uses `CURLOPT_MAXCONNECTS` for this.
+- **CP2 (15 min, from aria2):** Per-host connection semaphore (aria2's `-x` flag limits to max 16 per host). Our R2 host-grouped scheduling can accidentally hammer one host with all workers.
+- **CP3 (LOW, from libcurl):** DNS pre-resolution — irrelevant for .onion (Tor resolves internally).
+
+**Anti-Recommendations from C analysis:**
+- io_uring: Linux 5.1+ only, we're Windows-first
+- Zero-copy splice: Windows doesn't support splice(); tokio::fs adequate for our throughput
+- Custom allocator: Transport-bound, not allocation-bound
+- FFI to libcurl: Would lose Tauri integration benefits
 
 ## Phase 142-IMPL: R1+R2+R3+R4 Implemented (2026-03-13)
 
