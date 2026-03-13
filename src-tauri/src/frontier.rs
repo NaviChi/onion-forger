@@ -207,6 +207,11 @@ pub struct CrawlerFrontier {
 
     // Phase 79: Multi-Node Global Failover Rotation
     pub seed_manager: Arc<crate::seed_manager::SeedManager>,
+
+    // Phase 141: Event-driven parallel download feed.
+    // When set, discovered file entries are pushed here for immediate download
+    // instead of waiting for VFS polling. Set via set_download_feed().
+    pub download_feed_tx: Option<std::sync::Arc<tokio::sync::mpsc::UnboundedSender<crate::adapters::FileEntry>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -478,6 +483,7 @@ impl CrawlerFrontier {
                 target_url.clone(),
                 Vec::new(),
             )),
+            download_feed_tx: None,
         }
     }
 
@@ -494,6 +500,30 @@ impl CrawlerFrontier {
     /// Expose whether the Vanguard stealth ramp is active for this session
     pub fn stealth_ramp_active(&self) -> bool {
         self.active_options.stealth_ramp
+    }
+
+    /// Phase 141: Set the download feed channel sender.
+    /// Called from lib.rs after frontier construction but before crawl starts.
+    pub fn set_download_feed(&mut self, tx: std::sync::Arc<tokio::sync::mpsc::UnboundedSender<crate::adapters::FileEntry>>) {
+        self.download_feed_tx = Some(tx);
+    }
+
+    /// Phase 141: Push a batch of entries to the download feed channel.
+    /// Non-blocking, best-effort. Returns how many entries were successfully sent.
+    pub fn notify_download_feed(&self, entries: &[crate::adapters::FileEntry]) -> usize {
+        let tx = match &self.download_feed_tx {
+            Some(tx) => tx,
+            None => return 0,
+        };
+        let mut sent = 0;
+        for entry in entries {
+            if matches!(entry.entry_type, crate::adapters::EntryType::File) {
+                if tx.send(entry.clone()).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+        sent
     }
 
     /// Mark URL as visited, returns true if newly added, false if already visited

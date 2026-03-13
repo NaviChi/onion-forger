@@ -2879,11 +2879,28 @@ impl CrawlerAdapter for QilinAdapter {
         let ui_app = app.clone();
         let vfs_for_batches = vfs.clone();
         let collected_entries_for_batches = collected_entries.clone();
+        // Phase 141: Clone the download feed sender from the frontier
+        let dl_feed_tx = frontier.download_feed_tx.clone();
         let ui_flush_task = tokio::spawn(async move {
             let mut batch = Vec::new();
             // Phase 78: 2000ms flush interval to drastically reduce rapid React rendering overhead on massive QData targets
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(2000));
             let mut channel_closed = false;
+
+            // Phase 141: Helper closure to forward file entries to the download consumer
+            let forward_to_download = |batch: &[FileEntry], tx: &Option<std::sync::Arc<tokio::sync::mpsc::UnboundedSender<FileEntry>>>| {
+                if let Some(ref tx) = tx {
+                    for entry in batch {
+                        if matches!(entry.entry_type, EntryType::File)
+                            && !entry.raw_url.is_empty()
+                            && (entry.raw_url.starts_with("http://") || entry.raw_url.starts_with("https://"))
+                        {
+                            let _ = tx.send(entry.clone());
+                        }
+                    }
+                }
+            };
+
             loop {
                 tokio::select! {
                     entry = ui_rx.recv(), if !channel_closed => {
@@ -2895,6 +2912,7 @@ impl CrawlerAdapter for QilinAdapter {
                                     if let Some(vfs) = &vfs_for_batches {
                                         let _ = vfs.insert_entries(&batch).await;
                                     }
+                                    forward_to_download(&batch, &dl_feed_tx);
                                     let _ = ui_app.emit("crawl_progress", batch.clone());
                                     if collect_results_locally {
                                         collected_entries_for_batches.push_batch(batch.clone());
@@ -2912,6 +2930,7 @@ impl CrawlerAdapter for QilinAdapter {
                             if let Some(vfs) = &vfs_for_batches {
                                 let _ = vfs.insert_entries(&batch).await;
                             }
+                            forward_to_download(&batch, &dl_feed_tx);
                             let _ = ui_app.emit("crawl_progress", batch.clone());
                             if collect_results_locally {
                                 collected_entries_for_batches.push_batch(batch.clone());
@@ -2928,6 +2947,7 @@ impl CrawlerAdapter for QilinAdapter {
                 if let Some(vfs) = &vfs_for_batches {
                     let _ = vfs.insert_entries(&batch).await;
                 }
+                forward_to_download(&batch, &dl_feed_tx);
                 let _ = ui_app.emit("crawl_progress", batch.clone());
                 if collect_results_locally {
                     collected_entries_for_batches.push_batch(batch.clone());
