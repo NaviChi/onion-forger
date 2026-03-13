@@ -1,4 +1,4 @@
-> **Last Updated:** 2026-03-13T21:53 CDT
+> **Last Updated:** 2026-03-13T23:18 CDT
 
 ## Phase 144: Parallel Download Stall Prevention — 5 Bugs Fixed + 8 Recommendations (2026-03-13)
 
@@ -23,6 +23,8 @@
 - **PR-CONTROL-CLEANUP-144:** `clear_download_control()` MUST be called in ALL non-success paths (error, timeout, panic). Use RAII guard pattern if more call sites are added.
 - **PR-HEARTBEAT-144:** Any blocking operation >30s MUST have a concurrent heartbeat emitter so the user sees activity.
 - **PR-PROBE-PROGRESS-144:** Serial probe loops MUST emit progress every 10 iterations.
+- **PR-PARALLEL-PROBE-144:** Probe loops MUST use concurrent JoinSet with bounded Semaphore (default 4). Serial probes are prohibited for batches > 10 files.
+- **PR-THROTTLE-COORD-144:** HTTP 503/429 backoff MUST use a shared token bucket (Semaphore), not independent per-worker sleeps. Capacity=2, hold time=500ms.
 
 ## Phase 143: Progressive Download Total Tracking (2026-03-13)
 

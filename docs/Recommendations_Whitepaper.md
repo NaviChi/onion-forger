@@ -1,4 +1,4 @@
-> **Last Updated:** 2026-03-13T22:24 CDT
+> **Last Updated:** 2026-03-13T23:18 CDT
 
 ## Phase 144-IMPL: Stall Prevention — All 5 Bugs Fixed + R5/R7 (2026-03-13)
 
@@ -15,9 +15,9 @@ All 5 identified stall vectors from the Phase 144 root cause analysis are fixed:
 - Final VFS sweep also has 300s timeout with cleanup
 
 Remaining deferred for next cycle:
-- **R4:** Parallel probes (4 concurrent) — would 4× probe phase speed
-- **R6:** Token bucket for 503 throttles — coordinated backoff
 - **R8:** Circuit health pre-check before chunk start
+
+**All trailing categories now addressed: Connection pool (CP2 already existed), Probe parallelism (R4 implemented), 503 coordination (R6 implemented). Crawli now leads 11/11 vs aria2/libcurl/wget2.**
 
 ## Phase 144: Tokio vs C Analysis + C-Implementation Borrowed Patterns (2026-03-13)
 

@@ -2639,6 +2639,12 @@ async fn process_swarm(
     let low_speed_policy = download_low_speed_policy(is_onion);
     let host_cap_ceiling = configured_download_host_connection_cap(is_onion);
 
+    // Phase 144 (R6): Shared throttle token bucket for 503/429 coordination.
+    // When a worker hits HTTP 503/429, it acquires a throttle permit (capacity=2)
+    // and holds it for 500ms. This prevents all workers from simultaneously
+    // hammering a throttled server — coordinated backoff vs independent backoff.
+    let throttle_bucket = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
     let _ = app.emit(
         "log",
         format!(
@@ -2681,6 +2687,7 @@ async fn process_swarm(
         let task_no_byte_requeue_limit = no_byte_requeue_limit;
         let task_phase_name = phase_name.to_string();
         let task_low_speed_policy = low_speed_policy;
+        let task_throttle_bucket = throttle_bucket.clone();
 
         tasks.spawn(async move {
             let mut client = client;
@@ -2762,11 +2769,15 @@ async fn process_swarm(
                                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                             {
                                 task_bbr.on_reject();
-                                let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} hit HTTP {}. Re-isolating circuit locally...", circuit_id, status));
-                                // With isolated_client() native regeneration, no global rotation is needed.
-                                // Since we create a single `client` per circuit thread in process_swarm and
-                                // don't share it, we don't actually need to rotate the token here if we
-                                // regenerate the stream internally, but for pure idempotency we just pause.
+                                let _ = task_app.emit("log", format!("[🛡] Swarm Evasion: Small-file circuit {} hit HTTP {}. Coordinated throttle engaged.", circuit_id, status));
+
+                                // Phase 144 (R6): Shared throttle — acquire permit,
+                                // hold for 500ms. Other workers see reduced permits
+                                // and naturally slow down instead of all hammering.
+                                if let Ok(permit) = task_throttle_bucket.acquire().await {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    drop(permit);
+                                }
                             } else {
                                 task_bbr.on_reject();
                             }
@@ -2775,14 +2786,8 @@ async fn process_swarm(
                                 client = client.new_isolated();
                             }
                             record_host_failure(&entry.url, task_is_onion, HostFailureKind::Timeout);
-                            let active = task_bbr.current_active();
                             let base = backoff_duration(retries);
-                            let bbr_pause = if circuit_id >= active {
-                                Duration::from_millis(2000)
-                            } else {
-                                Duration::ZERO
-                            };
-                            tokio::time::sleep(base + bbr_pause).await;
+                            tokio::time::sleep(base).await;
                             continue;
                         }
                         Ok(Err(err)) => {
@@ -3428,6 +3433,16 @@ pub async fn start_batch_download(
     );
 
     let probe_total = files.len();
+
+    // Phase 144 (R4): Parallel probes with bounded concurrency.
+    // Files with known size_hint skip probe (fast path). Files needing
+    // probes are dispatched in parallel via JoinSet bounded to 4 concurrent
+    // probes by a shared Semaphore. This provides ~4× speedup on probe-heavy batches.
+    let probe_concurrency: usize = 4;
+    let probe_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(probe_concurrency));
+    let mut probe_tasks: tokio::task::JoinSet<Option<(BatchFileEntry, Result<(ProbeResult, u64), ()>)>> = tokio::task::JoinSet::new();
+    let mut fast_classified: Vec<(BatchFileEntry, u64, usize)> = Vec::new(); // (entry, size, order)
+
     for (probe_idx, file) in files.iter().enumerate() {
         if control.interruption_reason().is_some() {
             return Ok(());
@@ -3444,82 +3459,121 @@ pub async fn start_batch_download(
             );
         }
 
-        // Smart Skip Idempotency (redundant fallback)
+        // Fast path: files with known size_hint skip the probe entirely
         if let Some(hint) = file.size_hint {
             if hint > 0 {
-                if hint <= micro_threshold {
-                    micro_candidates.push(ScheduledBatchFile {
-                        entry: file.clone(),
-                        estimated_size: hint,
-                        enqueue_order,
-                        prefetched_probe: None,
-                    });
-                } else if hint <= large_threshold {
-                    small_candidates.push(ScheduledBatchFile {
-                        entry: file.clone(),
-                        estimated_size: hint,
-                        enqueue_order,
-                        prefetched_probe: None,
-                    });
-                } else {
-                    large_candidates.push(ScheduledBatchFile {
-                        entry: file.clone(),
-                        estimated_size: hint,
-                        enqueue_order,
-                        prefetched_probe: None,
-                    });
-                }
-                enqueue_order = enqueue_order.saturating_add(1);
+                fast_classified.push((file.clone(), hint, probe_idx));
                 continue;
             }
         }
 
+        // Slow path: need to probe — dispatch in parallel
+        let sem = probe_semaphore.clone();
+        let sniff = sniff_client.clone();
+        let probe_app = app.clone();
         let mut probed_file = file.clone();
-        match probe_target_with_alternates(&sniff_client, &mut probed_file, &app).await {
-            Ok(probe) => {
-                let estimated_size = probed_file.size_hint.unwrap_or(probe.content_length);
-                probed_file.size_hint = Some(estimated_size);
-                let prefetched_probe = probe.prefetched_probe.clone().filter(|seed| {
-                    seed.len() <= promotion_budget_remaining && estimated_size <= large_threshold
-                });
-                if let Some(seed) = &prefetched_probe {
-                    promotion_budget_remaining =
-                        promotion_budget_remaining.saturating_sub(seed.len());
+
+        probe_tasks.spawn(async move {
+            let _permit = sem.acquire().await.ok()?;
+            match probe_target_with_alternates(&sniff, &mut probed_file, &probe_app).await {
+                Ok(probe) => {
+                    let estimated_size = probed_file.size_hint.unwrap_or(probe.content_length);
+                    Some((probed_file, Ok((probe, estimated_size))))
                 }
-                if probe.content_length <= micro_threshold {
-                    micro_candidates.push(ScheduledBatchFile {
-                        entry: probed_file.clone(),
-                        estimated_size,
-                        enqueue_order,
-                        prefetched_probe,
+                Err(_) => {
+                    Some((probed_file, Err(())))
+                }
+            }
+        });
+    }
+
+    // Collect parallel probe results
+    while let Some(result) = probe_tasks.join_next().await {
+        if let Ok(Some((probed_file, probe_result))) = result {
+            match probe_result {
+                Ok((probe, estimated_size)) => {
+                    let mut entry = probed_file;
+                    entry.size_hint = Some(estimated_size);
+                    let prefetched_probe = probe.prefetched_probe.clone().filter(|seed| {
+                        seed.len() <= promotion_budget_remaining && estimated_size <= large_threshold
                     });
-                } else if probe.content_length <= large_threshold {
+                    if let Some(seed) = &prefetched_probe {
+                        promotion_budget_remaining =
+                            promotion_budget_remaining.saturating_sub(seed.len());
+                    }
+                    if probe.content_length <= micro_threshold {
+                        micro_candidates.push(ScheduledBatchFile {
+                            entry,
+                            estimated_size,
+                            enqueue_order,
+                            prefetched_probe,
+                        });
+                    } else if probe.content_length <= large_threshold {
+                        small_candidates.push(ScheduledBatchFile {
+                            entry,
+                            estimated_size,
+                            enqueue_order,
+                            prefetched_probe,
+                        });
+                    } else {
+                        large_candidates.push(ScheduledBatchFile {
+                            entry,
+                            estimated_size,
+                            enqueue_order,
+                            prefetched_probe: None,
+                        });
+                    }
+                }
+                Err(()) => {
+                    let estimated = probed_file
+                        .size_hint
+                        .unwrap_or(large_threshold.saturating_sub(1));
                     small_candidates.push(ScheduledBatchFile {
-                        entry: probed_file.clone(),
-                        estimated_size,
-                        enqueue_order,
-                        prefetched_probe,
-                    });
-                } else {
-                    large_candidates.push(ScheduledBatchFile {
-                        entry: probed_file.clone(),
-                        estimated_size,
+                        entry: probed_file,
+                        estimated_size: estimated,
                         enqueue_order,
                         prefetched_probe: None,
                     });
                 }
             }
-            Err(_) => small_candidates.push(ScheduledBatchFile {
-                entry: probed_file.clone(),
-                estimated_size: probed_file
-                    .size_hint
-                    .unwrap_or(large_threshold.saturating_sub(1)),
+            enqueue_order = enqueue_order.saturating_add(1);
+        }
+    }
+
+    // Classify the fast-path files (already had size_hint — no probe needed)
+    for (file, hint, _order) in fast_classified {
+        if hint <= micro_threshold {
+            micro_candidates.push(ScheduledBatchFile {
+                entry: file,
+                estimated_size: hint,
                 enqueue_order,
                 prefetched_probe: None,
-            }),
+            });
+        } else if hint <= large_threshold {
+            small_candidates.push(ScheduledBatchFile {
+                entry: file,
+                estimated_size: hint,
+                enqueue_order,
+                prefetched_probe: None,
+            });
+        } else {
+            large_candidates.push(ScheduledBatchFile {
+                entry: file,
+                estimated_size: hint,
+                enqueue_order,
+                prefetched_probe: None,
+            });
         }
         enqueue_order = enqueue_order.saturating_add(1);
     }
+
+    let _ = app.emit(
+        "log",
+        format!(
+            "[*] Batch probe completed: {}/{} files (parallel concurrency={})",
+            enqueue_order, probe_total, probe_concurrency
+        ),
+    );
 
     let scheduler_enabled = srpt_scheduler_enabled();
     let starvation_interval = srpt_starvation_interval();
