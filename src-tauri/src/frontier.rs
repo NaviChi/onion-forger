@@ -208,10 +208,11 @@ pub struct CrawlerFrontier {
     // Phase 79: Multi-Node Global Failover Rotation
     pub seed_manager: Arc<crate::seed_manager::SeedManager>,
 
-    // Phase 141: Event-driven parallel download feed.
+    // Phase 142: Event-driven parallel download feed with bounded channel (R4).
     // When set, discovered file entries are pushed here for immediate download
     // instead of waiting for VFS polling. Set via set_download_feed().
-    pub download_feed_tx: Option<std::sync::Arc<tokio::sync::mpsc::UnboundedSender<crate::adapters::FileEntry>>>,
+    // Bounded channel (capacity 200) provides natural backpressure.
+    pub download_feed_tx: Option<std::sync::Arc<tokio::sync::mpsc::Sender<crate::adapters::FileEntry>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -502,14 +503,16 @@ impl CrawlerFrontier {
         self.active_options.stealth_ramp
     }
 
-    /// Phase 141: Set the download feed channel sender.
+    /// Phase 142: Set the download feed channel sender (bounded).
     /// Called from lib.rs after frontier construction but before crawl starts.
-    pub fn set_download_feed(&mut self, tx: std::sync::Arc<tokio::sync::mpsc::UnboundedSender<crate::adapters::FileEntry>>) {
+    pub fn set_download_feed(&mut self, tx: std::sync::Arc<tokio::sync::mpsc::Sender<crate::adapters::FileEntry>>) {
         self.download_feed_tx = Some(tx);
     }
 
-    /// Phase 141: Push a batch of entries to the download feed channel.
-    /// Non-blocking, best-effort. Returns how many entries were successfully sent.
+    /// Phase 142: Push a batch of entries to the download feed channel.
+    /// Non-blocking, best-effort using try_send. If bounded channel is full,
+    /// entries are silently dropped (backpressure — consumer will catch up).
+    /// Returns how many entries were successfully sent.
     pub fn notify_download_feed(&self, entries: &[crate::adapters::FileEntry]) -> usize {
         let tx = match &self.download_feed_tx {
             Some(tx) => tx,
@@ -518,7 +521,7 @@ impl CrawlerFrontier {
         let mut sent = 0;
         for entry in entries {
             if matches!(entry.entry_type, crate::adapters::EntryType::File) {
-                if tx.send(entry.clone()).is_ok() {
+                if tx.try_send(entry.clone()).is_ok() {
                     sent += 1;
                 }
             }

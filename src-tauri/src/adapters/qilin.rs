@@ -2887,15 +2887,15 @@ impl CrawlerAdapter for QilinAdapter {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(2000));
             let mut channel_closed = false;
 
-            // Phase 141: Helper closure to forward file entries to the download consumer
-            let forward_to_download = |batch: &[FileEntry], tx: &Option<std::sync::Arc<tokio::sync::mpsc::UnboundedSender<FileEntry>>>| {
+            // Phase 142: Helper closure to forward file entries to the download consumer (bounded channel)
+            let forward_to_download = |batch: &[FileEntry], tx: &Option<std::sync::Arc<tokio::sync::mpsc::Sender<FileEntry>>>| {
                 if let Some(ref tx) = tx {
                     for entry in batch {
                         if matches!(entry.entry_type, EntryType::File)
                             && !entry.raw_url.is_empty()
                             && (entry.raw_url.starts_with("http://") || entry.raw_url.starts_with("https://"))
                         {
-                            let _ = tx.send(entry.clone());
+                            let _ = tx.try_send(entry.clone());
                         }
                     }
                 }

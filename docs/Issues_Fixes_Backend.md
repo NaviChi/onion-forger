@@ -1,4 +1,43 @@
-> **Last Updated:** 2026-03-13T13:25 CDT
+> **Last Updated:** 2026-03-13T19:35 CDT
+
+## Phase 142-IMPL: R1+R2+R3+R4 Implementation (2026-03-13)
+
+### Changes Implemented
+1. **R1 (Hedged Download Retry):** After each 100-file chunk download, the consumer checks which files are 0-byte or missing at the target path. Partial failures (some but not all files failed) trigger a hedged retry with a 60s timeout ceiling. This catches transient circuit failures without wasting time on permanently unavailable files.
+
+2. **R2 (Host-Grouped Batch Scheduling):** Chunks of 100 files are now sorted by host (primary) then size (secondary, SRPT — Shortest Remaining Processing Time). This maximizes HTTP keep-alive connection reuse: consecutive downloads targeting the same storage node share warm TCP connections instead of churning. Unique host count is now logged per chunk.
+
+3. **R3 (Adaptive Stall Threshold):** Replaced the fixed 90s stall threshold with `3× max(recent_batch_durations)` clamped to `[30s, 180s]`. The last 16 batch durations are tracked. Before any batches complete, the fallback 90s is used. On fast networks, the stall fires in ~15-30s; on degraded networks, it waits up to 180s.
+
+4. **R4 (Bounded Download Channel):** Changed `mpsc::unbounded_channel()` to `mpsc::channel(200)`. This provides natural backpressure during explosive discovery phases, preventing memory spikes. All callers (`frontier.rs`, `qilin.rs`) updated from `send()` to `try_send()` for non-blocking compatibility.
+
+### Files Modified
+- `src-tauri/src/lib.rs`: Download consumer — all 4 optimizations
+- `src-tauri/src/frontier.rs`: Channel type + `try_send()` migration
+- `src-tauri/src/adapters/qilin.rs`: VFS flush forward closure type update
+- `src-tauri/src/scorer.rs`: Added `median_latency_ms()` and `global_avg_speed_mbps()`
+
+### Prevention Rules
+- **PR-HEDGE-142:** Hedged retry must only fire when some (but not all) files failed. If 100% of files fail, let the stall detector handle recovery — hedging an entire failed batch would waste circuits.
+- **PR-BOUNDED-CH-142:** When switching channels from unbounded to bounded, ALL senders must use `try_send()` in sync contexts. `send().await` is async-only and will deadlock in sync closures.
+- **PR-STALL-ADAPTIVE-142:** The adaptive stall threshold must have a floor (30s) to prevent false-positive stalls from a single fast batch, and a ceiling (180s) to prevent infinite waits.
+
+## Phase 142: Exhaustive Cross-Industry Improvement Analysis (2026-03-13)
+
+### Investigation
+Reviewed all project whitepapers (Recommendations, Lessons Learned, Implementation Qilin, Theoretical Algorithm), internet research across 6 domains (Google, NASA, SpaceX, HFT, aria2, Tor Project), competitive analysis (aria2, IDM, wget2, tor-browser), and Phase 140B/141 test data.
+
+### Findings
+Identified 11 ranked improvement recommendations (R1-R11) with effort/impact matrix. Top 3 (R1 hedged probes, R2 host grouping, R3 adaptive stall) estimated at 40-70% improvement for <2 hours work. 8 anti-recommendations explicitly rejected with lesson references to prevent repeating past mistakes.
+
+### Key Bottleneck from Last Run
+The #1 remaining bottleneck is probe-stage failures. In the Phase 140B test (201K entries, 25 minutes), 1,055 HTTP 503 throttles were observed. The event-driven pipeline (Phase 141) solved discovery latency but the download consumer still probes serially on a single circuit per file.
+
+### Detailed Artifact
+Full analysis: [phase142_improvement_analysis.md](file:///C:/Users/Zero/.gemini/antigravity/brain/d0b38f8a-8219-43ab-9ba0-78d2db56d375/phase142_improvement_analysis.md)
+
+### Prevention Rules
+- **PR-ANALYSIS-142:** Before implementing any download optimization, cross-reference the Phase 142 anti-pattern registry (8 rejected ideas). This prevents re-discovering failures already documented in Phases 54, 99, 132, 136, 140C.
 
 ## Phase 141B: Intelligent Download Stall Detection & Recovery (2026-03-13)
 

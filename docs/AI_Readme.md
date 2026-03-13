@@ -1,11 +1,12 @@
 # OnionForge: AI Engineering & Context Reference
-> **Last Updated:** 2026-03-13T07:15 CDT
-> **Version:** 2.5.0
+> **Last Updated:** 2026-03-13T17:30 CDT
+> **Version:** 2.6.0
 > **Authors:** Navi (User), Antigravity (AI)
 
 This document serves as the master blueprint for any AI agent tasked with maintaining, extending, or recreating the OnionForge intelligence gathering application. It contains all critical architectural decisions, environment constraints, GUI styling instructions, and API behavioral knowledge required to build this system from scratch without guessing.
 
 Current repo state note:
+- **Phase 142-IMPL (2026-03-13):** R1+R2+R3+R4 implemented. Download channel is now bounded (`mpsc::channel(200)`) for backpressure — all senders use `try_send()`. Chunks sorted by host then size (SRPT). Adaptive stall threshold (`3× max_batch_duration`, floor 30s, ceiling 180s) replaces fixed 90s. Hedged retry fires on partial chunk failures (0-byte files get one 60s retry). Pipeline architecture: `Adapter → ui_tx → VFS Flush Task → download_feed_tx(bounded 200) → Download Consumer → scaffold_download(host-sorted chunk) → hedge_retry(failures)`. See `phase142_improvement_analysis.md` artifact for the full 11-recommendation ranked list.
 - Phase 130 implemented 6 new optimizations: Write Coalescing (`BufWriter` 256KB), Bloom Filter Right-Sizing (5M→200K entries, 24× RAM savings), SmallVec for Parse Results (stack-allocated `FileEntry` vectors for ≤64 entries), FILE_FLAG_SEQUENTIAL_SCAN (zero-cost NTFS hint), CUSUM for download circuits (integrated `CircuitHealth` change-point detection for 1-2 failures earlier recycling), and Release Profile Build (30-50% speed boost). Also confirmed Mirror Striping, Dynamic Bisection, and SRPT Scheduling were already implemented.
 - `smallvec = "1.15"` was added to `Cargo.toml`. The `local_files` and `new_files` vectors in `qilin.rs` crawl loops use `SmallVec<[FileEntry; 64]>` while `local_folders` remains `Vec<String>` since it contains URL strings, NOT FileEntry structs.
 - `CircuitScorer` in `aria_downloader.rs` now has a `circuit_health: Vec<CircuitHealth>` field with `record_download_success()`, `record_download_failure()`, `should_recycle()`, `reset_health()` methods. CUSUM is wired into all success/error/timeout paths.

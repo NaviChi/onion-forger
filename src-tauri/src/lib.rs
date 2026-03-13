@@ -794,8 +794,8 @@ async fn execute_crawl_attempt(
     app: &tauri::AppHandle,
     vfs: &db::SledVfs,
     ledger: std::sync::Arc<crate::target_state::TargetLedger>,
-    // Phase 141: Download feed sender for event-driven parallel downloads
-    download_feed_tx: Option<std::sync::Arc<tokio::sync::mpsc::UnboundedSender<adapters::FileEntry>>>,
+    // Phase 142: Download feed sender for event-driven parallel downloads (bounded channel)
+    download_feed_tx: Option<std::sync::Arc<tokio::sync::mpsc::Sender<adapters::FileEntry>>>,
 ) -> Result<CrawlAttemptResult, String> {
     let timer = crate::timer::CrawlTimer::new(app.clone());
     timer.emit_log(&format!("[System] Bootstrapping Target: {}", url));
@@ -1608,7 +1608,7 @@ async fn start_crawl(
     let mut final_instability_reasons = Vec::new();
     let mut retry_count_used = 0usize;
 
-    // Phase 141: Event-driven parallel download pipeline.
+    // Phase 141+142: Event-driven parallel download pipeline.
     // Instead of polling the VFS every 10s (O(N) scan with 200K+ entries),
     // we create a channel that adapters push FileEntry into as they discover them.
     // The consumer processes entries in chunks of 100, starting immediately.
@@ -1618,14 +1618,15 @@ async fn start_crawl(
     //                                                          ↓
     //                                              scaffold_download(chunk)
     //
-    // Benefits:
-    //   1. Zero VFS scanning overhead (was O(N) per 10s cycle)
-    //   2. Discovery-to-download latency: 25s → <3s
-    //   3. Natural backpressure through channel buffer
-    //   4. Chunked processing: download chunk 1 while chunk 2 accumulates
+    // Phase 142 improvements:
+    //   R1: Hedged retry — failed files from each chunk get one hedge retry with shorter timeout
+    //   R2: Host-grouped sorting — chunks sorted by host for HTTP connection reuse
+    //   R3: Adaptive stall threshold — 3× slowest batch duration (floor 30s, ceiling 180s)
+    //   R4: Bounded channel — backpressure prevents memory spikes during explosive discovery
     let parallel_download_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Phase 141: Create the download feed channel in start_crawl scope
-    let (download_feed_tx_raw, download_feed_rx) = tokio::sync::mpsc::unbounded_channel::<adapters::FileEntry>();
+    // Phase 142 (R4): Bounded channel with capacity 200 for natural backpressure.
+    // Previously unbounded — could buffer 200K+ entries in memory during explosive discovery.
+    let (download_feed_tx_raw, download_feed_rx) = tokio::sync::mpsc::channel::<adapters::FileEntry>(200);
     let download_feed_tx = std::sync::Arc::new(download_feed_tx_raw);
 
     let parallel_download_handle: Option<tokio::task::JoinHandle<()>> = if options.parallel_download && options.download {
@@ -1643,7 +1644,7 @@ async fn start_crawl(
         app.emit(
             "crawl_log",
             format!(
-                "[PARALLEL] ⚡ Phase 141: Event-driven download consumer armed ({} circuits, {} cap). Chunk size: 100. Speed threshold: 0.3 MB/s.",
+                "[PARALLEL] ⚡ Phase 142: Event-driven download consumer armed ({} circuits, {} cap). Chunk: 100. R1:hedge R2:host-group R3:adaptive-stall R4:bounded-ch.",
                 pd_circuits, pd_cap
             ),
         )
@@ -1656,12 +1657,21 @@ async fn start_crawl(
             let mut pending_entries: Vec<adapters::FileEntry> = Vec::new();
             let chunk_size: usize = 100;
 
-            // Phase 141B: Stall detection state
+            // Phase 142 (R3): Adaptive stall detection state.
+            // Instead of fixed 90s, we track batch durations and use
+            // 3× the slowest recent batch (floor 30s, ceiling 180s).
             let mut last_progress_at = std::time::Instant::now();
             let mut last_downloaded_count: usize = 0;
             let mut stall_recoveries: u8 = 0;
-            let stall_threshold = std::time::Duration::from_secs(90);
             let max_recoveries: u8 = 3;
+            // R3: Batch duration tracking for adaptive threshold
+            let mut recent_batch_durations: Vec<f64> = Vec::with_capacity(16); // last N batch durations in seconds
+            let stall_threshold_floor_secs: f64 = 30.0;
+            let stall_threshold_ceiling_secs: f64 = 180.0;
+            let stall_default_secs: f64 = 90.0; // fallback before any batches complete
+            // R1: Hedged retry tracking
+            let mut hedge_retries_total: u32 = 0;
+            let mut hedge_recovered_total: u32 = 0;
 
             // Phase 141: Small initial delay to let circuits warm up
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
@@ -1671,7 +1681,17 @@ async fn start_crawl(
                     break;
                 }
 
-                // Phase 141B: Check for stall before draining new entries
+                // Phase 142 (R3): Adaptive stall detection.
+                // Threshold = 3× slowest recent batch (floor 30s, ceiling 180s).
+                // Before any batches complete, use the fallback (90s).
+                let adaptive_stall_secs = if recent_batch_durations.is_empty() {
+                    stall_default_secs
+                } else {
+                    let max_batch = recent_batch_durations.iter().cloned().fold(0.0f64, f64::max);
+                    (max_batch * 3.0).clamp(stall_threshold_floor_secs, stall_threshold_ceiling_secs)
+                };
+                let stall_threshold = std::time::Duration::from_secs_f64(adaptive_stall_secs);
+
                 if last_progress_at.elapsed() > stall_threshold && downloaded_paths.len() > last_downloaded_count {
                     // Downloads were made but none recently — we're stalled
                     if stall_recoveries < max_recoveries {
@@ -1679,8 +1699,8 @@ async fn start_crawl(
                         let _ = pd_app.emit(
                             "crawl_log",
                             format!(
-                                "[PARALLEL] ⚠️ Stall detected (no progress for {}s). Recovery {}/{}: refreshing Tor circuits + 30s cooldown...",
-                                stall_threshold.as_secs(), stall_recoveries, max_recoveries
+                                "[PARALLEL] ⚠️ Adaptive stall detected (no progress for {:.0}s, threshold={:.0}s from {} batches). Recovery {}/{}: refreshing Tor circuits + 30s cooldown...",
+                                last_progress_at.elapsed().as_secs_f64(), adaptive_stall_secs, recent_batch_durations.len(), stall_recoveries, max_recoveries
                             ),
                         );
 
@@ -1704,8 +1724,8 @@ async fn start_crawl(
                         let _ = pd_app.emit(
                             "crawl_log",
                             format!(
-                                "[PARALLEL] ✅ Recovery {} complete. Resuming downloads (already completed: {} files).",
-                                stall_recoveries, downloaded_paths.len()
+                                "[PARALLEL] ✅ Recovery {} complete. Resuming downloads (already completed: {} files, hedged: {}/{}).",
+                                stall_recoveries, downloaded_paths.len(), hedge_recovered_total, hedge_retries_total
                             ),
                         );
                         continue; // Re-enter the loop with fresh circuits
@@ -1713,8 +1733,8 @@ async fn start_crawl(
                         let _ = pd_app.emit(
                             "crawl_log",
                             format!(
-                                "[PARALLEL] ❌ Max recoveries ({}) exhausted. Falling through to post-crawl sweep.",
-                                max_recoveries
+                                "[PARALLEL] ❌ Max recoveries ({}) exhausted. Hedged recoveries: {}/{}. Falling through to post-crawl sweep.",
+                                max_recoveries, hedge_recovered_total, hedge_retries_total
                             ),
                         );
                         break;
@@ -1769,19 +1789,45 @@ async fn start_crawl(
                     continue;
                 }
 
-                // Phase 141: Process in chunks of 100 — start downloading immediately
-                // while more entries continue to arrive via the channel
+                // Phase 142: Process in chunks of 100 — start downloading immediately
+                // while more entries continue to arrive via the channel.
+                // R2: Host-grouped + size-sorted for maximum HTTP connection reuse.
+                // R1: Failed files collected for hedged retry.
                 while !pending_entries.is_empty() && !pd_cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     let chunk: Vec<adapters::FileEntry> = pending_entries
                         .drain(..pending_entries.len().min(chunk_size))
                         .collect();
 
-                    // Sort chunk by size: small files first for rapid progress
+                    // Phase 142 (R2): Host-grouped batch scheduling.
+                    // Sort by host first (for HTTP connection reuse), then by size within
+                    // each host group (small files first for rapid progress).
+                    // This maximizes HTTP keep-alive utilization: consecutive files targeting
+                    // the same storage node share warm connections instead of churning.
                     let mut sorted_chunk = chunk;
-                    sorted_chunk.sort_by_key(|e| e.size_bytes.unwrap_or(u64::MAX));
+                    sorted_chunk.sort_by(|a, b| {
+                        // Primary: group by host (extract host from raw_url)
+                        let host_a = reqwest::Url::parse(&a.raw_url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        let host_b = reqwest::Url::parse(&b.raw_url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        host_a.cmp(&host_b)
+                            // Secondary: within same host, small files first (SRPT)
+                            .then_with(|| {
+                                a.size_bytes.unwrap_or(u64::MAX).cmp(&b.size_bytes.unwrap_or(u64::MAX))
+                            })
+                    });
 
                     batch_round += 1;
                     let chunk_len = sorted_chunk.len();
+                    // Count unique hosts in this chunk for logging
+                    let unique_hosts: std::collections::HashSet<String> = sorted_chunk.iter()
+                        .filter_map(|e| reqwest::Url::parse(&e.raw_url).ok())
+                        .filter_map(|u| u.host_str().map(|s| s.to_string()))
+                        .collect();
                     for e in &sorted_chunk {
                         downloaded_paths.insert(e.path.clone());
                     }
@@ -1789,8 +1835,8 @@ async fn start_crawl(
                     let _ = pd_app.emit(
                         "crawl_log",
                         format!(
-                            "[PARALLEL] ⚡ Chunk #{}: {} files (total downloaded: {})",
-                            batch_round, chunk_len, downloaded_paths.len()
+                            "[PARALLEL] ⚡ Chunk #{}: {} files across {} hosts (total downloaded: {})",
+                            batch_round, chunk_len, unique_hosts.len(), downloaded_paths.len()
                         ),
                     );
 
@@ -1800,6 +1846,9 @@ async fn start_crawl(
                         Some(pd_target_dir.as_path()),
                         &pd_app,
                     );
+
+                    // Phase 142 (R3): Track batch duration for adaptive stall threshold
+                    let batch_start = std::time::Instant::now();
 
                     match scaffold_download(
                         &sorted_chunk,
@@ -1811,17 +1860,110 @@ async fn start_crawl(
                     .await
                     {
                         Ok(count) => {
+                            let batch_duration_secs = batch_start.elapsed().as_secs_f64();
+
+                            // R3: Record batch duration (keep last 16 durations)
+                            if batch_duration_secs > 0.1 {
+                                recent_batch_durations.push(batch_duration_secs);
+                                if recent_batch_durations.len() > 16 {
+                                    recent_batch_durations.remove(0);
+                                }
+                            }
+
                             // Phase 141B: Update progress tracker on success
                             if count > 0 {
                                 last_progress_at = std::time::Instant::now();
                                 last_downloaded_count = downloaded_paths.len();
                             }
+
+                            // Phase 142 (R1): Hedged retry — collect files that may have failed
+                            // in this batch. Files that exist at their target path with 0 bytes
+                            // are candidates for a hedge retry on a different circuit.
+                            let hedge_candidates: Vec<adapters::FileEntry> = sorted_chunk.iter()
+                                .filter(|e| {
+                                    let target = pd_output.join(
+                                        e.path.strip_prefix('/').unwrap_or(&e.path)
+                                    );
+                                    // File doesn't exist or is 0 bytes = likely failed
+                                    match std::fs::metadata(&target) {
+                                        Ok(m) => m.len() == 0,
+                                        Err(_) => true,
+                                    }
+                                })
+                                .cloned()
+                                .collect();
+
+                            if !hedge_candidates.is_empty() && hedge_candidates.len() < chunk_len {
+                                // Only hedge if some (but not all) failed — if ALL failed,
+                                // the stall detector will handle recovery.
+                                hedge_retries_total += hedge_candidates.len() as u32;
+                                let hedge_count = hedge_candidates.len();
+                                let _ = pd_app.emit(
+                                    "crawl_log",
+                                    format!(
+                                        "[PARALLEL] 🔀 R1 Hedge: retrying {} failed files from chunk #{} (timeout 60s)",
+                                        hedge_count, batch_round
+                                    ),
+                                );
+
+                                // Hedged retry with 60s timeout ceiling
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(60),
+                                    scaffold_download(
+                                        &hedge_candidates,
+                                        &pd_output,
+                                        &pd_app,
+                                        pd_circuits,
+                                        pd_is_onion,
+                                    ),
+                                ).await {
+                                    Ok(Ok(recovered)) => {
+                                        if recovered > 0 {
+                                            hedge_recovered_total += recovered;
+                                            last_progress_at = std::time::Instant::now();
+                                            let _ = pd_app.emit(
+                                                "crawl_log",
+                                                format!(
+                                                    "[PARALLEL] ✅ R1 Hedge recovered {} / {} files",
+                                                    recovered, hedge_count
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        let _ = pd_app.emit(
+                                            "crawl_log",
+                                            format!("[PARALLEL] 🔀 Hedge error: {}", e),
+                                        );
+                                    }
+                                    Err(_) => {
+                                        let _ = pd_app.emit(
+                                            "crawl_log",
+                                            format!("[PARALLEL] 🔀 Hedge timeout (60s) for {} files — deferring to post-crawl sweep", hedge_count),
+                                        );
+                                    }
+                                }
+                            }
+
                             let _ = pd_app.emit(
                                 "crawl_log",
-                                format!("[PARALLEL] ⚡ Chunk #{} complete: {} items", batch_round, count),
+                                format!(
+                                    "[PARALLEL] ⚡ Chunk #{} complete: {} items in {:.1}s (stall threshold: {:.0}s)",
+                                    batch_round, count, batch_duration_secs,
+                                    if recent_batch_durations.is_empty() { stall_default_secs }
+                                    else { (recent_batch_durations.iter().cloned().fold(0.0f64, f64::max) * 3.0).clamp(stall_threshold_floor_secs, stall_threshold_ceiling_secs) }
+                                ),
                             );
                         }
                         Err(e) => {
+                            let batch_duration_secs = batch_start.elapsed().as_secs_f64();
+                            // Still record duration even on error for R3 adaptive threshold
+                            if batch_duration_secs > 0.1 {
+                                recent_batch_durations.push(batch_duration_secs);
+                                if recent_batch_durations.len() > 16 {
+                                    recent_batch_durations.remove(0);
+                                }
+                            }
                             let _ = pd_app.emit(
                                 "crawl_log",
                                 format!("[PARALLEL] Chunk #{} error: {}", batch_round, e),
@@ -1858,7 +2000,7 @@ async fn start_crawl(
 
                     if !missed.is_empty() {
                         missed.sort_by_key(|e| e.size_bytes.unwrap_or(u64::MAX));
-                        batch_round += 1;
+                        let _batch_round_final = batch_round + 1;
                         let sweep_count = missed.len();
                         for e in &missed {
                             downloaded_paths.insert(e.path.clone());

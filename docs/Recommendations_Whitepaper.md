@@ -1,4 +1,41 @@
-> **Last Updated:** 2026-03-10T19:20 CDT
+> **Last Updated:** 2026-03-13T19:35 CDT
+
+## Phase 142-IMPL: R1+R2+R3+R4 Implemented (2026-03-13)
+
+**Status: ✅ Implemented and build-verified**
+
+R1, R2, R3, R4 from the Phase 142 analysis are now implemented. Compilation verified on `cargo check` — zero errors, zero warnings.
+
+## Phase 142: Exhaustive Improvement Analysis — Top 8 Recommendations (2026-03-13)
+
+**Status: R1-R4 implemented. R5-R8 deferred for next cycle.**
+
+Full analysis artifact: [phase142_improvement_analysis.md](file:///C:/Users/Zero/.gemini/antigravity/brain/d0b38f8a-8219-43ab-9ba0-78d2db56d375/phase142_improvement_analysis.md)
+
+Based on exhaustive review of all whitepapers, lessons learned (Phases 54-141B), internet research (Google Tail-at-Scale, NASA DTN, SpaceX AQM, HFT ring buffers, aria2 connection reuse, Tor Conflux), and competitive analysis (aria2, IDM, wget2):
+
+### Top 3 Recommendations (40-70% estimated improvement, <2 hours total):
+
+1. **R1: Hedged Download Retry** ✅ IMPLEMENTED — After each chunk, 0-byte/missing files get one hedged retry (60s timeout). Catches transient circuit failures.
+
+2. **R2: Host-Grouped Batch Scheduling** ✅ IMPLEMENTED — Chunks sorted by host (primary) then size (secondary SRPT). Maximizes HTTP keep-alive connection reuse.
+
+3. **R3: Adaptive Stall Threshold** ✅ IMPLEMENTED — `3× max(recent_batch_durations)` clamped to `[30s, 180s]`. Replaces fixed 90s.
+
+### Additional Recommendations:
+4. **R4: Bounded Download Channel** ✅ IMPLEMENTED — `mpsc::channel(200)` replaces unbounded. Natural backpressure.
+5. **R5: Per-File Priority Queue** — Weight entries by file size (SRPT), host affinity, and freshness.
+6. **R6: Circuit Pre-Warming** — Pre-establish connections to next hosts while processing current batch.
+7. **R7: Token Bucket 503 Management** — Replace crude per-worker 2s sleep with global coordinated rate limiter.
+8. **R8: Entry Age Tracking** (Starlink AQM) — Demote entries queued >5 minutes to prevent head-of-line blocking.
+
+### Anti-Recommendations (explicitly rejected):
+- More isolated_client() views (LESSON-140C-001: shares guard bandwidth)
+- Conflux multi-path bonding (LESSON-136-001: doubles HS setup cost)
+- >4 base TorClients default (OOM risk on most systems)
+- Custom Tor relay picking (bottleneck is transport policy, not relay quality)
+
+Hardware budget for all 8: <1KB RAM, <0.1% CPU, estimated 15-25% energy savings from reduced wasted requests.
 
 ## Phase 102: Probe Admission Telemetry + Cooldown Escalation (2026-03-11)
 

@@ -1,4 +1,4 @@
-> **Last Updated:** 2026-03-06T13:05 CST
+> **Last Updated:** 2026-03-13T17:30 CST
 
 # Theory Whitepaper: Qilin Crawl Throughput, Tor Runtime Policy, and Feasible Speed Paths
 
@@ -294,3 +294,33 @@ We rolled out the complete military-grade predictive pacing suite inside `qilin_
 
 **Prevention Rule Enforced:**
 `PR-UNIFIED-ARCH-001`: Subcomponents must never drop down to rudimentary "sleep and fetch" execution. If a new module is built, it MUST instantiate `DdosGuard` (for EKF pacing) or `BbrController` (for sizing).
+
+
+## Phase 142: Cross-Industry Technique Evaluation (2026-03-13)
+
+### 10. External Techniques Evaluated
+
+| Source | Technique | Applicability | Status |
+|--------|-----------|---------------|--------|
+| Google "The Tail at Scale" (Dean & Barroso) | Hedged requests — race duplicate probe on 2nd circuit after P95 latency exceeded | ✅ HIGH — directly addresses #1 bottleneck (1,055 probe failures/25min) | ❌ Not implemented |
+| NASA JPL Deep Space Network | Delay-Tolerant Networking — store-and-forward queue for intermittent connectivity | ✅ PARTIALLY covered — VFS persistence already implements store-and-forward | ✅ Partially implemented |
+| SpaceX/Starlink AQM (RFC 8290 fq_codel) | Fair-queueing with controlled delay; age-based entry expiry | ✅ MEDIUM — prevents head-of-line blocking from stale entries | ❌ Not implemented |
+| HFT LMAX Disruptor | Lock-free ring buffer with bounded capacity for predictable latency | ✅ MEDIUM — bounded channel(200) provides natural backpressure | ❌ Not implemented |
+| aria2 connection reuse | HTTP keep-alive persistence across sequential file downloads | ✅ PARTIALLY covered — ArtiClient pool reuses; host grouping would maximize it | ✅ Partially implemented |
+| Tor Project Conflux | Multi-path traffic splitting across bonded circuits | ❌ REJECTED — doubles HS rendezvous setup cost (10-16 extra RTT) | N/A |
+| CenTor CDN for .onion (PETSymposium 2024) | CDN replicas for onion content | ❌ NOT APPLICABLE — we don't control target servers | N/A |
+| Forward Error Correction (Reed-Solomon) | Erasure coding for large file chunk redundancy | ⚠️ LOW priority — only useful for files >10MB; bandwidth cost 10-20% | Deferred |
+| Exponential Moving Weighted Scheduling | Proactive assignment weighting by circuit EWMA throughput | ✅ PARTIALLY — yield_delay() is reactive; proactive assignment is not implemented | ✅ Partially implemented |
+| Token Bucket Rate Limiter (RFC 2697 / BBR) | Coordinated global rate limiter instead of per-worker sleep | ✅ MEDIUM — replaces crude 2s per-worker 503 sleep | ❌ Not implemented |
+
+### 11. Phase 142 Recommended Next Experiment Order
+
+Based on the above evaluation and Phase 140B/141 test data (1.07-1.83 MB/s, 201K entries, 1,055 throttles):
+
+1. **R1: Hedged download probes** — wrap initial probe in `tokio::select!` with P95 timeout hedge
+2. **R2: Host-grouped batch scheduling** — sort 100-entry chunks by host before processing
+3. **R3: Adaptive stall threshold** — `3 × median_circuit_latency` with floor 30s / ceiling 180s
+4. **R7: Token bucket 503 management** — global coordinated rate limiter
+5. **R4: Bounded download channel** — `mpsc::channel(200)` with natural backpressure
+
+Expected combined impact: 40-70% improvement in effective download speed. Full hardware budget: <1KB RAM, <0.1% CPU overhead.

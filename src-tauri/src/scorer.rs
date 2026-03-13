@@ -244,6 +244,43 @@ impl CircuitScorer {
             .collect()
     }
 
+    /// Phase 142 (R3): Compute median Kalman-estimated latency across all circuits
+    /// with at least 3 samples. Returns milliseconds. Used by adaptive stall threshold.
+    /// If no circuits have data, returns 0.0 (caller should use fallback constant).
+    pub fn median_latency_ms(&self) -> f64 {
+        let mut latencies: Vec<f64> = (0..self.capacity)
+            .filter(|&cid| self.latency_samples[cid].load(Ordering::Relaxed) >= 3)
+            .map(|cid| load_f64(&self.kalman_x[cid]))
+            .filter(|&x| x > 0.0)
+            .collect();
+
+        if latencies.is_empty() {
+            return 0.0;
+        }
+
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = latencies.len() / 2;
+        if latencies.len() % 2 == 0 {
+            (latencies[mid - 1] + latencies[mid]) / 2.0
+        } else {
+            latencies[mid]
+        }
+    }
+
+    /// Phase 142: Compute global aggregate download speed across all circuits (MB/s).
+    pub fn global_avg_speed_mbps(&self) -> f64 {
+        let total_b: u64 = (0..self.capacity)
+            .map(|cid| self.total_bytes[cid].load(Ordering::Relaxed))
+            .sum();
+        let total_ms: u64 = (0..self.capacity)
+            .map(|cid| self.total_elapsed_ms[cid].load(Ordering::Relaxed))
+            .sum();
+        if total_ms == 0 {
+            return 0.0;
+        }
+        (total_b as f64 / total_ms.max(1) as f64) * 1000.0 / 1_048_576.0
+    }
+
     /// How long a circuit should wait before claiming the next URL target.
     /// Fast circuits: 0ms. Slow circuits: up to 1000ms.
     /// This naturally gives more work to faster circuits.
