@@ -1,4 +1,31 @@
 
+## [Phase 136] Arti Conflux (Proposal 329) — Deep Analysis & Decision: NOT IMPLEMENTING (2026-03-13)
+
+> **Finding:** `conflux` feature EXISTS in `tor-proto 0.40.0` (gated behind `__is_experimental`).
+> Feature chain: `arti-client/experimental → tor-circmgr/conflux → tor-proto/conflux → tor-cell/conflux`
+> **Decision: Do NOT enable.** Our application-level Mirror Striping is strictly superior for .onion downloads.
+
+### Why Conflux Won't Help Our Tool
+
+Conflux (Proposal 329) bonds 2 circuits to the **same destination** (exit or rendezvous point).
+Our primary use case is **.onion hidden service downloads**. The math doesn't work:
+
+| Metric | Conflux (Protocol-Level) | Our Mirror Striping (Phase 129) |
+|--------|--------------------------|----------------------------------|
+| Circuits bonded | 2 → same RP/exit | 4+ → different hosts |
+| Throughput gain | ~2× per stream | ~4× aggregate |
+| HS rendezvous cost | 2× (10-16 extra RT to build 2nd leg) | 0 extra (circuits pre-warmed) |
+| Relay requirements | RP relay must support Conflux (~40% exits, unknown RP) | None |
+| .onion service requirement | Must support Conflux | None |
+| Stability | `__is_experimental`, C-tor had DoS bugs through Nov 2025 | Production-stable |
+
+**Net effect on .onion downloads:** NEGATIVE. Doubled HS rendezvous setup cost exceeds the throughput gain from bonding.
+
+### When to Revisit
+- When `conflux` leaves `__is_experimental` in a future arti-client release
+- When >70% of rendezvous relays support Conflux
+- When we add a clearnet-only download mode where single-server throughput matters
+
 ## [Phase 132] Mirror Striping Activation & 5× Speed Infrastructure (2026-03-12)
 > **Context:** Arti Conflux unavailable in arti-client 0.40.0. Identified mirror striping (already half-built in Phase 129) as highest-impact alternative.
 > **Status:** 3/4 items implemented, 1 reverted. Ready for download-phase benchmark.

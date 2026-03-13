@@ -35,6 +35,9 @@ dist-ssr
 src-tauri/crawl_index_*.txt
 tmp/
 
+# Release build artifacts
+portable-assets/
+
 # Database artifacts
 *.sqlite
 *.sqlite-*
