@@ -1,4 +1,28 @@
-> **Last Updated:** 2026-03-13T21:22 CDT
+> **Last Updated:** 2026-03-13T21:53 CDT
+
+## Phase 144: Parallel Download Stall Prevention — 5 Bugs Fixed + 8 Recommendations (2026-03-13)
+
+### Issues Found (Root Cause Analysis)
+1. **BUG-1 (CRITICAL):** `scaffold_download()` had NO timeout wrapper. Could block for **2+ hours** on a single chunk with 503 throttles. Violated LESSON-140-001.
+2. **BUG-2 (CRITICAL):** Stall detector (R3) only ran at **top of outer loop** — never fired while `scaffold_download()` was stuck inside the inner chunk-processing loop.
+3. **BUG-3 (MEDIUM):** `activate_download_control()` mutex wasn't cleared on error/timeout paths. Next chunk would get "A download is already active" and silently skip all files.
+4. **BUG-4 (MEDIUM):** Serial probe loop in `start_batch_download()` blocked entire pipeline for 100×5s = 500s on files without size hints.
+5. **BUG-5 (LOW):** Exponential backoff had per-file ceiling (30s) but no aggregate per-chunk ceiling.
+
+### Fixes Implemented
+1. **BUG-1 FIX:** `scaffold_download()` now wrapped in `tokio::time::timeout(30s + 3s×files, max 300s)`. On timeout, chunk is skipped, NEWNYM fires, 10s recovery, then next chunk.
+2. **BUG-2 FIX:** Heartbeat watchdog task emits `💓 Chunk #{N} heartbeat (Xs elapsed, Y files)` every 30s during downloads so user sees activity.
+3. **BUG-3 FIX:** `aria_downloader::clear_download_control()` added in ALL error/timeout paths (scaffold error, scaffold timeout, hedge error, hedge timeout, final sweep error, final sweep timeout).
+4. **BUG-4 MITIGATION (R7):** Probe phase now emits progress every 10 files: `"Batch probe progress: N/M files classified..."`.
+5. **BUG-5 covered by BUG-1 FIX:** Per-chunk timeout caps aggregate time regardless of per-file backoff accumulation.
+6. **R5 (Timeout Escalation):** Consecutive timeouts multiply limit by 1.5× (max 3.0×). Success resets to 1.0×. Adapts to genuinely slow networks.
+7. **Final VFS sweep** also wrapped in 300s timeout with proper DownloadControl cleanup.
+
+### Prevention Rules
+- **PR-SCAFFOLD-TIMEOUT-144:** Every `scaffold_download().await` MUST be wrapped in `tokio::time::timeout()`. There are ZERO exceptions. Use adaptive ceiling: `30 + 3×files, max 300s` scaled by `timeout_multiplier`.
+- **PR-CONTROL-CLEANUP-144:** `clear_download_control()` MUST be called in ALL non-success paths (error, timeout, panic). Use RAII guard pattern if more call sites are added.
+- **PR-HEARTBEAT-144:** Any blocking operation >30s MUST have a concurrent heartbeat emitter so the user sees activity.
+- **PR-PROBE-PROGRESS-144:** Serial probe loops MUST emit progress every 10 iterations.
 
 ## Phase 143: Progressive Download Total Tracking (2026-03-13)
 

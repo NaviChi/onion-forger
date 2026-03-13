@@ -1,4 +1,23 @@
-> **Last Updated:** 2026-03-13T19:35 CDT
+> **Last Updated:** 2026-03-13T21:53 CDT
+
+## Phase 144-IMPL: Stall Prevention — All 5 Bugs Fixed + R5/R7 (2026-03-13)
+
+**Status: ✅ Implemented and build-verified (zero errors)**
+
+All 5 identified stall vectors from the Phase 144 root cause analysis are fixed:
+- **BUG-1:** `scaffold_download()` now has adaptive timeout (30+3s×files, max 300s)
+- **BUG-2:** Heartbeat watchdog emits 💓 logs every 30s during downloads
+- **BUG-3:** `clear_download_control()` in ALL error/timeout paths
+- **BUG-4:** Probe progress emission every 10 files (R7)
+- **BUG-5:** Covered by BUG-1's per-chunk timeout ceiling
+- **R5:** Timeout escalation (1.5× per consecutive timeout, max 3×, resets on success)
+- Proactive NEWNYM + 10s recovery on timeout
+- Final VFS sweep also has 300s timeout with cleanup
+
+Remaining deferred for next cycle:
+- **R4:** Parallel probes (4 concurrent) — would 4× probe phase speed
+- **R6:** Token bucket for 503 throttles — coordinated backoff
+- **R8:** Circuit health pre-check before chunk start
 
 ## Phase 142-IMPL: R1+R2+R3+R4 Implemented (2026-03-13)
 

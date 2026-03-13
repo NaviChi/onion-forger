@@ -1680,6 +1680,10 @@ async fn start_crawl(
             // R1: Hedged retry tracking
             let mut hedge_retries_total: u32 = 0;
             let mut hedge_recovered_total: u32 = 0;
+            // Phase 144 (R5): Timeout escalation multiplier.
+            // Starts at 1.0, grows by 1.5× on each consecutive timeout, resets on success.
+            // Prevents premature timeout on genuinely slow networks.
+            let mut timeout_multiplier: f64 = 1.0;
 
             // Phase 141: Small initial delay to let circuits warm up
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
@@ -1899,16 +1903,54 @@ async fn start_crawl(
                     // Phase 142 (R3): Track batch duration for adaptive stall threshold
                     let batch_start = std::time::Instant::now();
 
-                    match scaffold_download(
-                        &sorted_chunk,
-                        &pd_output,
-                        &pd_app,
-                        pd_circuits,
-                        pd_is_onion,
+                    // Phase 144 (BUG-1 FIX): Per-chunk timeout prevents infinite scaffold_download blocks.
+                    // LESSON-140-001: "Every handle.await MUST have a timeout wrapper."
+                    // Scale with chunk size: 30s base + 3s per file, ceiling 300s.
+                    // R5: timeout_multiplier escalates on consecutive timeouts.
+                    let chunk_timeout_secs = ((30 + sorted_chunk.len() as u64 * 3).min(300) as f64 * timeout_multiplier) as u64;
+                    let chunk_timeout = std::time::Duration::from_secs(chunk_timeout_secs.min(600));
+
+                    // Phase 144 (BUG-2 FIX): Heartbeat watchdog emits logs during long downloads
+                    // so the user sees activity and knows it's not frozen.
+                    let heartbeat_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let hb_cancel = heartbeat_cancel.clone();
+                    let hb_app = pd_app.clone();
+                    let hb_round = batch_round;
+                    let hb_chunk_len = chunk_len;
+                    let heartbeat_handle = tokio::spawn(async move {
+                        let mut tick = 0u32;
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            if hb_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            tick += 1;
+                            let _ = hb_app.emit(
+                                "crawl_log",
+                                format!(
+                                    "[PARALLEL] 💓 Chunk #{} heartbeat ({}s elapsed, {} files)...",
+                                    hb_round, tick * 30, hb_chunk_len
+                                ),
+                            );
+                        }
+                    });
+
+                    match tokio::time::timeout(
+                        chunk_timeout,
+                        scaffold_download(
+                            &sorted_chunk,
+                            &pd_output,
+                            &pd_app,
+                            pd_circuits,
+                            pd_is_onion,
+                        ),
                     )
                     .await
                     {
-                        Ok(count) => {
+                        Ok(Ok(count)) => {
+                            // Phase 144 (R5): Reset timeout multiplier on success
+                            timeout_multiplier = 1.0;
+
                             let batch_duration_secs = batch_start.elapsed().as_secs_f64();
 
                             // R3: Record batch duration (keep last 16 durations)
@@ -1980,12 +2022,16 @@ async fn start_crawl(
                                         }
                                     }
                                     Ok(Err(e)) => {
+                                        // Phase 144 (BUG-3 FIX): Clear DownloadControl on hedge error
+                                        aria_downloader::clear_download_control();
                                         let _ = pd_app.emit(
                                             "crawl_log",
                                             format!("[PARALLEL] 🔀 Hedge error: {}", e),
                                         );
                                     }
                                     Err(_) => {
+                                        // Phase 144 (BUG-3 FIX): Clear DownloadControl on hedge timeout
+                                        aria_downloader::clear_download_control();
                                         let _ = pd_app.emit(
                                             "crawl_log",
                                             format!("[PARALLEL] 🔀 Hedge timeout (60s) for {} files — deferring to post-crawl sweep", hedge_count),
@@ -2004,7 +2050,11 @@ async fn start_crawl(
                                 ),
                             );
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
+                            // Phase 144 (BUG-3 FIX): Clear DownloadControl on scaffold error
+                            // so the next chunk doesn't get "A download is already active"
+                            aria_downloader::clear_download_control();
+
                             let batch_duration_secs = batch_start.elapsed().as_secs_f64();
                             // Still record duration even on error for R3 adaptive threshold
                             if batch_duration_secs > 0.1 {
@@ -2018,7 +2068,45 @@ async fn start_crawl(
                                 format!("[PARALLEL] Chunk #{} error: {}", batch_round, e),
                             );
                         }
+                        Err(_elapsed) => {
+                            // Phase 144 (BUG-1 FIX): Chunk timed out — don't hang forever.
+                            // Phase 144 (BUG-3 FIX): Clear DownloadControl so next chunk can proceed.
+                            aria_downloader::clear_download_control();
+
+                            // Phase 144 (R5): Escalate timeout for consecutive timeouts
+                            timeout_multiplier = (timeout_multiplier * 1.5).min(3.0);
+
+                            let batch_duration_secs = batch_start.elapsed().as_secs_f64();
+                            if batch_duration_secs > 0.1 {
+                                recent_batch_durations.push(batch_duration_secs);
+                                if recent_batch_durations.len() > 16 {
+                                    recent_batch_durations.remove(0);
+                                }
+                            }
+
+                            let _ = pd_app.emit(
+                                "crawl_log",
+                                format!(
+                                    "[PARALLEL] ⏰ Chunk #{} timed out after {}s ({}×{} files). Multiplier now {:.1}×. Continuing to next chunk.",
+                                    batch_round, chunk_timeout_secs, chunk_len,
+                                    if timeout_multiplier > 1.01 { format!(" escalated {:.1}×,", timeout_multiplier) } else { String::new() },
+                                    timeout_multiplier
+                                ),
+                            );
+
+                            // Proactive NEWNYM after timeout — circuits are likely degraded
+                            let active_ports = crate::tor::detect_active_managed_tor_ports();
+                            for port in active_ports {
+                                let _ = crate::tor::request_newnym(port).await;
+                            }
+                            // Brief cooldown to let new circuits establish (shorter than stall recovery)
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        }
                     }
+
+                    // Stop heartbeat watchdog
+                    heartbeat_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    heartbeat_handle.abort();
 
                     // Drain more entries that arrived during this chunk's download
                     while let Ok(entry) = pd_rx.try_recv() {
@@ -2061,14 +2149,33 @@ async fn start_crawl(
                                 sweep_count, downloaded_paths.len()
                             ),
                         );
-                        let _ = scaffold_download(
-                            &missed,
-                            &pd_output,
-                            &pd_app,
-                            pd_circuits,
-                            pd_is_onion,
-                        )
-                        .await;
+                        // Phase 144: Final sweep also gets a timeout (5 min ceiling)
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(300),
+                            scaffold_download(
+                                &missed,
+                                &pd_output,
+                                &pd_app,
+                                pd_circuits,
+                                pd_is_onion,
+                            ),
+                        ).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
+                                aria_downloader::clear_download_control();
+                                let _ = pd_app.emit(
+                                    "crawl_log",
+                                    format!("[PARALLEL] 🧹 Final sweep error: {}", e),
+                                );
+                            }
+                            Err(_) => {
+                                aria_downloader::clear_download_control();
+                                let _ = pd_app.emit(
+                                    "crawl_log",
+                                    "[PARALLEL] ⏰ Final sweep timed out after 300s".to_string(),
+                                );
+                            }
+                        }
                     }
                 }
             }

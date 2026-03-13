@@ -3427,9 +3427,21 @@ pub async fn start_batch_download(
         ),
     );
 
-    for file in &files {
+    let probe_total = files.len();
+    for (probe_idx, file) in files.iter().enumerate() {
         if control.interruption_reason().is_some() {
             return Ok(());
+        }
+
+        // Phase 144 (R7): Progress emission during probe phase
+        if probe_idx > 0 && probe_idx % 10 == 0 {
+            let _ = app.emit(
+                "log",
+                format!(
+                    "[*] Batch probe progress: {}/{} files classified...",
+                    probe_idx, probe_total
+                ),
+            );
         }
 
         // Smart Skip Idempotency (redundant fallback)
