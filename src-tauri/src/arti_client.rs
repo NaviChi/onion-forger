@@ -44,10 +44,17 @@ impl ArtiClient {
         let client = Client::builder(hyper_util::rt::TokioExecutor::new())
             .http2_only(false)
             // Phase 124 P3: HTTP/2 window tuning for Tor BDP
-            // BDP = ~5 Mbps × 0.5s RTT = 312KB. 256KB stream / 1MB connection
+            // BDP = ~5 Mbps × 0.5s RTT = 312KB. 256KB stream / 4MB connection
             // reduces WINDOW_UPDATE stalls on 300KB+ directory pages.
-            .http2_initial_stream_window_size(262_144)      // 256KB (vs default 64KB)
-            .http2_initial_connection_window_size(1_048_576) // 1MB  (vs default 64KB)
+            .http2_initial_stream_window_size(262_144)        // 256KB (vs default 64KB)
+            .http2_initial_connection_window_size(4_194_304)  // 4MB  (vs 1MB — supports 4+ concurrent streams)
+            // Phase 137: Adaptive receive window — Hyper dynamically grows the
+            // window based on measured throughput (like TCP window scaling).
+            // Eliminates WINDOW_UPDATE stalls for high-BDP Tor circuits.
+            .http2_adaptive_window(true)
+            // Phase 137: Larger max frame size — 32KB vs 16KB default.
+            // Halves frame overhead for large body transfers.
+            .http2_max_frame_size(Some(32_768))
             .http2_keep_alive_interval(Some(std::time::Duration::from_secs(15)))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(32)

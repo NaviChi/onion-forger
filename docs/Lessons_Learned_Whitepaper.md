@@ -1,5 +1,11 @@
 # Lessons Learned Whitepaper
 
+## 2026-03-13 (Phase 137: HTTP/2 Flow Control Tuning)
+- **LESSON-137-001 (HIGH — ADAPTIVE WINDOW):** Hyper's `http2_adaptive_window(true)` dynamically grows the HTTP/2 receive window based on measured throughput — equivalent to TCP window scaling for H/2. Without it, the static 256KB stream window causes WINDOW_UPDATE stalls on fast circuits. This is a zero-cost configuration change.
+- **LESSON-137-002 (MEDIUM):** Connection-level HTTP/2 window must be proportional to `stream_window × max_concurrent_streams`. Old 1MB was insufficient for 4+ concurrent streams × 256KB each. Raised to 4MB.
+- **LESSON-137-003 (MEDIUM):** Increasing `http2_max_frame_size` from 16KB to 32KB halves framing overhead for large body transfers. Most .onion file servers send complete responses so larger frames reduce protocol overhead.
+- **LESSON-137-004 (AUDIT):** After auditing all remaining speed bottlenecks, the pipeline is now near-optimal. The primary bottleneck is Tor circuit RTT (~1-3s physics), not software. Remaining micro-optimizations (WriteMsg filepath Arc<str>, spin-wait tuning) would yield <1% improvement.
+
 ## 2026-03-13 (Phase 136: Connection Round-Trip Savings)
 - **PR-OPTIMISTIC-136-001 (CONFIRMED SAFE):** `StreamPrefs::optimistic()` is NOW safely enabled for clearnet exit-node connections only. Phase 132 reverted it globally — Phase 136 re-enables it conditionally by checking `host.ends_with(".onion")`. Clearnet exits don't need rendezvous, so the CONNECTED response is a formality. **Saves ~300-800ms per new clearnet connection.**
 - **PR-HOST-PERSIST-136-002 (HIGH):** Host capability data (range support, RTT EWMA, parallelism caps) was ephemeral — lost on app restart. Now persisted via sled at `~/.crawli/host_capabilities.sled` with 24h TTL. On restart, known hosts immediately enter range-mode without re-probing. **Saves 1 full probe round trip per known host.**

@@ -1,4 +1,25 @@
-> **Last Updated:** 2026-03-13T00:34 CDT
+> **Last Updated:** 2026-03-13T00:55 CDT
+
+## Phase 137: HTTP/2 Flow Control Tuning — Adaptive Window + Larger Frames (2026-03-13)
+
+### Problem
+HTTP/2 WINDOW_UPDATE stalls were limiting throughput for high-BDP Tor circuits. The default settings were:
+- Connection window: 1MB (insufficient for 4+ concurrent streams each needing 256KB)
+- No adaptive window scaling (fixed window regardless of measured throughput)
+- Default 16KB max frame size (excessive framing overhead for large body transfers)
+
+### Solution
+Three zero-cost Hyper builder changes in `arti_client.rs`:
+1. **`http2_adaptive_window(true)`** — Hyper dynamically grows the receive window based on measured throughput, analogous to TCP window scaling. Eliminates WINDOW_UPDATE stalls for high-BDP circuits.
+2. **`http2_initial_connection_window_size(4_194_304)`** — 4MB (up from 1MB). Supports 4+ concurrent streams × 256KB each without blocking.
+3. **`http2_max_frame_size(Some(32_768))`** — 32KB (up from 16KB default). Halves frame overhead for large body transfers.
+
+### Files Modified
+- `arti_client.rs` — HTTP/2 builder configuration
+
+### Prevention Rules
+- **PR-H2-WINDOW-137-001:** Always enable `http2_adaptive_window(true)` for high-BDP connections. Fixed windows cause stalls when throughput varies.
+- **PR-H2-CONN-WINDOW-137-002:** Connection window must be ≥ `stream_window × max_concurrent_streams`. Our 4MB = 256KB × 16 provides headroom for burst traffic.
 
 ## Phase 136: Connection Round-Trip Savings — Optimistic Streams + Host Capability Persistence (2026-03-13)
 
